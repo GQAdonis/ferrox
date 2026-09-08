@@ -5883,31 +5883,28 @@ pub fn launch_decode_dense_stack(
         .collect::<Result<Vec<_>, MetalError>>()?;
 
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-    // Sandwich (Gemma post-norms): use the default serial encoder. Concurrent
-    // dispatch + in-place RMSNorm/deferred residuals was measured to diverge
-    // from CPU on Gemma-2 B=1 decode while the serial prefill-shaped residual
-    // path stays coherent. Non-sandwich (SmolLM2) keeps Concurrent for Q∥K∥V.
+    // Gemma-style post-norms ("sandwich"): these layers take the EAGER
+    // residual path below, which is what makes concurrent encode safe here.
     let sandwich = layers
         .iter()
         .any(|l| l.post_attn_norm.is_some() || l.post_ffn_norm.is_some());
-    // The encoder kind and the hazard tracker are chosen together, from one
-    // expression, so they can never disagree: a serial encoder means Metal
-    // already orders the dispatches and every barrier is dead weight (llama
-    // likewise skips them when it is not encoding concurrently), while a
-    // Concurrent encoder means every hazard has to be declared. `mrs` emits
-    // a barrier only where a dispatch actually reads or overwrites something
-    // still in flight, narrowed to those resources rather than every buffer.
-    let (encoder, mut mrs) = if sandwich {
-        (
-            cmd_buf
-                .computeCommandEncoder()
-                .ok_or(MetalError::CommandFailed)?,
-            MemRanges::serial(),
-        )
-    } else {
-        // llama.cpp concurrent encode: gate∥up and Q∥K∥V overlap
-        (compute_encoder_concurrent(&cmd_buf)?, MemRanges::new())
-    };
+    // Every model encodes concurrently: gate∥up and Q∥K∥V overlap, and the
+    // hazard tracker emits a barrier only where a dispatch reads or
+    // overwrites something still in flight, narrowed to those resources.
+    //
+    // Sandwich models (Gemma post-norms) used to be forced onto the serial
+    // encoder, because concurrent dispatch with in-place RMSNorm and
+    // DEFERRED residuals diverged from CPU on Gemma-2 B=1 decode. That fix
+    // landed two changes at once -- serial encode AND eager residuals -- and
+    // the eager residuals are the half that mattered: with them, every op in
+    // this function declares its own reads and writes (`encode_gqa_with_kv`
+    // self-tracks, including the f16 dequant scratch no caller can name), so
+    // concurrency is safe by construction rather than by scheduling luck.
+    //
+    // Measured on an M2 Pro, interleaved, GPU-clock: Gemma-2-2B Q4_K_M decode
+    // 13.23 -> 12.20 ms/token, and greedy output stays byte-identical to the
+    // serial encoder across Gemma-2 and Gemma-3 on every prompt tried.
+    let (encoder, mut mrs) = (compute_encoder_concurrent(&cmd_buf)?, MemRanges::new());
 
     let embd_resident = if let Some(e) = embd {
         let w = resident_weight_buffer(device, e.weights)?;
@@ -6089,37 +6086,26 @@ pub fn launch_decode_dense_stack(
             )?;
             mrs.end_op(&[o_buf], &[o_buf]);
         }
-        if sandwich {
-            // Eager residual + separate ffn_norm (prefill / CPU parity).
-            mrs.begin_op(&encoder, &[h_buf, o_buf], &[h_buf]);
-            encode_vec_add(&encoder, device, h_buf, o_buf, hidden_dim as u32)?;
-            mrs.end_op(&[h_buf, o_buf], &[h_buf]);
-            mrs.begin_op(&encoder, &[h_buf], &[x2_buf]);
-            encode_rms_norm(
-                &encoder,
-                device,
-                h_buf,
-                &ffn_nw.buffer,
-                x2_buf,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-            mrs.end_op(&[h_buf], &[x2_buf]);
-        } else {
-            // Fuse attn residual + ffn_norm into one dispatch.
-            mrs.begin_op(&encoder, &[h_buf, o_buf], &[h_buf, x2_buf]);
-            encode_add_rms_norm(
-                &encoder,
-                device,
-                h_buf,
-                o_buf,
-                &ffn_nw.buffer,
-                x2_buf,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-            mrs.end_op(&[h_buf, o_buf], &[h_buf, x2_buf]);
-        }
+        // Attn residual + ffn_norm in one dispatch, for every model.
+        //
+        // Sandwich layers used to split this into `vec_add` then `rms_norm`,
+        // which is the same arithmetic in two dispatches: `post_attn_norm`
+        // has already been applied to `o_buf` in place above, so both paths
+        // compute `h += o` then `x2 = rms_norm(h)`. The split was a leftover
+        // from the serial-encoder era -- `encode_add_rms_norm` writes `h`
+        // itself, so the residual is just as eager as the two-dispatch form.
+        mrs.begin_op(&encoder, &[h_buf, o_buf], &[h_buf, x2_buf]);
+        encode_add_rms_norm(
+            &encoder,
+            device,
+            h_buf,
+            o_buf,
+            &ffn_nw.buffer,
+            x2_buf,
+            hidden_dim as u32,
+            rms_eps,
+        )?;
+        mrs.end_op(&[h_buf, o_buf], &[h_buf, x2_buf]);
         // gate ∥ up (llama concurrent)
         mrs.begin_op(&encoder, &[x2_buf], &[gate_buf, up_buf]);
         encode_matvec(&encoder, device, &layer.gate, &gate_w, x2_buf, gate_buf)?;

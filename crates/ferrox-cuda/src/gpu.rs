@@ -388,6 +388,344 @@ extern "C" __global__ void q5_0_matvec(
 ///
 /// Verified: compiled by NVRTC and executed on a real GPU, matching
 /// the CPU reference exactly -- see the module doc comment.
+/// Q4_K matvec with a COALESCED access pattern.
+///
+/// The kernel this replaces walks whole 144-byte super-blocks per
+/// thread (`blk += blockDim.x`), so adjacent lanes read addresses 144
+/// bytes apart and every lane in a warp touches a different cache
+/// line. Measured consequence on an RTX 3060: 19.0 GB/s of weight
+/// traffic, **5.3%** of the card's 360 GB/s, where llama.cpp reaches
+/// 60.4%. A decode matvec is a streaming read of the weights, so that
+/// percentage IS the gap, and the inner arithmetic is irrelevant while
+/// it holds (a `dp4a` port measured under 1%, #142).
+///
+/// Here one warp takes one super-block at a time and lane `l` reads
+/// `qs[4l .. 4l+4)`. Thirty-two lanes then cover the 128 quantized
+/// bytes as one contiguous run instead of 32 scattered ones.
+///
+/// The activation stays f32 on purpose. Quantizing it to int8 is what
+/// llama.cpp does, and on a real checkpoint it diverges from the CPU
+/// reference at token 4, which `ferrox verify` refuses. This change is
+/// meant to be token-identical.
+///
+/// Lane to data mapping, which is the part to get right:
+///   off = 4*l           byte offset into the 128 qs bytes
+///   oi  = l/8           which 32-byte group, so which sub-block PAIR
+///   low nibbles  -> activations at blk*256 + oi*64 + (off%32)
+///   high nibbles -> the same, plus 32
+/// The 32 bytes of a group carry the first 32 activations in their low
+/// nibbles and the next 32 in their high nibbles, so a lane that pairs
+/// byte `i` with activation `i` for both halves reads the wrong place.
+/// Q6_K matvec with a coalesced access pattern.
+///
+/// The kernel this replaces gives each thread a whole 210-byte
+/// super-block, so a warp's 32 loads land 210 bytes apart. Here the
+/// warp takes one super-block and lane `l` takes the index the old
+/// inner loop iterated, which makes `ql[l]`, `ql[l+32]` and `qh[l]`
+/// each contiguous across the warp.
+///
+/// Q6_K is worth doing right after Q4_K because a `Q4_K_M` checkpoint
+/// is not all Q4_K: its output tensor is usually Q6_K, so this kernel
+/// runs every token too.
+///
+/// Same arithmetic and same f32 activations as before, so it stays
+/// token-identical.
+/// CUDA C for the coalesced Q5_K matvec: one warp per row, lane `l`
+/// owning element `l` of each 32-element group, so the warp's loads of
+/// `qs`, `qh` and the activations are each contiguous.
+///
+/// Q5_K adds a fifth bit per weight over Q4_K, held in `qh` as one
+/// BIT-PLANE per group: bit `2*oi` for the group's low nibbles and bit
+/// `2*oi + 1` for its high ones. `q5_k_matvec_coalesced_row` in
+/// `coalesced_twin.rs` is the scalar twin that pins that down.
+pub const Q5_K_MATVEC_COALESCED_KERNEL_SRC: &str = r#"
+__device__ __forceinline__ float ferrox_f16_to_f32_q5co(unsigned short bits) {
+    unsigned int sign = (bits >> 15) & 0x1u;
+    unsigned int exp = (bits >> 10) & 0x1Fu;
+    unsigned int mant = bits & 0x3FFu;
+    float scale;
+    if (exp == 0) {
+        scale = ldexpf((float)mant, -24);
+    } else if (exp == 31) {
+        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
+    } else {
+        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
+    }
+    return sign ? -scale : scale;
+}
+
+__device__ __forceinline__ void ferrox_q4_k_scale_min_q5co(
+    int j, const unsigned char* scales, unsigned char* sc, unsigned char* m
+) {
+    if (j < 4) {
+        *sc = scales[j] & 63;
+        *m = scales[j + 4] & 63;
+    } else {
+        *sc = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        *m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+}
+
+extern "C" __global__ void q5_k_matvec_coalesced(
+    const unsigned char* weights,
+    const float* x,
+    float* out,
+    int rows,
+    int row_bytes,
+    int n_blocks_per_row
+) {
+    const int warps = blockDim.x / 32;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * warps + warp;
+    if (row >= rows) return;
+
+    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
+    float acc = 0.0f;
+
+    for (int blk = 0; blk < n_blocks_per_row; ++blk) {
+        const unsigned char* block = row_ptr + (size_t)blk * 176;
+        const float d = ferrox_f16_to_f32_q5co(
+            (unsigned short)block[0] | ((unsigned short)block[1] << 8));
+        const float dmin = ferrox_f16_to_f32_q5co(
+            (unsigned short)block[2] | ((unsigned short)block[3] << 8));
+        const unsigned char* scales = block + 4;
+        const unsigned char* qh = block + 16;
+        const unsigned char* qs = block + 48;
+        const int x_base = blk * 256;
+        const unsigned char h = qh[lane];
+
+        #pragma unroll
+        for (int oi = 0; oi < 4; ++oi) {
+            unsigned char sc1, m1, sc2, m2;
+            ferrox_q4_k_scale_min_q5co(2 * oi, scales, &sc1, &m1);
+            ferrox_q4_k_scale_min_q5co(2 * oi + 1, scales, &sc2, &m2);
+            const float d1 = d * (float)sc1, min1 = dmin * (float)m1;
+            const float d2 = d * (float)sc2, min2 = dmin * (float)m2;
+            const unsigned char ql = qs[oi * 32 + lane];
+            const unsigned char u1 = (unsigned char)(1u << (2 * oi));
+            const unsigned char u2 = (unsigned char)(2u << (2 * oi));
+            const int xb = x_base + oi * 64;
+            const int hi1 = (h & u1) ? 16 : 0;
+            const int hi2 = (h & u2) ? 16 : 0;
+            acc += (d1 * (float)((ql & 0x0F) + hi1) - min1) * x[xb + lane];
+            acc += (d2 * (float)((ql >> 4) + hi2) - min2) * x[xb + 32 + lane];
+        }
+    }
+
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, s);
+    }
+    if (lane == 0) out[row] = acc;
+}
+"#;
+
+/// CUDA C for the coalesced Q8_0 matvec. A Q8_0 block holds exactly 32
+/// quants, so a warp maps onto one block with no leftovers: lane `l`
+/// takes byte `l` and the warp's load is 32 contiguous bytes, against
+/// the 1088-byte stride the one-thread-per-block kernel used.
+///
+/// The quants are SIGNED; the twin has a test that fails on an
+/// unsigned read.
+pub const Q8_0_MATVEC_COALESCED_KERNEL_SRC: &str = r#"
+__device__ __forceinline__ float ferrox_f16_to_f32_q8co(unsigned short bits) {
+    unsigned int sign = (bits >> 15) & 0x1u;
+    unsigned int exp = (bits >> 10) & 0x1Fu;
+    unsigned int mant = bits & 0x3FFu;
+    float scale;
+    if (exp == 0) {
+        scale = ldexpf((float)mant, -24);
+    } else if (exp == 31) {
+        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
+    } else {
+        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
+    }
+    return sign ? -scale : scale;
+}
+
+extern "C" __global__ void q8_0_matvec_coalesced(
+    const unsigned char* weights,
+    const float* x,
+    float* out,
+    int rows,
+    int row_bytes,
+    int n_blocks_per_row
+) {
+    const int warps = blockDim.x / 32;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * warps + warp;
+    if (row >= rows) return;
+
+    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
+    float acc = 0.0f;
+
+    for (int blk = 0; blk < n_blocks_per_row; ++blk) {
+        const unsigned char* block = row_ptr + (size_t)blk * 34;
+        const float d = ferrox_f16_to_f32_q8co(
+            (unsigned short)block[0] | ((unsigned short)block[1] << 8));
+        const signed char q = (signed char)block[2 + lane];
+        acc += d * (float)q * x[blk * 32 + lane];
+    }
+
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, s);
+    }
+    if (lane == 0) out[row] = acc;
+}
+"#;
+
+pub const Q6_K_MATVEC_COALESCED_KERNEL_SRC: &str = r#"
+__device__ __forceinline__ float ferrox_f16_to_f32_q6co(unsigned short bits) {
+    unsigned int sign = (bits >> 15) & 0x1u;
+    unsigned int exp = (bits >> 10) & 0x1Fu;
+    unsigned int mant = bits & 0x3FFu;
+    float scale;
+    if (exp == 0) {
+        scale = ldexpf((float)mant, -24);
+    } else if (exp == 31) {
+        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
+    } else {
+        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
+    }
+    return sign ? -scale : scale;
+}
+
+extern "C" __global__ void q6_k_matvec_coalesced(
+    const unsigned char* weights,
+    const float* x,
+    float* out,
+    int rows,
+    int row_bytes,
+    int n_blocks_per_row
+) {
+    const int warps = blockDim.x / 32;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * warps + warp;
+    if (row >= rows) return;
+
+    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
+    const int is = lane / 16;
+    float acc = 0.0f;
+
+    for (int blk = 0; blk < n_blocks_per_row; ++blk) {
+        const unsigned char* block = row_ptr + (size_t)blk * 210;
+        const float d = ferrox_f16_to_f32_q6co(
+            (unsigned short)block[208] | ((unsigned short)block[209] << 8));
+        const int x_base = blk * 256;
+
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const unsigned char* ql = block + half * 64;
+            const unsigned char* qh = block + 128 + half * 32;
+            const signed char* sc = (const signed char*)(block + 192 + half * 8);
+            const int xh = x_base + half * 128;
+
+            const int q1 = (int)((ql[lane] & 0x0F) | ((qh[lane] & 0x03) << 4)) - 32;
+            const int q2 = (int)((ql[lane + 32] & 0x0F) | (((qh[lane] >> 2) & 0x03) << 4)) - 32;
+            const int q3 = (int)((ql[lane] >> 4) | (((qh[lane] >> 4) & 0x03) << 4)) - 32;
+            const int q4 = (int)((ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 0x03) << 4)) - 32;
+
+            acc += d * (float)sc[is] * (float)q1 * x[xh + lane];
+            acc += d * (float)sc[is + 2] * (float)q2 * x[xh + lane + 32];
+            acc += d * (float)sc[is + 4] * (float)q3 * x[xh + lane + 64];
+            acc += d * (float)sc[is + 6] * (float)q4 * x[xh + lane + 96];
+        }
+    }
+
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, s);
+    }
+    if (lane == 0) out[row] = acc;
+}
+"#;
+
+pub const Q4_K_MATVEC_COALESCED_KERNEL_SRC: &str = r#"
+__device__ __forceinline__ float ferrox_f16_to_f32_co(unsigned short bits) {
+    unsigned int sign = (bits >> 15) & 0x1u;
+    unsigned int exp = (bits >> 10) & 0x1Fu;
+    unsigned int mant = bits & 0x3FFu;
+    float scale;
+    if (exp == 0) {
+        scale = ldexpf((float)mant, -24);
+    } else if (exp == 31) {
+        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
+    } else {
+        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
+    }
+    return sign ? -scale : scale;
+}
+
+__device__ __forceinline__ void ferrox_q4_k_scale_min_co(
+    int j, const unsigned char* scales, unsigned char* sc, unsigned char* m
+) {
+    if (j < 4) {
+        *sc = scales[j] & 63;
+        *m = scales[j + 4] & 63;
+    } else {
+        *sc = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        *m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+}
+
+extern "C" __global__ void q4_k_matvec_coalesced(
+    const unsigned char* weights,
+    const float* x,
+    float* out,
+    int rows,
+    int row_bytes,
+    int n_blocks_per_row
+) {
+    const int warps = blockDim.x / 32;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * warps + warp;
+    if (row >= rows) return;
+
+    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
+    const int off = 4 * lane;
+    const int oi = lane / 8;
+    const int within = off % 32;
+
+    float acc = 0.0f;
+    for (int blk = 0; blk < n_blocks_per_row; ++blk) {
+        const unsigned char* block = row_ptr + (size_t)blk * 144;
+        const float d = ferrox_f16_to_f32_co(
+            (unsigned short)block[0] | ((unsigned short)block[1] << 8));
+        const float dmin = ferrox_f16_to_f32_co(
+            (unsigned short)block[2] | ((unsigned short)block[3] << 8));
+        const unsigned char* scales = block + 4;
+        const unsigned char* qs = block + 16;
+
+        unsigned char sc1, m1, sc2, m2;
+        ferrox_q4_k_scale_min_co(2 * oi, scales, &sc1, &m1);
+        ferrox_q4_k_scale_min_co(2 * oi + 1, scales, &sc2, &m2);
+        const float d1 = d * (float)sc1, min1 = dmin * (float)m1;
+        const float d2 = d * (float)sc2, min2 = dmin * (float)m2;
+
+        // The whole warp's 32 loads cover qs[0..128) contiguously.
+        const uchar4 w = *(const uchar4*)(qs + off);
+        const int xb = blk * 256 + oi * 64 + within;
+        const unsigned char wb[4] = { w.x, w.y, w.z, w.w };
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            acc += (d1 * (float)(wb[i] & 0x0F) - min1) * x[xb + i];
+            acc += (d2 * (float)(wb[i] >> 4) - min2) * x[xb + 32 + i];
+        }
+    }
+
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, s);
+    }
+    if (lane == 0) out[row] = acc;
+}
+"#;
+
 pub const Q4_K_MATVEC_KERNEL_SRC: &str = r#"
 extern "C" __device__ float ferrox_f16_to_f32(unsigned short bits) {
     unsigned int sign = (bits >> 15) & 0x1u;
@@ -745,7 +1083,11 @@ pub(crate) fn ensure_module_loaded_lazy(
 /// process-wide and persistent (see `shared_device`/`ensure_module_loaded`) --
 /// quantized weight buffers are also cached by host pointer+length
 /// (`resident_cuda_weights`) so decode does not re-upload multi-GB
-/// matrices every token. Activations still upload per call.
+/// matrices every token. Activations still upload per call, and that is
+/// deliberate: keeping them device-resident between matmuls was tried
+/// (PR #136) and measured 22% SLOWER on a GTX 1080, because decode is
+/// kernel-bound at ~90% utilization rather than host-bound. See
+/// `docs/plans/cpu-cuda-parity.md` step 2.
 #[allow(clippy::too_many_arguments)] // shared internal launch plumbing; each parameter is a distinct, clearly-named buffer/shape value, not something worth bundling into a struct for one private callee.
 fn launch_matvec(
     kernel_src: &'static str,
@@ -757,11 +1099,9 @@ fn launch_matvec(
     row_bytes: usize,
     n_blocks_per_row: usize,
 ) -> Result<Vec<f32>, CudaError> {
+    // Which kernel actually runs is `enqueue_matvec`'s decision, so
+    // every caller gets the same one -- see `matvec_launch_plan`.
     let dev = shared_device()?;
-    // If the previous decode left a matching host activation marked
-    // resident, skip a redundant HtoD (the bytes are still the same;
-    // a future DeviceAct-TLS path will skip the copy entirely).
-    let _reuse = take_resident_activation_if_matches(x);
     let d_x = dev
         .htod_copy(x.to_vec())
         .map_err(|e| CudaError::Launch(format!("{e:?}")))?;
@@ -776,12 +1116,8 @@ fn launch_matvec(
     };
     // `_weights` holds the resident-weight Arc alive until the DtoH sync.
     let (d_out, _weights) = enqueue_matvec(&dev, &launch, &d_x)?;
-    let out = dev
-        .dtoh_sync_copy(&d_out)
-        .map_err(|e| CudaError::Launch(format!("{e:?}")))?;
-    // Mark result resident for a possible follow-up matvec on the same
-    // host buffer (caller must keep `out` alive and pass the same ptr).
-    Ok(out)
+    dev.dtoh_sync_copy(&d_out)
+        .map_err(|e| CudaError::Launch(format!("{e:?}")))
 }
 
 /// Enqueues one matvec kernel on the shared device's default stream:
@@ -794,8 +1130,100 @@ fn launch_matvec(
 /// output slice plus the resident-weight `Arc`, which the caller must
 /// keep alive until it syncs (the kernel reads that buffer
 /// asynchronously). This is the single per-launch primitive shared by
-/// [`launch_matvec`], [`launch_matvec_multi`], [`matvec_into`], and
+/// [`launch_matvec`], [`launch_matvec_multi`] and
 /// [`launch_dense_ffn_swiglu`].
+/// The coalesced matvec kernel for `fn_name`, or `None` if that quant
+/// kind still runs the old one-thread-per-super-block kernel.
+///
+/// This is the ONLY place a coalesced kernel is named. Four launchers
+/// that each hard-coded one kind is exactly the shape this repo keeps
+/// getting bitten by: structures that must agree with nothing enforcing
+/// it. `every_coalesced_kernel_is_reachable_from_the_table` fails if a
+/// kernel const is added and this table is not updated, so a kernel
+/// cannot sit in the file unreachable.
+fn coalesced_matvec_kernel(fn_name: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match fn_name {
+        "q4_k_matvec" => Some((
+            Q4_K_MATVEC_COALESCED_KERNEL_SRC,
+            "ferrox_q4_k_coalesced",
+            "q4_k_matvec_coalesced",
+        )),
+        "q5_k_matvec" => Some((
+            Q5_K_MATVEC_COALESCED_KERNEL_SRC,
+            "ferrox_q5_k_coalesced",
+            "q5_k_matvec_coalesced",
+        )),
+        "q6_k_matvec" => Some((
+            Q6_K_MATVEC_COALESCED_KERNEL_SRC,
+            "ferrox_q6_k_coalesced",
+            "q6_k_matvec_coalesced",
+        )),
+        "q8_0_matvec" => Some((
+            Q8_0_MATVEC_COALESCED_KERNEL_SRC,
+            "ferrox_q8_0_coalesced",
+            "q8_0_matvec_coalesced",
+        )),
+        _ => None,
+    }
+}
+
+/// How many warps a coalesced matvec block carries. Eight keeps enough
+/// rows in flight per SM to hold loads outstanding, which is the thing
+/// those kernels exist to fix.
+const COALESCED_WARPS_PER_BLOCK: usize = 8;
+
+/// Which kernel a matvec actually runs, and the geometry that kernel
+/// needs.
+///
+/// The two must agree: a coalesced kernel launched with the
+/// block-per-row geometry computes one row per BLOCK while indexing as
+/// if it had one row per WARP, and returns wrong numbers rather than
+/// failing. That is the repo's dominant bug shape, so the choice is
+/// made once, here, by the only function that decides it, and
+/// `the_plan_pairs_each_kernel_with_its_own_geometry` checks the
+/// pairing on the host.
+///
+/// This lives in `enqueue_matvec` rather than in `launch_matvec`
+/// because the fused dense FFN and `launch_matvec_multi` enqueue
+/// directly. Routing at the `launch_matvec` level left the FFN --
+/// gate, up and down, about 83% of the weight bytes a Llama-3.2-3B
+/// decode step reads -- on the uncoalesced kernels while the
+/// benchmarks said "coalesced".
+fn matvec_launch_plan(
+    fn_name: &'static str,
+    kernel_src: &'static str,
+    module_name: &'static str,
+    rows: usize,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    cudarc::driver::LaunchConfig,
+) {
+    match coalesced_matvec_kernel(fn_name) {
+        Some((src, module, entry)) => (
+            src,
+            module,
+            entry,
+            cudarc::driver::LaunchConfig {
+                grid_dim: (rows.div_ceil(COALESCED_WARPS_PER_BLOCK) as u32, 1, 1),
+                block_dim: ((COALESCED_WARPS_PER_BLOCK * 32) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+        ),
+        None => (
+            kernel_src,
+            module_name,
+            fn_name,
+            cudarc::driver::LaunchConfig {
+                grid_dim: (rows as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+            },
+        ),
+    }
+}
+
 fn enqueue_matvec(
     dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
     launch: &MatvecLaunch<'_>,
@@ -809,26 +1237,22 @@ fn enqueue_matvec(
 > {
     use cudarc::driver::LaunchAsync;
 
-    ensure_module_loaded(dev, launch.kernel_src, launch.module_name, launch.fn_name)?;
-    let func = dev
-        .get_func(launch.module_name, launch.fn_name)
-        .ok_or_else(|| {
-            CudaError::KernelCompile(format!(
-                "function '{}' not found after load_ptx",
-                launch.fn_name
-            ))
-        })?;
+    let (src, module, entry, cfg) = matvec_launch_plan(
+        launch.fn_name,
+        launch.kernel_src,
+        launch.module_name,
+        launch.rows,
+    );
+
+    ensure_module_loaded(dev, src, module, entry)?;
+    let func = dev.get_func(module, entry).ok_or_else(|| {
+        CudaError::KernelCompile(format!("function '{entry}' not found after load_ptx"))
+    })?;
 
     let d_weights = resident_cuda_weights(dev, launch.weights)?;
     let mut d_out = dev
         .alloc_zeros::<f32>(launch.rows)
         .map_err(|e| CudaError::Launch(format!("output alloc: {e:?}")))?;
-
-    let cfg = cudarc::driver::LaunchConfig {
-        grid_dim: (launch.rows as u32, 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
-    };
 
     unsafe {
         func.launch(
@@ -842,7 +1266,7 @@ fn enqueue_matvec(
                 launch.n_blocks_per_row as i32,
             ),
         )
-        .map_err(|e| CudaError::Launch(format!("kernel {}: {e:?}", launch.fn_name)))?;
+        .map_err(|e| CudaError::Launch(format!("kernel {entry}: {e:?}")))?;
     }
 
     Ok((d_out, d_weights))
@@ -1237,77 +1661,6 @@ pub fn launch_fused_add_rmsnorm(
         .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm download: {e:?}")))
 }
 
-/// A device-resident activation vector: a `CudaSlice<f32>` plus its
-/// logical length, so a matvec's output can be fed straight into the
-/// next matvec without a DtoH/HtoD round-trip (the exact per-call
-/// upload/download overhead that made CUDA decode bandwidth-starved).
-/// Mirrors Metal's on-device activation residency; created by
-/// [`upload_act`], consumed by [`matvec_into`], read back by
-/// [`download_act`].
-pub struct DeviceAct {
-    slice: cudarc::driver::CudaSlice<f32>,
-    len: usize,
-}
-
-// SAFETY: the slice lives on the process-wide shared CudaDevice and is
-// only touched by kernels launched on that device; same sharing model
-// as ResidentCudaWeights above.
-unsafe impl Send for DeviceAct {}
-unsafe impl Sync for DeviceAct {}
-
-impl DeviceAct {
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-/// Uploads a host activation vector to the device once, returning a
-/// [`DeviceAct`] that later matvecs can consume in place (no repeated
-/// HtoD). One HtoD copy; the shared persistent device/context is reused.
-pub fn upload_act(x: &[f32]) -> Result<DeviceAct, CudaError> {
-    let dev = shared_device()?;
-    let slice = dev
-        .htod_copy(x.to_vec())
-        .map_err(|e| CudaError::Launch(format!("act upload: {e:?}")))?;
-    Ok(DeviceAct {
-        slice,
-        len: x.len(),
-    })
-}
-
-/// Downloads a [`DeviceAct`] back to a host `Vec<f32>` (one DtoH, which
-/// also synchronizes the stream). Used at the edge of a chained matvec
-/// sequence, exactly once, instead of once per matvec.
-pub fn download_act(act: &DeviceAct) -> Result<Vec<f32>, CudaError> {
-    let dev = shared_device()?;
-    dev.dtoh_sync_copy(&act.slice)
-        .map_err(|e| CudaError::Launch(format!("act download: {e:?}")))
-}
-
-/// Runs one matvec whose activation input is already on the device,
-/// producing another device-resident activation — no HtoD of `x`, no
-/// DtoH of the result. This is the device-resident counterpart of the
-/// `launch_*_matvec` host wrappers: chain several of these (plus
-/// [`silu_mul_device`], via [`launch_dense_ffn_swiglu`]) between a
-/// single [`upload_act`] and [`download_act`] to keep a whole FFN /
-/// projection stack on-GPU.
-pub fn matvec_into(launch: &MatvecLaunch<'_>, x: &DeviceAct) -> Result<DeviceAct, CudaError> {
-    let dev = shared_device()?;
-    let (d_out, _weights) = enqueue_matvec(&dev, launch, &x.slice)?;
-    // DtoH-free: the resident-weight Arc is dropped here, but the kernel
-    // has already been enqueued reading it on the same (default) stream,
-    // and the *cached* Arc in CUDA_WEIGHT_CACHE keeps the buffer alive
-    // regardless — resident_cuda_weights never evicts.
-    Ok(DeviceAct {
-        slice: d_out,
-        len: launch.rows,
-    })
-}
-
 /// Fused dense SwiGLU FFN entirely on-device: uploads `x` once, runs
 /// the gate and up matvecs (device-resident weights), fuses
 /// `silu(gate)*up` in a kernel, runs the down matvec, and downloads the
@@ -1344,64 +1697,6 @@ pub fn launch_dense_ffn_swiglu(
 
     dev.dtoh_sync_copy(&d_out)
         .map_err(|e| CudaError::Launch(format!("ffn out download: {e:?}")))
-}
-
-/// Thread-local resident activation buffer (output of a matvec that
-/// might be reused as input to the next call, skipping host↔device
-/// upload/download). Mirrors Metal's `RESIDENT_ACT` TLS in
-/// `ferrox-metal/src/gpu.rs` -- same pattern: decoder hands back the
-/// output buffer if it knows the next matvec will consume it, and
-/// `launch_matvec` (or a future fused-stack path) can skip `htod_copy`
-/// when the pointer+length match.
-///
-/// Not yet wired into `launch_matvec` itself (future work: check TLS
-/// before `htod_copy`, skip upload if matches, download result and
-/// update TLS if decoder will hand it back) -- the public
-/// `set_resident_activation` / `clear_resident_activation` functions
-/// are the API surface for that integration.
-#[allow(dead_code)] // Infrastructure for future launch_matvec integration.
-#[derive(Clone, Copy)]
-struct ResidentActivation {
-    /// Raw host pointer (borrowed, not owned -- caller must keep alive).
-    ptr: *const f32,
-    len: usize,
-}
-
-thread_local! {
-    static RESIDENT_ACT: std::cell::Cell<Option<ResidentActivation>> = const { std::cell::Cell::new(None) };
-}
-
-/// Stores a resident activation buffer pointer for the current thread.
-/// Used by dense-decode paths when the output of one matvec (e.g.
-/// final_norm) is known to be the input of the next (e.g. lm_head).
-/// Call this *after* downloading the result to host, passing the host
-/// slice pointer+length. The next `launch_matvec` call can skip
-/// `htod_copy` if it sees the same pointer.
-pub fn set_resident_activation(x: &[f32]) {
-    RESIDENT_ACT.set(Some(ResidentActivation {
-        ptr: x.as_ptr(),
-        len: x.len(),
-    }));
-}
-
-/// Clears the resident activation TLS (use after a decode that doesn't
-/// consume it, or at the start of a fresh generation, to avoid stale
-/// pointer reuse).
-pub fn clear_resident_activation() {
-    RESIDENT_ACT.set(None);
-}
-
-/// Checks if a resident activation matches `x` (same pointer+length),
-/// and if so, returns `true` and clears the TLS. `launch_matvec` can
-/// then skip `htod_copy(x)` because the data is already on device from
-/// the prior call.
-///
-/// Not yet called by `launch_matvec` -- future work to wire this check
-/// in before the `htod_copy` inside that function.
-fn take_resident_activation_if_matches(x: &[f32]) -> bool {
-    RESIDENT_ACT
-        .take()
-        .is_some_and(|res| res.len == x.len() && res.ptr == x.as_ptr())
 }
 
 #[cfg(test)]
@@ -1747,6 +2042,176 @@ mod tests {
         (weights, x, expected)
     }
 
+    /// Every coalesced kernel against its scalar twin, on a real
+    /// device. The twins prove the lane mapping without a GPU; this
+    /// proves the CUDA C, the vector loads and the warp-shuffle
+    /// reduction, none of which a twin covers.
+    ///
+    /// One test over the table rather than one test per kind, so a new
+    /// kind cannot be added with its hardware check quietly left out.
+    ///
+    ///   cargo test -p ferrox-cuda --features cuda -- --ignored
+    #[test]
+    #[ignore = "requires real CUDA hardware -- verifies every coalesced matvec against its scalar twin"]
+    fn every_coalesced_matvec_matches_its_twin() {
+        type Twin = fn(&[u8], &[f32], usize) -> f32;
+        let cases: &[(&str, usize, usize, u32, Twin)] = &[
+            (
+                "Q4_K",
+                144,
+                256,
+                7,
+                crate::coalesced_twin::q4_k_matvec_coalesced_row,
+            ),
+            (
+                "Q5_K",
+                176,
+                256,
+                17,
+                crate::coalesced_twin::q5_k_matvec_coalesced_row,
+            ),
+            (
+                "Q6_K",
+                210,
+                256,
+                11,
+                crate::coalesced_twin::q6_k_matvec_coalesced_row,
+            ),
+            (
+                "Q8_0",
+                34,
+                32,
+                23,
+                crate::coalesced_twin::q8_0_matvec_coalesced_row,
+            ),
+        ];
+        let rows = 37usize; // not a multiple of the warps per block
+        let n_blocks_per_row = 3usize;
+        for (kind, block_bytes, per_block, seed, twin) in cases {
+            let row_bytes = n_blocks_per_row * block_bytes;
+            let cols = n_blocks_per_row * per_block;
+            let weights = pseudo_bytes(*seed, rows * row_bytes);
+            let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.021).sin()).collect();
+            // Enter through the ordinary kernel identity, not the
+            // coalesced one, so this exercises the ROUTING too: if
+            // `matvec_launch_plan` stopped substituting the coalesced
+            // kernel, the result would match a dequantize-then-dot
+            // reference but not the coalesced twin's lane order.
+            let (src, module, fn_name) = super::matvec_launch_meta(kind)
+                .unwrap_or_else(|| panic!("{kind} has no matvec kernel"));
+            let got = super::launch_matvec(
+                src,
+                module,
+                fn_name,
+                &weights,
+                &x,
+                rows,
+                row_bytes,
+                n_blocks_per_row,
+            )
+            .unwrap_or_else(|e| panic!("{kind}: {e:?}"));
+            assert_eq!(got.len(), rows, "{kind}");
+            for r in 0..rows {
+                let row = &weights[r * row_bytes..(r + 1) * row_bytes];
+                let want = twin(row, &x, n_blocks_per_row);
+                assert!(
+                    !(want.is_nan() ^ got[r].is_nan()),
+                    "{kind} row {r}: GPU={} twin={want}",
+                    got[r]
+                );
+                assert_close_relative(got[r], want, r);
+            }
+        }
+    }
+
+    /// A coalesced kernel launched with the block-per-row geometry
+    /// indexes as if it had one row per warp while getting one row per
+    /// block, and returns wrong numbers rather than failing. So the
+    /// kernel and its geometry are chosen together, and this checks
+    /// they stay that way -- on the host, with no GPU.
+    #[test]
+    fn the_plan_pairs_each_kernel_with_its_own_geometry() {
+        let rows = 37usize; // not a multiple of the warps per block
+
+        for kind in ["Q4_K", "Q5_K", "Q6_K", "Q8_0"] {
+            let (src, module, fn_name) = super::matvec_launch_meta(kind).expect("kernel");
+            let (plan_src, plan_module, entry, cfg) =
+                super::matvec_launch_plan(fn_name, src, module, rows);
+            assert!(
+                entry.ends_with("_coalesced"),
+                "{kind}: plan chose {entry}, not the coalesced kernel"
+            );
+            assert!(
+                plan_src.contains(entry) && plan_module.ends_with("_coalesced"),
+                "{kind}: plan's source and module do not match {entry}"
+            );
+            let warps = super::COALESCED_WARPS_PER_BLOCK as u32;
+            assert_eq!(cfg.block_dim, (warps * 32, 1, 1), "{kind}: block_dim");
+            assert_eq!(cfg.shared_mem_bytes, 0, "{kind}: needs no shared memory");
+            // Every row must land in some warp, including the tail.
+            assert!(
+                cfg.grid_dim.0 * warps >= rows as u32,
+                "{kind}: {} blocks x {warps} warps does not cover {rows} rows",
+                cfg.grid_dim.0
+            );
+            assert!(
+                (cfg.grid_dim.0 - 1) * warps < rows as u32,
+                "{kind}: {} blocks is more than the tail needs",
+                cfg.grid_dim.0
+            );
+        }
+
+        // A kind with no coalesced kernel keeps the old geometry, and
+        // keeps its own kernel rather than silently getting another's.
+        let (src, module, fn_name) = super::matvec_launch_meta("Q4_0").expect("kernel");
+        let (plan_src, plan_module, entry, cfg) =
+            super::matvec_launch_plan(fn_name, src, module, rows);
+        assert_eq!(entry, fn_name);
+        assert!(std::ptr::eq(plan_src, src) && std::ptr::eq(plan_module, module));
+        assert_eq!(cfg.grid_dim, (rows as u32, 1, 1), "one block per row");
+        assert_eq!(cfg.block_dim, (256, 1, 1));
+        assert!(
+            cfg.shared_mem_bytes > 0,
+            "the block-per-row kernels reduce through shared memory"
+        );
+    }
+
+    /// A coalesced kernel the table does not name is dead code that
+    /// reads as coverage. The entry points are derived from this file,
+    /// not restated, so adding a kernel without routing it fails here.
+    #[test]
+    fn every_coalesced_kernel_is_reachable_from_the_table() {
+        let src = include_str!("gpu.rs");
+        let mut found = 0usize;
+        for line in src.lines() {
+            let Some(rest) = line.strip_prefix(r#"extern "C" __global__ void "#) else {
+                continue;
+            };
+            let Some(entry) = rest.split('(').next() else {
+                continue;
+            };
+            let Some(base) = entry.strip_suffix("_coalesced") else {
+                continue;
+            };
+            found += 1;
+            let routed = super::coalesced_matvec_kernel(base).unwrap_or_else(|| {
+                panic!("kernel {entry} is not reachable: no table row for {base}")
+            });
+            assert_eq!(
+                routed.2, entry,
+                "table row for {base} names the wrong entry point"
+            );
+            assert!(
+                routed.0.contains(entry),
+                "table row for {base} points at a source that does not define {entry}"
+            );
+        }
+        assert!(
+            found >= 4,
+            "expected at least four coalesced kernels, found {found}"
+        );
+    }
+
     #[test]
     #[ignore = "requires real CUDA hardware -- verified passing on an RTX 3060 (vast.ai, 2026-07-31) with the relative-tolerance fix; run with --ignored on a CUDA-capable machine to re-verify"]
     fn launch_q4_k_matvec_matches_cpu_reference() {
@@ -1981,39 +2446,6 @@ mod tests {
         assert_eq!(gpu.len(), expected.len());
         for (i, (got, want)) in gpu.iter().zip(expected.iter()).enumerate() {
             assert_close_relative(*got, *want, i);
-        }
-    }
-
-    /// `upload_act` → `matvec_into` → `download_act` (device-resident
-    /// activation, no per-matvec host round-trip) must agree with the
-    /// host-wrapper `launch_q8_0_matvec` for the same weights/input.
-    #[test]
-    #[ignore = "requires real CUDA hardware -- run with --ignored to verify DeviceAct residency vs the host-wrapper matvec"]
-    fn matvec_into_matches_host_wrapper() {
-        let rows = 4;
-        let cols = 64;
-        let row_bytes = (cols / ferrox_quant::Q8_0_BLOCK_ELEMS) * ferrox_quant::Q8_0_BLOCK_BYTES;
-        let (weights, x, _expected) = real_q8_0_test_matrix(rows, cols);
-
-        let host = launch_q8_0_matvec(&weights, &x, rows, row_bytes, cols / 32)
-            .expect("host-wrapper matvec must launch");
-
-        let d_x = upload_act(&x).expect("upload");
-        let launch = MatvecLaunch {
-            kernel_src: Q8_0_MATVEC_KERNEL_SRC,
-            module_name: "ferrox_q8_0",
-            fn_name: "q8_0_matvec",
-            weights: weights.as_slice(),
-            rows,
-            row_bytes,
-            n_blocks_per_row: cols / 32,
-        };
-        let d_out = matvec_into(&launch, &d_x).expect("device matvec");
-        let device = download_act(&d_out).expect("download");
-
-        assert_eq!(host.len(), device.len());
-        for (i, (h, d)) in host.iter().zip(device.iter()).enumerate() {
-            assert_close_relative(*d, *h, i);
         }
     }
 

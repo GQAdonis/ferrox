@@ -148,13 +148,67 @@ now ruled out**:
 - **CUDA graphs are not it, yet.** `FERROX_CUDA_GRAPH=1` measures
   11.80 against 11.84 off, exactly as its own doc predicts: nothing
   enqueues into a captured stream, so it is groundwork.
-- **The GPU is idle.** `nvidia-smi` reports **36% utilization** during
-  decode. Two thirds of the time nothing is computing, so the cost is
-  host-side: launch overhead, per-token synchronisation, or per-launch
-  allocation. That is where to look next, and it is consistent with a
-  gap that is uniform across every quant kind.
+- **The GPU is NOT idle, and the claim that it was is retracted.** An
+  earlier version of this plan said `nvidia-smi` reported 36%
+  utilization during decode, and concluded the cost was host-side. That
+  number came from a single instantaneous sample taken AFTER a bench
+  run had finished, so it caught an idle moment. Sampled five times
+  DURING a `tg256` decode on a GTX 1080, `main` sits at **86% to 93%**.
+  Decode is **kernel-bound**, and the host-side theory this plan was
+  built on for a day was wrong.
 
-**The cause is identified, and the fix is already written.**
+  The correction cost a PR (#136, measured 22% SLOWER on hardware:
+  8.24 against 10.55 tok/s). The arithmetic that should have caught it
+  was available before the code was written: at 36% utilization,
+  removing every host round-trip buys at most 1/0.36 = 2.8x against a
+  9x to 17x gap. A lever that cannot reach the target is the wrong
+  lever even if the diagnosis is right, and here the diagnosis was also
+  wrong.
+
+**And prefill is a second, larger problem that widens with hardware.**
+Re-measured on an RTX 3060 (Ampere): prefill is **55x to 57x** off
+llama.cpp, against ~11x on the GTX 1080. llama.cpp is 2.4x faster on
+Ampere than on Pascal; ferrox is not faster at all. Decode is roughly
+unchanged at 11.5x to 12.2x. The GPU sits about half idle during
+prefill (0%, 57%, 50%) where decode runs it at ~90%, so the two have
+different signatures and are probably different bugs. Thread count is
+not it: `-t 4` against ferrox's chosen `-t 1` is worth 25% and leaves
+44x.
+
+Treat the 50% as a lead needing repeated sampling, not a conclusion.
+One instantaneous utilization sample already cost this plan a day and a
+PR.
+
+**What llama.cpp's CUDA backend does**, read out of
+`.scratch/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu`. Kept because it
+is true and useful, with the caveat that it is NOT the explanation for
+this gap:
+
+- `ggml_backend_cuda_graph_compute` runs a whole token's graph, and its
+  node loop contains **zero** `cudaStreamSynchronize` or
+  `cudaDeviceSynchronize` calls. Every sync in the file is at the graph
+  boundary, in `tensor_set` / `tensor_get` / `cpy_tensor`.
+- Every tensor, including every intermediate activation, is allocated
+  in a device buffer up front. Residency is a tensor's default state,
+  not an optimisation applied to a pair of calls, so the host never
+  sees an intermediate.
+
+That is a real architectural difference and it settles the identity
+question a residency scheme would face: a tensor's device buffer IS its
+identity, for its lifetime, which is stronger than any length or epoch
+comparison. But ferrox's decode already runs the GPU at ~90%, so it is
+not waiting on the host, and closing this difference would not close
+the gap. Recorded so the next reader does not re-derive it and reach
+the conclusion this plan already retracted.
+
+**The cause is the kernels.** ferrox's CUDA matvec uses one 256-thread
+block per row with a shared-memory tree reduction; ggml-cuda uses
+warp-level `dp4a` with no shared-memory round trip. At ~90%
+utilization and 9x to 17x off, that is where essentially all of the
+difference is. Compare one kernel against its ggml-cuda equivalent for
+the same kind and shape, and close the arithmetic.
+
+**A dead API that should still go.** 
 `ferrox-cuda/src/gpu.rs` defines `DeviceAct` / `upload_act` /
 `matvec_into` / `download_act`, whose doc says they exist "so a
 matvec's output can be fed straight into the next matvec without a
@@ -165,8 +219,14 @@ that file.** The decode path takes `launch_matvec`, which returns
 uploads, allocates, launches, synchronises and downloads, on the order
 of a hundred times per token.
 
-**Exit:** wire the chaining, then before/after `tg128` on the same GPU
-plus `nvidia-smi` utilization, which should rise from 36%.
+Five DtoH points exist per dense decode layer and chaining can reach
+only three of them: norms, RoPE and the attention reduction sit between
+the matmuls on the host, so there is no consecutive-matmul pair left
+for `matvec_into` to serve. Measured, and the reason the narrow fix
+could never have worked even had the diagnosis been right.
+
+**Exit:** tok/s against llama.cpp on the same GPU and model, with
+utilization already high on both sides. Not a utilization target.
 
 **The hazard to design around first.** Metal's equivalent
 (`take_resident_activation_if_matches`) matches on LENGTH alone, which
@@ -280,7 +340,18 @@ all, which is honest and temporary.
   and loses at 135M on aarch64. A single-machine ledger would have
   published either as universal.
 - **Do not benchmark on a laptop with a UI.** Rent a box. The whole
-  investigation behind this plan cost $0.49.
+  investigation behind this plan cost under a dollar.
+- **One instantaneous sample is not a measurement.** The claim that
+  CUDA decode ran at 36% GPU utilization came from a single
+  `nvidia-smi` taken after a bench had finished. It sent a day of work
+  at a host-side cost that does not exist: the real figure, sampled
+  during the run, is 86% to 93%. Sample repeatedly, and sample WHILE
+  the thing is running.
+- **Check whether the lever can reach the target before pulling it.**
+  At the (wrong) 36% figure, removing every host round-trip was worth
+  at most 2.8x against a 9x to 17x gap. That arithmetic was in the
+  agent's PR body before the code was written, and reading past it cost
+  a merged-nothing PR.
 
 ## Status
 

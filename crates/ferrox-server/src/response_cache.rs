@@ -72,6 +72,18 @@ pub struct GenerationKey {
     pub json_object: bool,
     pub grammar: Option<GrammarKey>,
     pub ignore_eos: bool,
+    /// The requested reasoning budget, `None` when unrestricted. A
+    /// budget cuts the thought and so changes the answer.
+    pub reasoning_budget: Option<u32>,
+    /// The LoRA scales the generation ran under, by adapter id, as f32
+    /// bits; `None` when the model holds no adapter. KEYED because the
+    /// scales are the weights: `POST /lora-adapters` changes the answer
+    /// to an identical request on an identical model, and so does a
+    /// request's own `lora` field. `crate::lora::resolve_request` fills
+    /// the EFFECTIVE vector in whenever an adapter is loaded, precisely
+    /// so this key can see a change made by a POST between two
+    /// identical requests.
+    pub lora: Option<Vec<u32>>,
 }
 
 /// A compiled grammar, in a form a hashed cache key can hold.
@@ -113,7 +125,7 @@ impl Hash for GrammarKey {
 /// The destructure below is exhaustive ON PURPOSE, for the same reason
 /// [`sampling_key`]'s is: a field added to `GenerationParams` stops this
 /// crate compiling, HERE, until someone decides whether it belongs in
-/// the cache key. Three of the ten fields are deliberately NOT keyed and
+/// the cache key. Three of the eleven fields are deliberately NOT keyed and
 /// each says why at its `_` binding -- an exclusion on the record is a
 /// decision; a field nobody looked at is the bug in #35.
 pub fn generation_key(params: &GenerationParams) -> GenerationKey {
@@ -153,6 +165,8 @@ pub fn generation_key(params: &GenerationParams) -> GenerationKey {
         // this cache is correct.
         cancel: _,
         ignore_eos,
+        reasoning_budget,
+        lora,
     } = params;
     GenerationKey {
         max_tokens: *max_tokens,
@@ -168,6 +182,12 @@ pub fn generation_key(params: &GenerationParams) -> GenerationKey {
         json_object: *json_object,
         grammar: grammar.clone().map(GrammarKey),
         ignore_eos: *ignore_eos,
+        // The number, not the plan: the plan is derived from the number,
+        // the model and the prompt, all three already keyed.
+        reasoning_budget: reasoning_budget.key(),
+        lora: lora
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.to_bits()).collect()),
     }
 }
 
@@ -195,10 +215,33 @@ pub struct SamplingKey {
     pub penalty_last_n: usize,
     pub presence_penalty_bits: u32,
     pub frequency_penalty_bits: u32,
+    pub typical_p_bits: u32,
+    pub top_n_sigma_bits: u32,
+    pub xtc_probability_bits: u32,
+    pub xtc_threshold_bits: u32,
+    /// DRY, as the configuration a caller SPELLED rather than as the
+    /// tokenised breaker map it resolved to. The map is a function of
+    /// that configuration and the model, and the model is already part
+    /// of [`CacheKey`], so hashing the strings keys the same answers
+    /// and costs a few bytes instead of a walk over the vocabulary.
+    pub dry: DryKey,
     /// The ORDER the chain ran in (llama.cpp's `samplers`). Two
     /// requests that differ only in it get different answers, so it is
     /// a key field like any other knob.
     pub sampler_order: ferrox_models::sampler_order::SamplerOrder,
+}
+
+/// The DRY half of [`SamplingKey`]. Its own struct because
+/// `DryParams` holds an `Arc` to a map that is neither `Hash` nor `Eq`,
+/// and because every field here is one a caller can change.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DryKey {
+    pub multiplier_bits: u32,
+    pub base_bits: u32,
+    pub allowed_length: i32,
+    pub penalty_last_n: i32,
+    pub total_context_size: usize,
+    pub sequence_breakers: Vec<String>,
 }
 
 /// The cache-key form of a resolved sampling configuration.
@@ -217,6 +260,11 @@ pub fn sampling_key(params: &SamplingParams) -> SamplingKey {
         top_p,
         min_p,
         top_k,
+        typical_p,
+        top_n_sigma,
+        xtc_probability,
+        xtc_threshold,
+        dry,
         repetition_penalty,
         penalty_last_n,
         presence_penalty,
@@ -228,6 +276,18 @@ pub fn sampling_key(params: &SamplingParams) -> SamplingKey {
         top_p_bits: top_p.to_bits(),
         min_p_bits: min_p.to_bits(),
         top_k: *top_k,
+        typical_p_bits: typical_p.to_bits(),
+        top_n_sigma_bits: top_n_sigma.to_bits(),
+        xtc_probability_bits: xtc_probability.to_bits(),
+        xtc_threshold_bits: xtc_threshold.to_bits(),
+        dry: DryKey {
+            multiplier_bits: dry.multiplier().to_bits(),
+            base_bits: dry.base().to_bits(),
+            allowed_length: dry.allowed_length(),
+            penalty_last_n: dry.penalty_last_n(),
+            total_context_size: dry.total_context_size(),
+            sequence_breakers: dry.breakers().raw().to_vec(),
+        },
         repetition_penalty_bits: repetition_penalty.to_bits(),
         penalty_last_n: *penalty_last_n,
         presence_penalty_bits: presence_penalty.to_bits(),
@@ -452,6 +512,8 @@ mod tests {
             grammar: None,
             cancel: None,
             ignore_eos: false,
+            reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+            lora: None,
         }
     }
 

@@ -44,14 +44,12 @@ fn alternating_swa_config() -> ModelConfig {
     cfg.head_dim = 8;
     cfg.hidden_dim = 32;
     cfg.sliding_window = Some(WINDOW);
-    cfg.swa_pattern = Some(SWA_PERIOD);
+    cfg.swa_layers = ferrox_models::swa_layers::SwaLayers::period(SWA_PERIOD, false);
     cfg
 }
 
 fn caches(cfg: &ModelConfig) -> Vec<KvCache> {
-    (0..cfg.n_layers)
-        .map(|_| KvCache::new(cfg.n_kv_heads, cfg.head_dim))
-        .collect()
+    cfg.new_kv_caches()
 }
 
 fn argmax(logits: &[f32]) -> usize {

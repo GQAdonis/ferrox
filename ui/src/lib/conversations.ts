@@ -15,6 +15,7 @@
 // byte-identical.
 
 import { getJson, postJson, routes } from "./api.ts";
+import { readThought, THOUGHT_KEY, type Thought } from "./thought.ts";
 
 export type ConversationRole = "user" | "assistant" | "system";
 
@@ -24,6 +25,20 @@ export type StoredMessage = {
   parent_id: string | null;
   role: ConversationRole;
   content: string;
+  /**
+   * A reasoning model's chain of thought, beside the answer rather
+   * than inside it. Absent on records written before the store had the
+   * field, and on every turn that did not think.
+   */
+  reasoning_content?: string | null;
+  /**
+   * How long the model thought, in milliseconds, measured by the
+   * client between the first reasoning delta and the first content
+   * delta. Beside `reasoning_content` and never without it. Absent on
+   * records from before it was stored, which then show their thought
+   * with no time.
+   */
+  reasoning_ms?: number | null;
   created_at: number;
   metadata?: Record<string, unknown> | null;
 };
@@ -64,6 +79,8 @@ export type NewMessage = {
   parent_id: string | null;
   role: ConversationRole;
   content: string;
+  reasoning_content?: string;
+  reasoning_ms?: number;
   metadata?: Record<string, unknown>;
 };
 
@@ -92,8 +109,23 @@ export async function listConversations(): Promise<ConversationSummary[]> {
   return body?.data ?? [];
 }
 
+/**
+ * Fired on `window` after any write to the conversation store succeeds,
+ * so a listing kept somewhere other than the chat (the sidebar) can
+ * re-read without polling the store on a timer. Every write goes
+ * through the three functions below; there is no other writer.
+ */
+export const CONVERSATIONS_CHANGED = "ferrox:conversations-changed";
+
+function notifyChanged<T>(value: T): T {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event(CONVERSATIONS_CHANGED));
+  }
+  return value;
+}
+
 export function createConversation(body: CreateBody): Promise<Conversation> {
-  return postJson<Conversation>(routes.conversations, body);
+  return postJson<Conversation>(routes.conversations, body).then(notifyChanged);
 }
 
 export function getConversation(id: string): Promise<Conversation> {
@@ -104,11 +136,13 @@ export function updateConversation(
   id: string,
   body: UpdateBody,
 ): Promise<Conversation> {
-  return postJson<Conversation>(routes.conversation(id), body);
+  return postJson<Conversation>(routes.conversation(id), body).then(
+    notifyChanged,
+  );
 }
 
 export function deleteConversation(id: string): Promise<unknown> {
-  return postJson(routes.conversationDelete(id), {});
+  return postJson(routes.conversationDelete(id), {}).then(notifyChanged);
 }
 
 // ---------------------------------------------------------------------
@@ -141,15 +175,37 @@ export type ExportedRepository = {
 
 const ROLES: ReadonlySet<string> = new Set(["user", "assistant", "system"]);
 
+/** Parts of one kind, concatenated. */
+function textOfKind(
+  content: readonly { type: string; text?: string }[],
+  kind: "text" | "reasoning",
+): string {
+  return content
+    .filter((part) => part.type === kind && typeof part.text === "string")
+    .map((part) => part.text as string)
+    .join("");
+}
+
 /** Text parts, concatenated. Anything else in the message is not text
- * and is not what a transcript stores. */
+ * and is not what a transcript stores as the answer. */
 export function plainText(
   content: readonly { type: string; text?: string }[],
 ): string {
-  return content
-    .filter((part) => part.type === "text" && typeof part.text === "string")
-    .map((part) => part.text as string)
-    .join("");
+  return textOfKind(content, "text");
+}
+
+/**
+ * Reasoning parts, concatenated.
+ *
+ * Stored in its own field, never folded into the answer. An R1 turn cut
+ * off inside its thinking is ALL reasoning; stored as `content: ""` it
+ * came back from a reload as an empty bubble with the thinking gone,
+ * which is the defect this exists to close.
+ */
+export function plainReasoning(
+  content: readonly { type: string; text?: string }[],
+): string {
+  return textOfKind(content, "reasoning");
 }
 
 /**
@@ -209,12 +265,16 @@ export function pendingAppend(
     const parentId = item.parentId;
     if (parentId !== null && !reachable.has(parentId)) continue;
     reachable.add(message.id);
+    const reasoning = plainReasoning(message.content);
+    const { metadata, thoughtMs } = liftThought(message.metadata);
     messages.push({
       id: message.id,
       parent_id: parentId,
       role: message.role as ConversationRole,
       content: plainText(message.content),
-      ...(message.metadata ? { metadata: message.metadata } : {}),
+      ...(reasoning ? { reasoning_content: reasoning } : {}),
+      ...(reasoning && thoughtMs !== undefined ? { reasoning_ms: thoughtMs } : {}),
+      ...(metadata ? { metadata } : {}),
     });
   }
 
@@ -236,13 +296,89 @@ export function hasWork(pending: Pending, storedHead: string | null): boolean {
 }
 
 /**
+ * The thought's duration, taken OUT of the metadata it rides on.
+ *
+ * The store keeps `metadata` byte-identical, so leaving
+ * `custom.thought` in it would store the duration twice -- once as
+ * the typed `reasoning_ms` column and once inside an opaque blob --
+ * and a reload would then have two numbers to choose between. It is
+ * stored once, as the column, and `toBranchable` puts it back under
+ * the same key. A thought still marked as running is not a duration
+ * and is dropped rather than stored.
+ */
+function liftThought(metadata: Record<string, unknown> | undefined): {
+  metadata: Record<string, unknown> | undefined;
+  thoughtMs: number | undefined;
+} {
+  const thought = metadata && readThought(metadata);
+  if (!metadata || !thought) return { metadata, thoughtMs: undefined };
+  const { [THOUGHT_KEY]: _thought, ...custom } = metadata.custom as Record<
+    string,
+    unknown
+  >;
+  return {
+    metadata: { ...metadata, custom },
+    thoughtMs: thought.state === "done" ? thought.ms : undefined,
+  };
+}
+
+/** The status an assistant node gets back, from the outcome its own
+ * metadata recorded. */
+export type RestoredStatus =
+  | { type: "complete"; reason: "stop" }
+  | { type: "incomplete"; reason: "length" | "cancelled" };
+
+/**
+ * `status` is reconstructed rather than stored: the store has no
+ * business keeping a copy of a fact that is already in the metadata it
+ * carries. The outcome is what the runtime wrote under
+ * `metadata.custom.stats`, and it is what decides whether a reloaded
+ * answer offers Continue -- a cut-off turn restored as complete would
+ * lose the way out of it.
+ */
+export function restoredStatus(
+  metadata: Record<string, unknown> | null | undefined,
+): RestoredStatus {
+  const outcome = (
+    metadata as { custom?: { stats?: { outcome?: unknown } } } | undefined
+  )?.custom?.stats?.outcome;
+  if (outcome === "length") return { type: "incomplete", reason: "length" };
+  if (outcome === "stopped-by-you" || outcome === "stopped-by-server")
+    return { type: "incomplete", reason: "cancelled" };
+  return { type: "complete", reason: "stop" };
+}
+
+/**
+ * The metadata a restored node carries: what was stored, with the
+ * thought's duration put back where the runtime writes it, so the
+ * Thinking block reads one shape whether the turn is fresh or
+ * reloaded. `null` when there is nothing to carry.
+ */
+export function restoredMetadata(
+  node: Pick<StoredMessage, "metadata" | "reasoning_content" | "reasoning_ms">,
+): Record<string, unknown> | null {
+  const ms = node.reasoning_ms;
+  const thought: Thought | undefined =
+    node.reasoning_content && typeof ms === "number" && Number.isFinite(ms)
+      ? { state: "done", ms: Math.max(0, ms) }
+      : undefined;
+  if (!thought) return node.metadata ?? null;
+  const custom = node.metadata?.custom;
+  return {
+    ...node.metadata,
+    custom: {
+      ...(custom && typeof custom === "object" ? custom : {}),
+      [THOUGHT_KEY]: thought,
+    },
+  };
+}
+
+/**
  * The stored tree, in the shape `ExportedMessageRepository
  * .fromBranchableArray` takes.
  *
- * `status` is reconstructed rather than stored: an assistant node is
- * complete unless its own metadata says the run was stopped, and the
- * store has no business keeping a copy of a fact that is already in the
- * metadata it carries.
+ * Thinking comes back as a reasoning part ABOVE the text, the order it
+ * was shown in; a turn that never thought grows no empty part.
  */
 export function toBranchable(conversation: Conversation): {
   items: {
@@ -250,28 +386,39 @@ export function toBranchable(conversation: Conversation): {
     message: {
       id: string;
       role: ConversationRole;
-      content: { type: "text"; text: string }[];
+      content: (
+        | { type: "text"; text: string }
+        | { type: "reasoning"; text: string }
+      )[];
       createdAt: Date;
-      status?: { type: "complete"; reason: "stop" };
+      status?: RestoredStatus;
       metadata?: Record<string, unknown>;
     };
   }[];
   headId: string | null;
 } {
   return {
-    items: conversation.messages.map((node) => ({
-      parentId: node.parent_id,
-      message: {
-        id: node.id,
-        role: node.role,
-        content: [{ type: "text" as const, text: node.content }],
-        createdAt: new Date(node.created_at * 1000),
-        ...(node.role === "assistant"
-          ? { status: { type: "complete" as const, reason: "stop" as const } }
-          : {}),
-        ...(node.metadata ? { metadata: node.metadata } : {}),
-      },
-    })),
+    items: conversation.messages.map((node) => {
+      const metadata = restoredMetadata(node);
+      return {
+        parentId: node.parent_id,
+        message: {
+          id: node.id,
+          role: node.role,
+          content: [
+            ...(node.reasoning_content
+              ? [{ type: "reasoning" as const, text: node.reasoning_content }]
+              : []),
+            { type: "text" as const, text: node.content },
+          ],
+          createdAt: new Date(node.created_at * 1000),
+          ...(node.role === "assistant"
+            ? { status: restoredStatus(node.metadata) }
+            : {}),
+          ...(metadata ? { metadata } : {}),
+        },
+      };
+    }),
     headId: conversation.head_id,
   };
 }

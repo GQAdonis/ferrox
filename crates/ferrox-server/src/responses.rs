@@ -104,7 +104,7 @@ use serde_json::{json, Map, Value};
 use crate::generate::{DecodeError, Usage};
 use crate::output::OutputPosture;
 use crate::{
-    attribution, output, prompt_from_messages, run_generation_emit, sse, stats, ApiError, AppState,
+    attribution, output, run_generation_emit, sse, stats, ApiError, AppState,
     ChatCompletionRequest, ChatMessage, MessageContent, ToolCallFunctionIn, ToolCallIn, ToolChoice,
     ToolDef, ToolFunctionDef,
 };
@@ -217,6 +217,13 @@ pub(crate) struct ResponsesRequest {
     /// surface.
     #[serde(default)]
     reasoning: Option<Value>,
+    /// llama.cpp's `reasoning_budget_tokens` (alias
+    /// `thinking_budget_tokens`), at the top level of the body where
+    /// llama.cpp's Responses lowering leaves every field it does not
+    /// rewrite (`server-chat.cpp:15`). Same type, same range, same
+    /// sampler as on `/v1/chat/completions`.
+    #[serde(default, alias = "thinking_budget_tokens")]
+    reasoning_budget_tokens: Option<crate::reasoning_budget::BudgetTokens>,
     #[serde(default)]
     chat_template_kwargs: Option<Map<String, Value>>,
     /// Stateful features. Accepted so a client that always sends them
@@ -621,6 +628,11 @@ fn to_chat_request(req: &ResponsesRequest) -> Result<ChatCompletionRequest, ApiE
         min_p: None,
         top_k: req.top_k,
         repetition_penalty: None,
+        // Neither the Anthropic Messages wire nor the Responses wire
+        // carries llama.cpp's extra samplers, so they resolve to their
+        // neutral defaults and this chain is llama.cpp's default one
+        // doing nothing extra.
+        extra_samplers: Default::default(),
         // No seed field on this surface, so the chat path's policy
         // applies unchanged: an unseeded sampled request draws fresh
         // every time rather than replaying one draw forever.
@@ -647,6 +659,15 @@ fn to_chat_request(req: &ResponsesRequest) -> Result<ChatCompletionRequest, ApiE
         // Stateless surface: history comes in `input`, in full, on every
         // turn.
         session_id: None,
+        // Says nothing, and gets the one rule every route gets: a
+        // trailing assistant item is continued by default, exactly as
+        // it is on `/v1/chat/completions` -- see `continuation`.
+        continue_final_message: Default::default(),
+        // llama.cpp copies every field of a Responses body onto the
+        // chat body it lowers to (`server-chat.cpp:15`), so the budget
+        // spelled at the top level of a Responses request reaches the
+        // sampler there too.
+        reasoning_budget_tokens: req.reasoning_budget_tokens,
         logprobs: None,
         top_logprobs: None,
         n: None,
@@ -660,6 +681,7 @@ fn to_chat_request(req: &ResponsesRequest) -> Result<ChatCompletionRequest, ApiE
         grammar: None,
         // Not on the Responses wire.
         logit_bias: None,
+        lora: None,
     };
     request.validate_supported_fields()?;
     Ok(request)
@@ -698,6 +720,9 @@ fn failure_code(error: &DecodeError) -> &'static str {
         // it is the request that is invalid -- retrying it unchanged
         // fails identically.
         DecodeError::GrammarConstraint { .. } => "invalid_grammar",
+        // Likewise: the budget named a family, or reached the sampler
+        // in a shape, this server cannot enforce.
+        DecodeError::ReasoningBudget { .. } => "invalid_reasoning_budget",
     }
 }
 
@@ -1443,9 +1468,10 @@ async fn responses_full(
     let template = active.generative()?.chat_template();
     let kwargs = chat.resolve_template_kwargs(&template);
     let offered = offered_tools(&chat);
-    let prompt = prompt_from_messages(&chat.messages, &template, &offered, kwargs)?;
+    let prompt = chat.render_prompt(&chat.messages, &template, &offered, kwargs, active.name())?;
     let posture = OutputPosture::resolve(active.name(), &prompt);
-    let params = chat.generation_params_for_template(&template, active.name())?;
+    let params =
+        chat.generation_params_for_template(&template, active.name(), active.sampler_model())?;
 
     let (chunks, finish, usage) = crate::decode_task::buffered(
         crate::decode_task::DecodeHandles::take(&state, &active)?,
@@ -1502,10 +1528,11 @@ async fn responses_stream(
     let template = active.generative()?.chat_template();
     let kwargs = chat.resolve_template_kwargs(&template);
     let offered = offered_tools(&chat);
-    let prompt = prompt_from_messages(&chat.messages, &template, &offered, kwargs)?;
     let served_model = active.name().to_string();
+    let prompt = chat.render_prompt(&chat.messages, &template, &offered, kwargs, &served_model)?;
     let posture = OutputPosture::resolve(&served_model, &prompt);
-    let mut params = chat.generation_params_for_template(&template, &served_model)?;
+    let mut params =
+        chat.generation_params_for_template(&template, &served_model, active.sampler_model())?;
 
     // The same two-tier cancellation the chat stream has: the guard
     // rides with the generation task and deregisters however that task

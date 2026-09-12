@@ -19,7 +19,7 @@
 | Source files (C++/CUDA/Metal) | **1,103** mapped | **308** Rust files, **~230k** lines | Structural: 140 per-arch graphs vs 1 decoder |
 | Architecture graphs | **140** hand-written | **16** audited + 4 dedicated engines | **P0** — 124 graphs unported |
 | Backends | CPU, CUDA, Metal, Vulkan, SYCL, HIP, OpenCL, … | CPU, Metal, CUDA (partial), Vulkan (beachhead) | **P0** Vulkan; **P1** CUDA GEMM |
-| CLI tools | 15+ binaries | 20+ subcommands; most core tools present | **P2** gguf-split, imatrix, batched-bench |
+| CLI tools | 15+ binaries | 23+ subcommands; every core tool present | gguf-split ported 2026-09-09, imatrix and batched-bench 2026-09-11 |
 | Logit parity (local sweep) | reference | 19 models tested | **2 WRONG**, 8 DRIFT (expected K-quant), 6 MATCH, 1 TIE-FLIP, 2 encoder skip |
 
 ### Live parity sweep (2026-09-02)
@@ -117,14 +117,14 @@ ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 | llama.cpp tool | ferrox command | Status |
 |----------------|----------------|--------|
 | `llama-cli` | `ferrox run` | partial — flag parity mostly done |
-| `llama-server` | `ferrox serve` | partial — slot save/load missing |
+| `llama-server` | `ferrox serve` | partial — slot save/restore present, `GET /slots` / `/props` / `/infill` absent |
 | `llama-bench` | `ferrox bench` | **ported** |
-| `llama-quantize` | `ferrox quantize` | partial — Q8_0 byte-identical; K-quants missing |
+| `llama-quantize` | `ferrox quantize` | partial — Q8_0, Q4_K_S/M, Q5_K_S/M, Q6_K byte-identical, with and without `--imatrix`; Q2_K/Q3_K, IQ tiers, MXFP4 refused by name |
 | `llama-perplexity` | `ferrox perplexity` | partial — corpus ppl; no HellaSwag |
 | `llama-tokenize` | via `ferrox parity` tokenizer sweep | partial |
-| `llama-gguf-split` | — | **missing** |
-| `llama-imatrix` | — | **missing** |
-| `llama-batched-bench` | — | **missing** |
+| `llama-gguf-split` | `ferrox gguf-split` | **ported**: split by tensors or size, merge, `--no-tensor-first-split`, `--dry-run` |
+| `llama-imatrix` | `ferrox imatrix` | **ported** (2026-09-11): same file format both ways, GGUF and legacy `.dat`; sums agree to the forward pass's precision, not bit for bit (see `docs/CLI.md`) |
+| `llama-batched-bench` | `ferrox batched-bench` | **ported** (2026-09-11): same sweep, same ten columns and JSONL keys, drives `forward_multi_seq` directly; `-b`, `-kvu`, `-fa`, `-tb` refused by name |
 | `llama-mtmd` (multimodal) | — | **missing** |
 | `llama-tts` | — | **missing** |
 | `llama-rpc` | — | **missing** |
@@ -183,13 +183,13 @@ ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 
 | Gap | llama.cpp | ferrox |
 |-----|-----------|--------|
-| Slot save/load | yes | **missing** |
-| `-np` / `--parallel` | yes | env only (`FERROX_CB_MAX_SEQS`) |
-| `-b` / `-ub` batch flags | yes | env only |
+| Slot save/load | yes | **`POST /slots/{id}?action=save\|restore`** (2026-09-11), gated on `--slot-save-path`, restoring into the prefix cache; the file carries a checkpoint fingerprint and a mismatch is refused by name. `erase` refused by name, `GET /slots` absent |
+| `-np` / `--parallel` | yes | wired (was already; the row was stale). Read back as `ferrox_scheduler_max_seqs` on `/metrics` since 2026-09-11 |
+| `-b` / `-ub` batch flags | yes | **wired** (2026-09-11), one number on both decode paths, read back as `ferrox_scheduler_prefill_chunk` |
 | Partial `-ngl` | yes | all-or-nothing |
 | Streamed CB output | token stream | buffers full completion |
-| gguf-split merge/split | yes | read shards only |
-| imatrix | yes | **missing** |
+| gguf-split merge/split | yes | **`ferrox gguf-split`**, both directions |
+| imatrix | yes | **`ferrox imatrix`** + `ferrox quantize --imatrix`, byte-identical output |
 
 ### 2.5 Sampling (mostly closed)
 
@@ -232,9 +232,9 @@ Ranked per [`north-star.md`](north-star.md) and [`roadmap.md`](roadmap.md).
 | 5 | **Model layer reorg phase 1** — extract `attn_block`, `rope`, per-arch trait | L | Everything below |
 | 6 | **K-quant encoders** (#70) — Q4_K_M write parity | L | `ferrox quantize` usefulness |
 | 7 | **CUDA mul_mm + mmvq** — port from Metal `mul_mm_sg_impl` | L | CUDA prefill |
-| 8 | **Server: `-np`, slot save/load, streamed CB** | M | Serving parity |
+| 8 | **Server: ~~`-np`~~, ~~slot save/load~~, streamed CB** | M | Serving parity. `-np` was already wired; slot save/restore and `-b`/`-ub` landed 2026-09-11. Streamed CB output remains |
 | 9 | **Embedding model path** — WordPiece + BERT loader | L | BGE/E5/nomic-embed |
-| 10 | **gguf-split utility** | S | Shard management |
+| ~~10~~ | ~~**gguf-split utility**~~ | S | **done 2026-09-09**: `ferrox gguf-split` |
 
 ### P2 — Hardware reach (this quarter)
 
@@ -250,7 +250,7 @@ Ranked per [`north-star.md`](north-star.md) and [`roadmap.md`](roadmap.md).
 
 - 26 new-code architecture graphs (apertus xIELU, dbrx LayerNorm, bitnet, …)
 - Multimodal (`mtmd`), TTS, RPC
-- imatrix, batched-bench, LoRA adapters
+- LoRA adapters (imatrix and batched-bench ported 2026-09-11)
 - SYCL/HIP/OpenCL backends
 
 ---

@@ -16,6 +16,7 @@ use crate::attribution::Attribution;
 use crate::generate::{FinishReason, GenerationParams};
 use crate::sampling_knobs::SamplingKnobs;
 use crate::{unsupported_feature, ApiError, AppState};
+use ferrox_models::tokenizer::SpecialTokens;
 
 /// What one of the small endpoints knows before it does any work.
 ///
@@ -110,11 +111,10 @@ pub(crate) struct TokenizeRequest {
     #[serde(default)]
     add_special: Option<bool>,
     /// llama.cpp: tokenize special-token text as special tokens rather
-    /// than as plaintext. Upstream defaults to `true`, and ferrox's
-    /// tokenizers always split on special tokens
-    /// (`ferrox_models::tokenizer::split_on_special_tokens`), so `true`
-    /// is honoured and `false` is REFUSED BY NAME rather than silently
-    /// ignored.
+    /// than as plaintext. Upstream defaults to `true`
+    /// (`server-context.cpp`: `json_value(body, "parse_special", true)`)
+    /// and so does this server; `false` tokenizes `<|im_start|>` as the
+    /// characters it is written with.
     #[serde(default)]
     parse_special: Option<bool>,
     /// llama.cpp: return `{"id", "piece"}` objects instead of bare ids.
@@ -153,13 +153,6 @@ impl TokenizeRequest {
     /// Every knob this server does not implement, refused by name
     /// before any work happens.
     fn reject_unsupported(&self) -> Result<(), ApiError> {
-        if self.parse_special == Some(false) {
-            return Err(unsupported_feature(
-                "`parse_special: false` is not implemented: ferrox's tokenizers always split \
-                 on special-token text, so this server cannot tokenize `<|im_start|>` as \
-                 plain characters. Omit the field or send `true` (llama.cpp's default)",
-            ));
-        }
         if self.with_pieces == Some(true) {
             return Err(unsupported_feature(
                 "`with_pieces: true` is not implemented: ferrox's tokenizers expose decoded \
@@ -169,6 +162,15 @@ impl TokenizeRequest {
             ));
         }
         Ok(())
+    }
+
+    /// The `parse_special` setting the request asked for, with
+    /// llama.cpp's default when it did not say.
+    fn specials(&self) -> SpecialTokens {
+        match self.parse_special {
+            Some(false) => SpecialTokens::AsText,
+            Some(true) | None => SpecialTokens::Parse,
+        }
     }
 }
 
@@ -215,6 +217,11 @@ pub(crate) struct CompletionsRequest {
     top_k: Option<usize>,
     #[serde(default)]
     repetition_penalty: Option<f32>,
+    /// llama.cpp's `typ_p`, `top_n_sigma`, `xtc_*` and `dry_*`, in ONE
+    /// struct shared with the other two routes that take them. See
+    /// `sampling_knobs::ExtraSamplerFields`.
+    #[serde(flatten)]
+    extra_samplers: crate::sampling_knobs::ExtraSamplerFields,
     #[serde(default)]
     presence_penalty: Option<f32>,
     #[serde(default)]
@@ -230,6 +237,10 @@ pub(crate) struct CompletionsRequest {
     /// `ChatCompletionRequest::ignore_eos`.
     #[serde(default)]
     ignore_eos: Option<bool>,
+    /// llama.cpp's per-request `lora: [{id, scale}]`; see
+    /// `ChatCompletionRequest::lora`.
+    #[serde(default)]
+    lora: Option<Vec<ferrox_api::LoraScaleRequest>>,
     // Fields this server does not implement. Deserialized ONLY so they
     // can be refused by name -- serde would otherwise drop each one
     // silently, which is indistinguishable from having honoured it.
@@ -285,8 +296,8 @@ impl CompletionsRequest {
     /// chat route uses. See `crate::sampling_knobs`.
     /// Fallible because `samplers` is parsed here; see the chat route's
     /// twin.
-    fn sampling_knobs(&self) -> Result<SamplingKnobs, ApiError> {
-        Ok(SamplingKnobs {
+    pub(crate) fn sampling_knobs(&self) -> Result<SamplingKnobs, ApiError> {
+        let mut knobs = SamplingKnobs {
             temperature: self.temperature,
             top_p: self.top_p,
             min_p: self.min_p,
@@ -301,7 +312,10 @@ impl CompletionsRequest {
                 self.samplers.as_ref(),
                 "/v1/completions",
             )?,
-        })
+            ..SamplingKnobs::default()
+        };
+        self.extra_samplers.apply(&mut knobs);
+        Ok(knobs)
     }
 
     fn stop_sequences(&self) -> Vec<String> {
@@ -414,7 +428,7 @@ fn tokenize_inner(
     // generative model" on an encoder-only server, which is the right
     // refusal for a decode and the wrong one for this (issue #28).
     let active = state.require_active()?;
-    let mut tokens = active.encode_any(text);
+    let mut tokens = active.encode_any(text, req.specials());
     if req.add_special == Some(true) {
         // The same helper the generation path uses, so `add_special`
         // reports the prompt the model would actually be given --
@@ -484,7 +498,12 @@ pub async fn completions(
         // split that did not happen.
         reasoning: None,
         max_tokens: req.max_tokens,
-        sampling: req.sampling_knobs()?.resolve(),
+        sampling: req
+            .sampling_knobs()?
+            .resolve(active.sampler_model())
+            .map_err(|e| {
+                crate::unsupported_feature(&format!("`dry_multiplier` on /v1/completions: {e}"))
+            })?,
         seed: req.seed.unwrap_or(0),
         stop: req.stop_sequences(),
         json_object: false,
@@ -495,6 +514,10 @@ pub async fn completions(
         stop_token_ids: Vec::new(),
         cancel: None,
         ignore_eos: req.ignore_eos.unwrap_or(false),
+        // A raw completion has no reasoning format (`reasoning: None`
+        // above), so there is no block for a budget to bound.
+        reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+        lora: crate::lora::resolve_request(active.generative()?, req.lora.as_deref())?,
     };
     let (chunks, finish, usage) = crate::decode_task::buffered(
         crate::decode_task::DecodeHandles::take(&state, &active)?,
@@ -546,30 +569,21 @@ mod tests {
         serde_json::from_value(value).expect("request")
     }
 
-    /// The two llama.cpp knobs this server does not implement. Both
-    /// deserialize, so serde would happily have dropped them; the
-    /// point of declaring them is that they are refused BY NAME.
+    /// The llama.cpp knob this server does not implement. It
+    /// deserializes, so serde would happily have dropped it; the point
+    /// of declaring it is that it is refused BY NAME.
     #[test]
-    fn the_tokenize_knobs_ferrox_lacks_are_refused_by_name() {
-        for (field, body) in [
-            (
-                "parse_special",
-                serde_json::json!({"content": "hi", "parse_special": false}),
-            ),
-            (
-                "with_pieces",
-                serde_json::json!({"content": "hi", "with_pieces": true}),
-            ),
-        ] {
-            let (status, body) = tokenize_request(body)
+    fn the_tokenize_knob_ferrox_lacks_is_refused_by_name() {
+        let field = "with_pieces";
+        let (status, body) =
+            tokenize_request(serde_json::json!({"content": "hi", "with_pieces": true}))
                 .reject_unsupported()
                 .expect_err("this is not implemented");
-            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{field}");
-            assert!(
-                body.0["error"]["message"].as_str().unwrap().contains(field),
-                "the refusal must name {field}: {body:?}"
-            );
-        }
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{field}");
+        assert!(
+            body.0["error"]["message"].as_str().unwrap().contains(field),
+            "the refusal must name {field}: {body:?}"
+        );
     }
 
     /// The values ferrox *does* honour must not be refused: upstream's
@@ -582,6 +596,25 @@ mod tests {
         )
         .reject_unsupported()
         .expect("these are the values this server implements");
+    }
+
+    /// `parse_special` maps onto the tokenizer's setting, and an absent
+    /// field is llama.cpp's default of `true`. `false` used to be
+    /// refused by name because ferrox parsed specials unconditionally.
+    #[test]
+    fn parse_special_selects_the_tokenizer_setting_and_defaults_to_true() {
+        assert_eq!(
+            tokenize_request(serde_json::json!({"content": "hi"})).specials(),
+            SpecialTokens::Parse
+        );
+        assert_eq!(
+            tokenize_request(serde_json::json!({"content": "hi", "parse_special": true}))
+                .specials(),
+            SpecialTokens::Parse
+        );
+        let off = tokenize_request(serde_json::json!({"content": "hi", "parse_special": false}));
+        off.reject_unsupported().expect("false is implemented now");
+        assert_eq!(off.specials(), SpecialTokens::AsText);
     }
 
     /// One field under two spellings. Absent means absent -- llama.cpp
@@ -681,7 +714,8 @@ mod tests {
         }))
         .sampling_knobs()
         .expect("knobs")
-        .resolve();
+        .resolve(crate::sampling_knobs::SamplerModel::absent())
+        .expect("no dry");
 
         assert_eq!(resolved.temperature, 0.5);
         assert_eq!(resolved.top_p, 0.9);
@@ -717,14 +751,17 @@ mod tests {
         let completion = request(completion_body)
             .sampling_knobs()
             .expect("knobs")
-            .resolve();
+            .resolve(crate::sampling_knobs::SamplerModel::absent())
+            .expect("no dry");
 
         let mut chat_body = knobs;
         chat_body["model"] = serde_json::json!("m");
         chat_body["messages"] = serde_json::json!([{"role": "user", "content": "hi"}]);
         let chat: crate::ChatCompletionRequest =
             serde_json::from_value(chat_body).expect("chat request");
-        let chat = chat.sampling_params().expect("knobs");
+        let chat = chat
+            .sampling_params(crate::sampling_knobs::SamplerModel::absent())
+            .expect("knobs");
 
         assert_eq!(completion.temperature, chat.temperature);
         assert_eq!(completion.top_p, chat.top_p);

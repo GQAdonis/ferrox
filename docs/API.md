@@ -30,6 +30,8 @@ comes back the same way.
 | `GET`/`POST /v1/conversations/{conversation_id}` | Read one with its messages, or rename, retarget and append |
 | `POST /v1/conversations/{conversation_id}/delete` | Delete. Spelled as a POST suffix because the CORS allow-list is `GET, POST`, so a `DELETE` method would work from curl and fail from every cross-origin browser |
 | `POST /v1/admin/prepare-stop` | Close admission, seal the accounting, and make the receipt durable (see below) |
+| `POST /slots/{id_slot}?action=save\|restore` | llama.cpp's slot save/restore: persist a prompt prefix's KV to disk and load it back after a restart. Needs `--slot-save-path` and `FERROX_PREFIX_CACHE_ENTRIES` (see below). `action=erase` is refused by name |
+| `GET /lora-adapters` · `POST /lora-adapters` | llama.cpp's LoRA listing and scale setting; the per-request `lora` field is honoured on `/v1/chat/completions`, `/v1/completions` and `/completion` (see below) |
 | `GET /cache/stats` · `GET /metrics` | Ferrox extensions |
 | `/admin/*` | Control surface (see below) |
 | `GET /` | 404. The web UI in [`ui/`](../ui) is a separate app and this server does not serve it |
@@ -61,10 +63,12 @@ conversation or a large `/v1/embeddings` batch past that comes back
 | `model`, `messages` | Supported |
 | `max_tokens` | Supported; **defaults to 32768**, not OpenAI's legacy 16. An explicit `0` is a 400 |
 | `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `seed`, `stop` | Supported |
+| `typical_p`, `top_n_sigma`, `xtc_probability`, `xtc_threshold`, `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers` | Supported. llama.cpp's own spellings; absent means the sampler is off |
+| `samplers` | Supported. The chain order, as a list of names or a `;`-separated string. Defaults to llama.cpp's own default chain |
 | `presence_penalty`, `frequency_penalty` | Supported |
 | `stream` | Supported (overlapped SSE when tools off and CB off) |
 | `tools` / `tool_choice: none\|auto` | Supported (prompt-engineered, parsed in eleven wire formats) |
-| `tool_choice: required` / named function | Supported on **eight of the eleven** wire formats, by a lazy grammar built from the same marker description the parser reads with. **501 naming the format** on the remaining three (`gemma4`, `minimax_m3`, `muse_glimmer`), each for a reason the refusal states |
+| `tool_choice: required` / named function | Supported on **ten of the eleven** wire formats, by a lazy grammar built from the same marker description the parser reads with. **501 naming the format** on the remaining one (`muse_glimmer`), for the reason the refusal states |
 | `logprobs` / `top_logprobs` / `n` (>1) | **Reject** |
 | `response_format: json_object` | Supported (best-effort character mask + validate) |
 | `grammar` | Supported. llama.cpp's own field: a GBNF string, enforced per token by a real parser |
@@ -73,9 +77,11 @@ conversation or a large `/v1/embeddings` batch past that comes back
 | `session_id` | Ferrox extension (server-side history) |
 | `chat_template_kwargs` | Supported (see [Chat templates](#chat-templates)) |
 | `reasoning_effort` | Supported, quantized onto what the checkpoint grades; `none`/`off` turn thinking off |
-| `thinking: {"type": …}` | Supported (DeepSeek wire): `enabled`/`disabled`, anything else is a 400 |
+| `thinking: {"type": …}` | Supported (DeepSeek wire): `enabled`/`disabled`, anything else is a 400. On `/v1/messages`, `thinking.budget_tokens` becomes `reasoning_budget_tokens` exactly as llama.cpp's Anthropic lowering does (`server-chat.cpp:585-591`): `enabled` without a number gets 10,000 |
 | `ignore_eos` | Ferrox extension: run past the model's own end-of-generation tokens so the request produces exactly `max_tokens`. A serving-benchmark knob. Suppresses the model's set only. A caller's own `stop` strings still end the answer |
 | `reasoning_content` (both ways) | Ferrox extension: a reasoning model's chain of thought, split out of `content` on the way out and replayable on the way in (`reasoning` is accepted as an alias) |
+| `continue_final_message` | Supported, llama.cpp's field and value set: `true` (auto), `"reasoning_content"`, `"content"`, or `false`. The trailing assistant message is rendered as a turn still being written, thought included, so the model carries on from where it stopped. **Default on, as llama.cpp's server** (`server-common.cpp:1046-1056`): a request that says nothing and ends in an assistant message is continued; `false` renders it as a closed turn for that request (llama.cpp reads `false` as absence, so this is the one deliberate difference), and `--no-prefill-assistant` turns the default off server-wide. One rule for `/v1/chat/completions`, `/v1/messages` and `/v1/responses`, applied in one renderer. The harmony and ATEM channel formats, a content continuation for an always-open family, and a turn with tool calls are **501 by name**; a 501 reached by the default says how to switch it off |
+| `reasoning_budget_tokens` / `thinking_budget_tokens` | Supported, llama.cpp's sampler-level budget (`common/reasoning-budget.cpp`): `-1` or absent takes the server's `--reasoning-budget` (itself `-1`, unrestricted); `N` allows N tokens of thought after the opener and then forces the closer one token per step, so the answer still arrives with `finish_reason: "stop"`; `0` forces the closer the moment the block opens. The closer is never counted, a forced closer waits for a split UTF-8 character to complete, and a second block in the same response gets a fresh budget. Below `-1` is a 400 naming the field. Also accepted at the top level of a `/v1/responses` body, as llama.cpp's lowering passes it. A checkpoint with no reasoning format has no thought to bound (llama.cpp builds no sampler either); the harmony and ATEM channel formats are **501 by name** |
 
 ### Where a completion stops
 
@@ -586,14 +592,14 @@ prevent. A load-time NOTE says the same thing to an operator, because a
 log is what an operator sees and a JSON field is the only one a client
 can act on.
 
-Almost every GGUF in the wild is the second regime. llama.cpp's
-converter drops the pooler by name
-(`conversion/bert.py`, "we are only using BERT for embeddings so we do
-not need the pooling layer"), and under llama.cpp's tensor naming the
-pooler slot is `cls`, with `cls.output` being the classifier that
-follows it (`src/llama-graph.cpp`: `cls`, then bias, then `tanh`, then
-an optional head norm). ferrox reads `cls` when a file carries it and
-refuses to invent one when it does not.
+Every published GGUF is the second regime. llama.cpp's converter drops
+the pooler by name (`conversion/bert.py`, `BertModel.filter_tensors`,
+"we are only using BERT for embeddings so we do not need the pooling
+layer"; still unconditional on `master` as of 2026-09-11), and under
+llama.cpp's tensor naming the pooler slot is `cls`, with `cls.output`
+being the classifier that follows it (`src/llama-graph.cpp`: `cls`,
+then bias, then `tanh`, then an optional head norm). ferrox reads `cls`
+when a file carries it and refuses to invent one when it does not.
 
 An absent pooler is a NOTE rather than a refusal on purpose: nothing in
 the file distinguishes "trained without a pooler" from "converted
@@ -601,8 +607,41 @@ without one", and `jina-reranker-v1-tiny-en` is a real checkpoint whose
 head IS a direct projection. Refusing would reject a valid model to
 flag a lossy conversion.
 
-Tracked as [#82](https://github.com/antonellof/ferrox/issues/82), which
-stays open because no published GGUF carries the tensor yet.
+### Getting the first regime: `ferrox splice-pooler`
+
+The pooler is in the checkpoint's own safetensors, and `ferrox
+splice-pooler` writes a GGUF that carries it (`docs/CLI.md`). The tie
+between the two files is the classifier they both hold, compared
+element-wise to within the GGUF's storage precision; the GGUF's
+`general.name` is deliberately NOT trusted, because the published
+`ms-marco-MiniLM-L6-v2-Q8_0.gguf` names the L12 model. A pooler from
+any other checkpoint is refused naming the element that disagrees.
+
+Measured on `ms-marco-MiniLM-L6-v2`, four query sets, seventeen pairs,
+against the NumPy transcription of `BertForSequenceClassification`
+(`scripts/rerank_reference_ms_marco.py`, `hf` rows):
+
+| | `relevance_score` range | largest deviation from HuggingFace | orderings |
+|---|---|---|---|
+| converter's GGUF, `classifier(cls)` | about `-0.25 .. 0.15` | not comparable (a different function) | 4 of 4 match |
+| spliced, `classifier(tanh(pooler(cls)))` | `-11.19 .. 10.93` | `0.051` | 4 of 4 match |
+
+The "How many people live in Berlin?" set, converter's file then
+spliced, HuggingFace in the last row:
+
+```text
+[-0.027, 0.073, -0.175, -0.250, 0.009]
+[-4.302, 8.604, -11.100, -11.188, 0.647]
+[-4.320, 8.607, -11.101, -11.188, 0.637]
+```
+
+llama.cpp loads the spliced file and runs the pooler too (its
+`build_pooling` RANK arm reads `cls`); its scores still differ from
+HuggingFace by its all-zero token types, described above.
+
+Tracked as [#82](https://github.com/antonellof/ferrox/issues/82): the
+converter's output is still uncalibrated, and the splice is the
+in-tree route until upstream keeps the tensor.
 
 ## Errors that retrying will not fix
 
@@ -858,14 +897,154 @@ wait for admission. Past that cap a request gets a `503` with a
 `Retry-After` header instead of joining an unbounded queue, and the JSON
 body names the queue depth, the cap and `retry_after_seconds`.
 
+`-b N` / `--batch-size N` and `-ub N` / `--ubatch-size N` set the
+prefill chunk on both decode paths at once (`FERROX_CB_PREFILL_CHUNK`
+here and `FERROX_CHUNKED_PREFILL` on the private loop, which used to be
+two independent knobs for one number). ferrox has one prefill stage, so
+the two flags resolve the way llama.cpp resolves them
+(`src/llama-context.cpp:265`): the smaller of whichever was named.
+
 While a batcher is active, `GET /metrics` reports
 `ferrox_prefill_chunks_total`, `ferrox_prefill_tokens_total`,
-`ferrox_decode_steps_total`, `ferrox_scheduler_queue_depth` and
-`ferrox_scheduler_queue_rejected_total`.
+`ferrox_decode_steps_total`, `ferrox_scheduler_queue_depth`,
+`ferrox_scheduler_queue_rejected_total`, and the configured caps
+`ferrox_scheduler_max_seqs` (`-np`; 0 when unlimited) and
+`ferrox_scheduler_prefill_chunk` (`-ub`), so a flag can be read back
+from the process that received it rather than trusted.
 
 Every `503` this server returns carries `Retry-After: 1`. It is a fixed
 hint, not a computed one. An honest estimate would need the caller's
 throughput, and the server does not know it.
+
+## Slot save and restore
+
+llama.cpp's `POST /slots/{id_slot}?action=save|restore`, so a long
+system prompt survives a restart instead of being prefilled again. The
+route, the `action` query, the gate and the response fields are
+llama.cpp's (`tools/server/server.cpp:273`,
+`server-context.cpp:4536-4567`, `server-task.cpp:1570-1592`); a client
+written against `llama-server` works unchanged.
+
+```bash
+# Start with somewhere to put the files, and the prefix cache the
+# slots restore into.
+FERROX_PREFIX_CACHE_ENTRIES=8 ferrox-server -m model.gguf \
+  --slot-save-path ./slots --port 8383
+
+# Prefill a prompt, store its KV in the prefix cache, and write it to
+# ./slots/system.fslot
+curl -s -X POST 'http://127.0.0.1:8383/slots/0?action=save' \
+  -H 'content-type: application/json' \
+  -d '{"filename":"system.fslot","prompt":"You are a terse assistant ..."}'
+# {"id_slot":0,"filename":"system.fslot","n_saved":83,"n_written":5953021,"timings":{"save_ms":297.5}}
+
+# ... restart the server ...
+
+curl -s -X POST 'http://127.0.0.1:8383/slots/0?action=restore' \
+  -H 'content-type: application/json' \
+  -d '{"filename":"system.fslot"}'
+# {"id_slot":0,"filename":"system.fslot","n_restored":83,"n_read":5953021,"timings":{"restore_ms":75.5}}
+```
+
+Any completion whose prompt starts with those tokens then reports
+`cached_tokens: 83` in `usage` and prefills only the remainder, with
+the same greedy output the cold server gave.
+
+Two things differ from llama.cpp, and are said rather than emulated:
+
+- **`id_slot` is bookkeeping.** llama.cpp has N fixed slots each owning
+  a KV region, and `-np` sets N. ferrox builds KV per request and
+  shares prefixes through one `PrefixCache`, so there is no per-slot
+  region for the id to select. It is validated (a non-negative
+  integer) and echoed.
+- **`save` names its `prompt`.** llama.cpp saves whatever the slot was
+  last serving; nothing here is "last serving" anything. The body
+  carries the prompt to prefill, tokenized with BOS exactly as a
+  completion would be.
+
+`action=erase` is `501`, not a no-op: the prefix cache has whole-cache
+clearing and no per-entry eviction, so erasing one slot would mean
+erasing all of them. Delete the file, or restart.
+
+**A restore is refused, by name, when the file is not of the model
+being served.** A slot file is raw attention state; restoring it under
+other weights does not fail, it answers wrongly. So the file carries
+the checkpoint's identity and a restore compares it before storing
+anything:
+
+```
+400 slot_model_mismatch
+refusing to restore ./slots/system.fslot: checkpoint: the slot was saved
+under 2b77f720... and this server is serving 3a59835e.... Restoring
+attention state computed by other weights does not fail, it answers wrongly
+```
+
+The identity is a SHA-256 over the GGUF's metadata (sorted, typed),
+its full tensor directory, and 4 KiB from the head and tail of every
+tensor, beside the layer count, KV head count, head dimension and KV
+dtype. Path, size and hyper-parameters were each rejected as the key
+because each admits the likely pair, two fine-tunes of one base at one
+quantisation. The same model at a different quantisation is refused on
+`checkpoint`; a different model is refused on `model` or the first
+shape field that differs. llama.cpp's own slot file
+(`src/llama-context.cpp:3081-3141`) carries no identity at all.
+
+The file is framed with a length-and-digest prefix like
+`ferrox_core::kv_disk`'s blocks: a truncated, edited or foreign file is
+refused before anything is parsed or allocated. Filenames are a strict
+whitelist (`[A-Za-z0-9._-]`, no leading dot), so a name cannot leave
+`--slot-save-path`.
+
+Slots are implemented for the generic GGUF decoder. The dedicated
+engines (Kimi, MLA, Gemma-4, GLM-5.2) refuse by name; so does a server
+without a checkpoint on disk.
+
+## LoRA adapters
+
+llama.cpp's `GET /lora-adapters`, `POST /lora-adapters` and the
+per-request `lora` field, over adapters loaded with `--lora` /
+`--lora-scaled` (see [`CLI.md`](CLI.md#lora-adapters)).
+
+```sh
+ferrox-server -m model.gguf --lora style.gguf --lora-scaled tone.gguf:0.5
+
+curl localhost:8383/lora-adapters
+# [{"id":0,"path":"style.gguf","scale":1.0,"task_name":"","prompt_prefix":""},
+#  {"id":1,"path":"tone.gguf","scale":0.5,"task_name":"","prompt_prefix":""}]
+
+# Set the scales for every request that does not override them. An
+# adapter not named goes to 0, as upstream's construct_lora_list sets it.
+curl localhost:8383/lora-adapters -d '[{"id":1,"scale":1.0}]'
+# {"success":true}
+
+# One request under its own scales; the server's are untouched after.
+curl localhost:8383/v1/chat/completions -d '{"model":"m",
+  "messages":[{"role":"user","content":"hi"}], "lora":[{"id":0,"scale":0.25}]}'
+```
+
+`GET` reports the scale currently applied, which is what
+`--lora-init-without-apply` starts at (0) rather than the flag's
+number. `POST` takes the `[{id, scale}]` array (`scale` absent reads
+0, as upstream's `json_value` default); an `id` no adapter has is a
+400 naming the range, where upstream ignores it. A request's `lora`
+list means what `construct_lora_list` makes it mean -- every adapter
+named gets its scale, every other adapter 0 for that request -- and
+an EMPTY list means the server's own scales, as upstream reads it.
+Naming an adapter on a server that loaded none is a 400; the field on
+a checkpoint served by a dedicated engine (MLA, Gemma-4, GLM-5.2,
+Kimi) is a 501.
+
+An adapter's scale is one atomic read by every projection at apply
+time, so a change costs nothing and recomputes nothing. What it costs
+instead is exclusivity: a `POST`, or a request whose `lora` list
+differs from what is applied, waits for the generations in flight and
+runs alone, then the request's override is restored. A request whose
+list names exactly the current scales is an ordinary concurrent
+request. This is llama.cpp's rule -- two slots with different LoRA
+lists are never co-batched -- at the granularity of the whole server
+rather than the batch. The response cache keys on the scales a
+generation ran under, so a `POST` between two identical requests does
+not serve the first answer to the second.
 
 ## MCP
 
@@ -977,8 +1156,9 @@ from arriving as a number.
 `/v1/completions` honours `stop`, `max_tokens` (default 16, because the legacy
 floor is right *here*, where a caller completing a fragment usually
 wants a fragment back), `temperature`, `top_p`, `min_p`, `top_k`,
-`repetition_penalty`, `presence_penalty`, `frequency_penalty`, `seed`,
-`ignore_eos` and `grammar`.
+`typical_p`, `top_n_sigma`, `xtc_probability`, `xtc_threshold`, the five
+`dry_*` fields, `samplers`, `repetition_penalty`, `presence_penalty`,
+`frequency_penalty`, `seed`, `ignore_eos` and `grammar`.
 
 Four of those are recent. `top_k`, `repetition_penalty`,
 `presence_penalty` and `frequency_penalty` were undeclared on this
@@ -1037,9 +1217,26 @@ is a wire, not a second implementation.
 
 `prompt` (string, or `{"prompt_string": "…"}`) · `n_predict` ·
 `stream` · `stop` · `temperature` · `top_p` · `min_p` · `top_k` ·
+`typical_p` · `top_n_sigma` · `xtc_probability` · `xtc_threshold` ·
+`dry_multiplier` · `dry_base` · `dry_allowed_length` ·
+`dry_penalty_last_n` · `dry_sequence_breakers` ·
 `repeat_penalty` · `repeat_last_n` · `presence_penalty` ·
-`frequency_penalty` · `seed` (`-1` draws one) · `ignore_eos` ·
-`grammar` · `cache_prompt`.
+`frequency_penalty` · `samplers` · `seed` (`-1` draws one) ·
+`ignore_eos` · `grammar` · `cache_prompt`.
+
+The nine samplers of llama.cpp's default chain all run, in llama.cpp's
+order (`penalties, dry, top_n_sigma, top_k, typical_p, top_p, min_p,
+xtc, temperature`). An absent field resolves to the value that makes its
+sampler a no-op, so a request that names none of them is sampled exactly
+as it was before they existed.
+
+`dry_sequence_breakers` are STRINGS, tokenised against the loaded
+model's own vocabulary (llama.cpp's `get_overlapping_token_sequences`).
+A checkpoint with no real vocabulary — the synthetic-weight fallback —
+**refuses** `dry_multiplier` rather than running DRY with no breakers,
+because a breaker-less DRY looks like working DRY and penalises across
+every boundary the caller named. Send `dry_sequence_breakers: []` to ask
+for DRY with no breakers deliberately.
 
 `n_predict` keeps llama.cpp's meaning exactly, including the part that
 is easy to get wrong: **an absent `n_predict` is `-1`**, which means
@@ -1068,14 +1265,13 @@ because a stock client sends most of them explicitly and refusing
 `mirostat: 0` would be a false refusal. At any other value it is a 501
 naming the field:
 
-`dynatemp_range` · `typical_p` · `xtc_probability` · `mirostat` ·
-`dry_multiplier` · `samplers` (the sampler chain order is fixed) ·
+`dynatemp_range` · `mirostat` ·
 `n_probs` and `post_sampling_probs` (no per-token logprobs) ·
 `min_keep` · `return_tokens` (the decode loop hands this layer text,
 not ids) · `n_indent` · `n_keep` (ferrox refuses an oversized request
 rather than shifting context, so there is nothing to protect) ·
 `n_cmpl` · `n_cache_reuse` · `t_max_predict_ms` · `id_slot` (no slots)
-· `lora` · `response_fields` · `return_progress` · `timings_per_token`
+· `response_fields` · `return_progress` · `timings_per_token`
 · `sse_ping_interval` (the keepalive is fixed at 15s).
 
 Also refused: `logit_bias` (through the same rule both OpenAI routes
@@ -1089,10 +1285,9 @@ than ranked; upstream prefers `grammar` and drops the schema, which is
 a 200 whose answer need not match the schema the caller sent.
 
 Options that only *parameterise* a switched-off sampler (
-`mirostat_tau`, `mirostat_eta`, `dry_base`, `dry_allowed_length`,
-`dry_penalty_last_n`, `dry_sequence_breakers`, `xtc_threshold`,
-`dynatemp_exponent`) are deliberately not in that list: they do
-nothing while their switch is off, and their switch is. A field
+`mirostat_tau`, `mirostat_eta`, `dynatemp_exponent`) are deliberately
+not in that list: they do nothing while their switch is off, and their
+switch is. A field
 llama.cpp does not define either is ignored, exactly as upstream
 ignores it.
 
@@ -1146,8 +1341,8 @@ The request body accepts both dialects on both paths:
 | both at once | **400.** They are one field, and guessing which was meant would tokenize text the caller did not ask about |
 | neither | **400** naming both. llama.cpp answers an empty array here; ferrox does not, because an empty array cannot be told apart from tokenizing `""` |
 | `add_special` | Supported. Prepends the same BOS id the generation path prepends, including its no-op on a checkpoint whose metadata says not to add one, so the count matches the prompt the model would really see |
-| `parse_special: true` (upstream's default) | Supported. ferrox's tokenizers always split on special-token text |
-| `parse_special: false` | **501 by name.** ferrox cannot tokenize `<|im_start|>` as plain characters |
+| `parse_special: true` (upstream's default) | Supported. Special-token markers in the text are the tokens they name |
+| `parse_special: false` | Supported. `<|im_start|>` is tokenized as the characters it is written with, as llama.cpp does |
 | `with_pieces` | **501 by name.** ferrox's tokenizers expose decoded text, not the raw per-token piece bytes, so a byte-fallback token could not be given llama.cpp's `piece` byte array |
 | `model` | Accepted and ignored; this server serves one model at a time |
 
@@ -1229,9 +1424,15 @@ The cost, stated: a model that never opens a call runs to `max_tokens`
 and finishes `"length"`, a visible failure rather than prose served as
 the call that was asked for.
 
-**Eight of the eleven** wire formats are supported: the three whose call
-is a JSON object behind a marker (Hermes/Qwen2.5, Llama 3, Mistral),
-plus `qwen3_coder`, `glm47`, `minimax`, `deepseekv32` and `gpt_oss`.
+**Ten of the eleven** wire formats are supported. One root rule per
+SHAPE, not one per format:
+
+| Shape | Formats | Root rule |
+|---|---|---|
+| JSON payload | Hermes/Qwen2.5, Llama 3, Mistral | a marker, a JSON object naming the tool, a closing marker |
+| Elements | `qwen3_coder`, `glm47`, `minimax`, `deepseekv32`, `minimax_m3` | an invoke element holding one element per argument |
+| Harmony | `gpt_oss` | a channel header addressed to `functions.<name>`, then JSON |
+| Pairs | `gemma4` | `call:NAME{k:v,k:v}`, the values in gemma's own quoting |
 
 The grammar's literals are built from the SAME marker description the
 streaming parser reads with, which is the only reason this is safe to
@@ -1239,18 +1440,25 @@ widen. Two hand-kept tables, one for writing a call and one for reading
 it, would drift, and the symptom would be output the engine forced and
 then could not parse back.
 
-Three still return **501 naming the format**, each for a reason the
-refusal states:
+An argument whose declared type the family's own spelling and this
+server's own reader disagree about is refused BY PROPERTY NAME rather
+than written approximately. On `gemma4` that is an `object` or `array`
+argument: the template writes a composite in gemma's DSL (bare keys,
+gemma-quoted strings) and ferrox reads a value with `serde_json`, so the
+spelling the checkpoint was trained to write comes back as a string. On
+the element formats it is a property with no declared `type` at all.
 
-- `gemma4`: arguments are a comma-separated list in gemma's own quoting
-  rather than a JSON object, so required-versus-optional cannot be said
-  by the object rule every other format shares. llama.cpp does not
-  schema-constrain gemma4 either.
-- `minimax_m3`: an argument is named by an element, and a repeated
-  element means an array, so what a name means depends on siblings that
-  have not been written yet.
+One still returns **501 naming the format**:
+
 - `muse_glimmer`: the call boundary is not syntactic. The same ATEM
-  block is a call in a tool channel and prose in a user-facing one.
+  block is a call in a tool channel and prose in a user-facing one, and
+  forcing the channel HEADER instead would need two facts about the
+  checkpoint's template rather than about the format: which recipient
+  name it addresses a tool with (the parser accepts any name that is not
+  `self` or `user`), and how much of that header the rendered prompt
+  already wrote, since a muse-glimmer prompt ends *inside* one. No
+  muse-glimmer checkpoint or template is on hand to read either off, and
+  guessing is the thing this refusal exists to prevent.
 
 ## Not yet
 
@@ -1262,9 +1470,9 @@ multi-GPU, tensor parallel, prefill/decode disaggregation · streamed
 argument deltas for the JSON-payload tool formats (they arrive whole) ·
 streamed tool calls on the continuous-batching path · a speculative
 decode path in the server, so every speculation field in `usage` is
-absent today · llama.cpp's `/infill`, `/props`, `/slots`,
-`/apply-template` and `/lora-adapters`, none of which have a
-ferrox counterpart.
+absent today · llama.cpp's `/infill`, `/props`, `GET /slots` (the live
+slot listing; `POST /slots/{id}` save/restore is supported, see above),
+and `/apply-template`, none of which has a ferrox counterpart.
 
 A few request fields deserialize and then go nowhere, accepted so a
 stock client's body does not fail validation over something this server

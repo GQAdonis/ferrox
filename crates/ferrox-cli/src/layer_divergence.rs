@@ -448,8 +448,12 @@ fn child_probe(args: &DivergenceArgs, backend: &str, prompt: &str) -> anyhow::Re
 /// Child side: one prefill, then read every layer's cache.
 fn emit(model: &str, prompt: &str, prompt_tokens: Option<usize>) -> anyhow::Result<()> {
     let path = crate::pull::resolve_model_path(model)?;
-    let (decoder, tokens, _eos) =
-        crate::verify_engine::load_and_tokenize(Path::new(&path), prompt, prompt_tokens)?;
+    let (decoder, tokens, _eos) = crate::verify_engine::load_and_tokenize(
+        Path::new(&path),
+        prompt,
+        ferrox_models::tokenizer::SpecialTokens::Parse,
+        prompt_tokens,
+    )?;
     let mut caches = fresh_caches(&decoder);
     let _ = decoder.forward_batch_last(&tokens, 0, &mut caches);
 
@@ -522,9 +526,7 @@ fn emit(model: &str, prompt: &str, prompt_tokens: Option<usize>) -> anyhow::Resu
 }
 
 fn fresh_caches(decoder: &ferrox_models::decoder::Decoder) -> Vec<KvCache> {
-    (0..decoder.layers.len())
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect()
+    decoder.config.new_kv_caches()
 }
 
 /// Sum of squares, used only to ask whether a buffer holds anything at

@@ -261,9 +261,16 @@ pub fn run(args: PerplexityArgs) -> anyhow::Result<()> {
     // over is the one `parity` proves against llama.cpp. A second
     // spelling of "encode, then add BOS if the checkpoint says to" is
     // exactly the drift that makes two numbers incomparable.
-    let (decoder, tokens, _eos) =
-        crate::verify_engine::load_and_tokenize(Path::new(&path), &text, None)
-            .context("loading the model and tokenizing the corpus")?;
+    let (decoder, tokens, _eos) = crate::verify_engine::load_and_tokenize(
+        Path::new(&path),
+        &text,
+        // llama-perplexity tokenizes its corpus with
+        // `common_tokenize(ctx, params.prompt, true)`, whose
+        // `parse_special` defaults to false.
+        ferrox_models::tokenizer::SpecialTokens::AsText,
+        None,
+    )
+    .context("loading the model and tokenizing the corpus")?;
 
     // The per-window BOS reset needs the id itself, and needs to know
     // whether this checkpoint uses one at all. Same predicate as the
@@ -308,9 +315,7 @@ pub fn run(args: PerplexityArgs) -> anyhow::Result<()> {
         // A fresh cache per window is llama.cpp's `llama_memory_clear`:
         // windows are independent, and a carried-over cache would let
         // window N attend over window N-1 and quietly lower the number.
-        let mut caches: Vec<KvCache> = (0..decoder.layers.len())
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let logits = decoder.forward_batch(&ids, 0, &mut caches);
         anyhow::ensure!(
             logits.len() == plan.n_ctx,

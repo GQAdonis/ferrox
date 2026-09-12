@@ -21,16 +21,49 @@ pub mod gpu;
 pub mod attn;
 
 #[cfg(feature = "metal")]
+pub mod rope;
+
+#[cfg(feature = "metal")]
+mod fa_vec_decode;
+
+#[cfg(feature = "metal")]
+pub mod decode_dense;
+
+#[cfg(feature = "metal")]
+pub mod resident_act;
+
+#[cfg(feature = "metal")]
+mod resident_cache;
+
+#[cfg(feature = "metal")]
+pub mod greedy_fold;
+
+#[cfg(feature = "metal")]
+mod dispatch;
+
+#[cfg(feature = "metal")]
 mod mem_ranges;
+
+#[cfg(feature = "metal")]
+pub(crate) mod timing;
+
+#[cfg(feature = "metal")]
+pub(crate) mod kernel_timing;
+
+#[cfg(all(test, feature = "metal"))]
+mod kernel_bench;
 
 #[cfg(feature = "metal")]
 mod moe_ids;
 
 #[cfg(feature = "metal")]
-pub use mem_ranges::{metal_barrier_stats, metal_barrier_stats_reset};
+pub use dispatch::{metal_encode_stats, metal_encode_stats_reset, EncodeStats};
 
 #[cfg(feature = "metal")]
 pub mod elem;
+
+#[cfg(feature = "metal")]
+pub mod norm;
 
 #[cfg(feature = "metal")]
 pub mod embd;

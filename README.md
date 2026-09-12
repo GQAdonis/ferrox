@@ -33,26 +33,35 @@ own. No llama.cpp bindings, no ggml wrapper. The loader, the quantized
 kernels, attention and expert routing are written here, in Rust.
 
 - **One binary, no runtime.** 19 MB with Metal and the server, and
-  completions, the API server, `download`, `bench` and `verify` are all
-  inside it. No wheels, no CUDA userspace to match against a driver.
-  PyTorch alone is 402 MB, before vLLM sits on top.
+  completions, the API server, `download`, `bench`, `batched-bench`,
+  `quantize`, `imatrix`, `gguf-split` and `verify` are all inside it. No
+  wheels, no CUDA userspace to match against a driver. PyTorch alone is
+  402 MB, before vLLM sits on top.
 - **Quantized end to end.** Weights stay quantized on mmap and
   dequantize inside the matmul, so an 8B model fits on a laptop.
   K-quants, the IQ tiers, MXFP4, F16 and BF16.
 - **Drop-in for llama.cpp.** Same flags, same sampler chain in the same
-  order. Tokenization is verified byte-for-byte on ten checkpoints, and
-  every engine number in [the speed table](benchmarks/RESULTS.md) was
-  measured against llama.cpp on the same host and the same file.
+  order, and the same tools: `quantize` writes Q8_0 and the K-quants
+  byte-identically to `llama-quantize`, with or without an importance
+  matrix, and `gguf-split`, `imatrix` and `batched-bench` are ports.
+  Tokenization is verified against libllama on twenty checkpoints under
+  both special-token settings, and every engine number in
+  [the speed table](benchmarks/RESULTS.md) was measured against
+  llama.cpp on the same host and the same file. 47 architectures run
+  with a logit comparison to back it; the rest stop and say what is
+  missing rather than guess.
 - **OpenAI-compatible server.** On Metal, multiple concurrent clients
   share one batched decode worker (llama.cpp slots + continuous batching,
   on by default). Paged KV shared across conversations, runtime model
-  swap, resumable streams, Anthropic and Responses endpoints, and
-  speculative decoding that stays lossless at any temperature. Point your
-  existing client at it.
+  swap, slot save and restore that refuses a mismatched checkpoint by
+  name, resumable streams, Anthropic and Responses endpoints, and
+  speculative decoding that stays lossless at any temperature. Point
+  your existing client at it.
 - **Structured output, enforced per token.** A GBNF grammar, a forced
-  `tool_choice`, or a tool's own `parameters` schema: a stack machine
-  masks every token that would break the constraint, so an invalid
-  answer is not reachable. No retry loop, no repair pass.
+  `tool_choice` in ten of the eleven tool-call wire formats, or a tool's
+  own `parameters` schema: a stack machine masks every token that would
+  break the constraint, so an invalid answer is not reachable. No retry
+  loop, no repair pass.
 - **Built for agents.** Reasoning streams into `reasoning_content`, tool
   calls parse in the eleven formats real checkpoints emit, and prompts
   are framed by the GGUF's own `tokenizer.chat_template`, compiled and
@@ -135,11 +144,34 @@ On `Q8_0` and `IQ4_NL`, ferrox's logits match llama.cpp's. On K-quants
 they drift, for a
 [known reason](docs/plans/llama-cpp-gap-inventory.md) that is not a
 ferrox bug: llama.cpp quantizes activations to `Q8_K` before the dot
-product and ferrox keeps them in f32. Use whichever quant you would
+product and ferrox keeps them in f32.
+
+**`IQ4_XS` is on the drifting side, not the matching one**, which the
+pair of names above makes easy to misread. ggml declares
+`vec_dot_type = Q8_K` for `IQ4_XS` and `Q8_0` for `IQ4_NL`, so they
+behave oppositely here despite the spelling. `ferrox parity` on an
+`IQ4_XS` checkpoint reads `DRIFT` by design and says so in its own
+output. Use whichever quant you would
 use with llama.cpp; if you are comparing the two, `Q8_0` is the one
 that answers the question without that variable in it.
 [docs/MODELS.md](docs/MODELS.md) lists what runs today, and which
 checkpoints stop with an error instead.
+
+## Ferrox Studio
+
+A web UI for the server: chat, the model inventory, live request
+activity, and copy-pasteable connection snippets. It is a separate app
+that talks to `ferrox-server` over the same public API every other
+client uses, so nothing in it can work that the API does not expose.
+
+<img src="docs/assets/studio-chat.webp" alt="Ferrox Studio chat" width="100%" />
+
+```bash
+ferrox serve -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -ngl all &
+cd ui && npm install && npm run dev      # http://localhost:5173
+```
+
+More screenshots and how it is put together: [`ui/README.md`](ui/README.md).
 
 ## Use it as a library
 

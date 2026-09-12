@@ -51,7 +51,10 @@
 //! single-use access -- exactly matching what `launch_matvec` already
 //! does (a fresh command buffer/encoder every call, never stored).
 
+use crate::dispatch::dispatch_counted;
 use crate::moe_ids::IdsBinding;
+use crate::resident_cache::{get_or_build, HostKey, Resident};
+use crate::timing::mm_timing_add;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -60,7 +63,7 @@ use objc2_metal::{
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
     MTLDispatchType, MTLLibrary, MTLResource, MTLResourceOptions, MTLSize,
 };
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
@@ -98,21 +101,48 @@ pub(crate) fn compute_encoder_concurrent(
 /// reads), which bubbles the GPU on OLMoE Concurrent encode.
 #[inline]
 pub(crate) fn memory_barrier_buffers(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
+    crate::dispatch::note_barrier();
     encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
 }
 
-/// Resource-scoped Concurrent barrier: only the listed buffers are ordered.
-/// Subsequent dispatches that don't touch these resources can overlap with
-/// in-flight work on other buffers (e.g. weight reads from a prior matvec).
+/// Resource-scoped Concurrent barrier over an ALREADY-BUILT resource list.
+///
+/// Only the listed buffers are ordered, so subsequent dispatches that
+/// don't touch them can overlap with in-flight work on other buffers
+/// (e.g. weight reads from a prior matvec).
+///
+/// This takes the list rather than building one because the hazard
+/// tracker already holds the pending set in exactly this form and reuses
+/// its allocation across the ~160 barriers a decode token emits;
+/// [`memory_barrier_resources`] is the convenience wrapper for the
+/// handful of call sites that name their buffers inline.
+#[inline]
+pub(crate) fn memory_barrier_resource_list(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    resources: &mut [NonNull<ProtocolObject<dyn MTLResource>>],
+) {
+    if resources.is_empty() {
+        // Nothing named: fall back to scope-Buffers, which is counted by
+        // the delegate.
+        memory_barrier_buffers(encoder);
+        return;
+    }
+    let head = NonNull::new(resources.as_mut_ptr()).expect("non-empty slice has a non-null base");
+    crate::dispatch::note_barrier();
+    // SAFETY: `head` points at `resources.len()` live resource pointers,
+    // each taken from a buffer bound into this encoder's command buffer
+    // and therefore alive for the whole encode pass.
+    unsafe {
+        encoder.memoryBarrierWithResources_count(head, resources.len());
+    }
+}
+
+/// Resource-scoped Concurrent barrier over buffers named inline.
 #[inline]
 pub(crate) fn memory_barrier_resources(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     bufs: &[&ProtocolObject<dyn MTLBuffer>],
 ) {
-    if bufs.is_empty() {
-        memory_barrier_buffers(encoder);
-        return;
-    }
     // MTLBuffer: MTLResource — build a contiguous pointer list for the API.
     let mut resources: Vec<NonNull<ProtocolObject<dyn MTLResource>>> =
         Vec::with_capacity(bufs.len());
@@ -120,64 +150,15 @@ pub(crate) fn memory_barrier_resources(
         let r: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(*b);
         resources.push(NonNull::from(r));
     }
-    unsafe {
-        encoder.memoryBarrierWithResources_count(
-            NonNull::new(resources.as_mut_ptr()).unwrap(),
-            resources.len(),
-        );
-    }
+    memory_barrier_resource_list(encoder, &mut resources);
 }
 
-/// Thread-local pointer + length for a Metal-resident activation buffer
-/// (normalized hidden after final_norm in the dense stack). When set,
-/// [`launch_matvec_fused`] can skip re-uploading if `x` matches.
-#[derive(Clone, Copy)]
-struct ResidentActivation {
-    /// Raw pointer to the MTLBuffer (not retained — caller owns).
-    buf_ptr: *const ProtocolObject<dyn MTLBuffer>,
-    /// Number of f32 elements.
-    len: usize,
-}
-
-thread_local! {
-    /// Holds a resident activation buffer from the dense stack (final_norm
-    /// output in `x_buf`) so the next `output_head.apply_gpu` can reuse it
-    /// without uploading. Cleared after first read.
-    static RESIDENT_ACT: Cell<Option<ResidentActivation>> = const { Cell::new(None) };
-}
-
-/// Stores a resident activation buffer pointer for the current thread.
-/// Used by [`crate::attn::launch_decode_dense_stack`] when writing
-/// final_norm output to scratch so the next matvec can skip upload.
-pub(crate) fn set_resident_activation(buf: &ProtocolObject<dyn MTLBuffer>, len: usize) {
-    RESIDENT_ACT.set(Some(ResidentActivation {
-        buf_ptr: buf as *const _,
-        len,
-    }));
-}
-
-/// Clears the resident activation buffer TLS. Used to ensure clean state
-/// after a decode that doesn't consume the resident buffer.
-pub fn clear_resident_activation() {
-    RESIDENT_ACT.set(None);
-}
-
-/// Checks if a resident activation buffer matches `x`, and if so, returns
-/// the buffer and clears the TLS. Used by [`launch_matvec_fused`].
-fn take_resident_activation_if_matches(
-    x: &[f32],
-) -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
-    RESIDENT_ACT.take().and_then(|res| {
-        if res.len == x.len() {
-            // Safety: pointer came from a live buffer in the same thread's
-            // dense stack call (still in scope). We use Retained::retain
-            // to get a new strong reference.
-            unsafe { Retained::retain(res.buf_ptr as *mut _) }
-        } else {
-            None
-        }
-    })
-}
+/// The resident-activation hand-off from the dense stack to the next
+/// matvec used to live here, as a thread-local raw pointer into the
+/// process-wide decode scratch, matched on LENGTH alone. It is now
+/// [`crate::resident_act`], which states the identity it matches on and
+/// why a length was not one.
+pub use crate::resident_act::{clear_resident_activation, resident_activation_reuses};
 
 /// Returns the default Metal device's name, or `None` if this machine
 /// has no Metal-capable GPU (real check, not a compile-time guess).
@@ -1572,7 +1553,8 @@ pub(crate) fn encode_q4_0_mul_mm(
         enc.setThreadgroupMemoryLength_atIndex((tg as usize) * 4, 0);
     }
 
-    enc.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        enc,
         MTLSize {
             width: rows,
             height: 1,
@@ -3590,7 +3572,8 @@ pub(crate) fn encode_moe_mm_id_map0(
         enc.setBytes_length_atIndex(NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(), 4, 3);
         enc.setThreadgroupMemoryLength_atIndex(smem, 0);
     }
-    enc.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        enc,
         MTLSize {
             width: 1,
             height: 1,
@@ -3648,7 +3631,8 @@ pub(crate) fn encode_mul_mm_id_f16(
             );
         }
         enc.setThreadgroupMemoryLength_atIndex(8192, 0);
-        enc.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            enc,
             MTLSize {
                 width: (n_tokens as usize).div_ceil(32),
                 height: (rows as usize).div_ceil(64),
@@ -3689,7 +3673,8 @@ pub(crate) fn encode_moe_router_mm_f32(
             );
         }
     }
-    enc.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        enc,
         MTLSize {
             width: n_experts as usize,
             height: n_tokens as usize,
@@ -3738,7 +3723,8 @@ pub(crate) fn encode_moe_topk_softmax_batch(
         }
         enc.setThreadgroupMemoryLength_atIndex((n as usize) * 4, 0);
     }
-    enc.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        enc,
         MTLSize {
             width: n_tokens as usize,
             height: 1,
@@ -3958,7 +3944,8 @@ pub(crate) fn encode_moe_prefill_weighted_sum(
         encoder.setBytes_length_atIndex(NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(), 4, 5);
     }
     let sum_elems = (n_tokens as usize) * (hidden_rows as usize);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: sum_elems.div_ceil(SUM_TG),
             height: 1,
@@ -4016,7 +4003,8 @@ pub(crate) fn encode_mul_mm_id(
             );
         }
         enc.setThreadgroupMemoryLength_atIndex(8192, 0);
-        enc.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            enc,
             MTLSize {
                 width: (n_tokens as usize).div_ceil(32),
                 height: (rows as usize).div_ceil(64),
@@ -4135,7 +4123,8 @@ pub(crate) fn encode_mul_mm_sg_f16(
             );
         }
         enc.setThreadgroupMemoryLength_atIndex(smem, 0);
-        enc.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            enc,
             MTLSize {
                 width: batch_size.div_ceil(32),
                 height: l.rows.div_ceil(64),
@@ -4209,7 +4198,8 @@ pub(crate) fn encode_mul_mm_sg_offset_ex(
             );
         }
         enc.setThreadgroupMemoryLength_atIndex(smem, 0);
-        enc.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            enc,
             MTLSize {
                 width: batch_size.div_ceil(32),
                 height: l.rows.div_ceil(64),
@@ -4417,7 +4407,7 @@ fn launch_k_quant_mul_mm_sg(
             height: 1,
             depth: 1,
         };
-        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        dispatch_counted(&enc, grid, tg);
     }
     enc.endEncoding();
     let t_gpu = std::time::Instant::now();
@@ -4434,78 +4424,6 @@ fn launch_k_quant_mul_mm_sg(
         mm_timing_add(setup_us, gpu_us, t_read.elapsed().as_micros());
     }
     Ok(out)
-}
-
-use std::sync::atomic::{AtomicU64, Ordering as AtomOrd};
-static MM_SETUP_US: AtomicU64 = AtomicU64::new(0);
-static MM_GPU_US: AtomicU64 = AtomicU64::new(0);
-static MM_READ_US: AtomicU64 = AtomicU64::new(0);
-static MM_CALLS: AtomicU64 = AtomicU64::new(0);
-
-/// Accumulate into the `FERROX_METAL_MM_TIMING` counters (prefill evidence).
-pub(crate) fn mm_timing_add(setup: u128, gpu: u128, read: u128) {
-    MM_SETUP_US.fetch_add(setup as u64, AtomOrd::Relaxed);
-    MM_GPU_US.fetch_add(gpu as u64, AtomOrd::Relaxed);
-    MM_READ_US.fetch_add(read as u64, AtomOrd::Relaxed);
-    let n = MM_CALLS.fetch_add(1, AtomOrd::Relaxed) + 1;
-    // First call + every 224: stack prefill is often one timed launch.
-    if n == 1 || n.is_multiple_of(224) {
-        eprintln!(
-            "ferrox: mul_mm {n} calls -- setup {:.1} ms, gpu {:.1} ms, readback {:.1} ms",
-            MM_SETUP_US.load(AtomOrd::Relaxed) as f64 / 1000.0,
-            MM_GPU_US.load(AtomOrd::Relaxed) as f64 / 1000.0,
-            MM_READ_US.load(AtomOrd::Relaxed) as f64 / 1000.0,
-        );
-    }
-}
-
-/// GPU-clock accumulators for `FERROX_METAL_GPU_TIMING`, keyed by tag.
-///
-/// Wall-clock (`FERROX_METAL_MM_TIMING`) measures how long the host waited,
-/// which on a loaded host is mostly scheduler noise. `MTLCommandBuffer`'s
-/// `GPUStartTime`/`GPUEndTime` measure the command buffer's own occupancy
-/// and stay usable while the machine is busy, so A/B evidence in
-/// `docs/plans/llama-cpp-parity-push.md` is taken from these.
-static GPU_TIMING: std::sync::Mutex<Vec<(&'static str, u64, u64)>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// True when `FERROX_METAL_GPU_TIMING` is set (cached; read once).
-pub(crate) fn gpu_timing_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FERROX_METAL_GPU_TIMING").is_some())
-}
-
-/// Accumulate one command buffer's GPU-side duration under `tag` and log a
-/// running mean every `every` submissions. No-op unless timing is enabled.
-pub(crate) fn gpu_timing_note(
-    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
-    tag: &'static str,
-    every: u64,
-) {
-    if !gpu_timing_enabled() {
-        return;
-    }
-    let dt_ns = ((cmd_buf.GPUEndTime() - cmd_buf.GPUStartTime()) * 1e9).max(0.0) as u64;
-    let Ok(mut slots) = GPU_TIMING.lock() else {
-        return;
-    };
-    let slot = match slots.iter_mut().find(|(t, _, _)| *t == tag) {
-        Some(s) => s,
-        None => {
-            slots.push((tag, 0, 0));
-            slots.last_mut().expect("just pushed")
-        }
-    };
-    slot.1 += 1;
-    slot.2 += dt_ns;
-    let (n, acc) = (slot.1, slot.2);
-    if n.is_multiple_of(every.max(1)) {
-        eprintln!(
-            "ferrox: metal gpu[{tag}] {:.3} ms avg over {n} (last {:.3} ms)",
-            (acc as f64 / n as f64) / 1e6,
-            dt_ns as f64 / 1e6,
-        );
-    }
 }
 
 /// Launches Q4_K multi-activation matmul (see [`Q4_K_MUL_MM_KERNEL_SRC`]).
@@ -4589,7 +4507,8 @@ pub fn launch_q4_k_mul_mm(
         enc.setThreadgroupMemoryLength_atIndex((tg as usize) * 4, 0);
     }
 
-    enc.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        &enc,
         MTLSize {
             width: rows,
             height: 1,
@@ -5178,9 +5097,10 @@ pub(crate) fn warm_mul_mm_sg_pipeline(
     ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)
 }
 
-/// Process-wide cache of quantized weight `MTLBuffer`s, keyed by the
-/// host slice's base pointer and length. Stable for mmap-backed and
-/// owned `WeightBytes` after load (weights are not mutated in place).
+/// Process-wide cache of quantized weight `MTLBuffer`s, looked up by
+/// the host slice's base pointer and length and served only when the
+/// entry can still prove it holds those bytes -- see
+/// [`crate::resident_cache`] for why a lookup key is not an identity.
 pub(crate) struct ResidentWeightBuffer {
     pub(crate) buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Byte offset of the weight bytes within `buffer`. Non-zero only on
@@ -5236,78 +5156,46 @@ fn weight_fingerprint(weights: &[u8]) -> u64 {
 unsafe impl Send for ResidentWeightBuffer {}
 unsafe impl Sync for ResidentWeightBuffer {}
 
-type WeightCacheKey = (usize, usize);
-type WeightCacheMap = HashMap<WeightCacheKey, Arc<ResidentWeightBuffer>>;
+impl Resident for ResidentWeightBuffer {
+    /// One proof per way this entry can have been built.
+    ///
+    /// A `BytesNoCopy` alias holds an `Arc<ResidentMmapFile>`, and that
+    /// keepalive is what makes its address an identity: the mapping
+    /// cannot be unmapped while the entry lives, so the kernel cannot
+    /// reissue the range to a second file. There is also nothing to
+    /// compare, because the device bytes ARE the host bytes.
+    ///
+    /// A copied entry owns its bytes, and the host allocation behind
+    /// the address can be freed and reissued, so it carries a
+    /// fingerprint of what it was built from. Sampled rather than
+    /// exhaustive: the copy path is what an expert-streaming lease
+    /// takes, where comparing a whole matrix per matvec would cost what
+    /// the upload it skips costs. That is a weaker proof than
+    /// [`ResidentF32Buffer`]'s, and saying so is the honest version.
+    fn still_holds(&self, host: &[u8]) -> bool {
+        self.mmap_backed || self.fingerprint == weight_fingerprint(host)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.nbytes
+    }
+}
+
+type WeightCacheMap = HashMap<HostKey, Arc<ResidentWeightBuffer>>;
 
 static WEIGHT_CACHE: Mutex<Option<WeightCacheMap>> = Mutex::new(None);
 
 thread_local! {
-    static TL_WEIGHT_CACHE: RefCell<HashMap<(usize, usize), Arc<ResidentWeightBuffer>>> =
-        RefCell::new(HashMap::new());
-}
-
-fn weight_cache_budget_bytes() -> usize {
-    match std::env::var("FERROX_METAL_WEIGHT_CACHE_BYTES") {
-        Ok(v) => v.parse().unwrap_or(usize::MAX),
-        // Default: effectively unlimited on unified memory; callers can
-        // cap with FERROX_METAL_WEIGHT_CACHE_BYTES for smaller machines.
-        Err(_) => usize::MAX,
-    }
+    static TL_WEIGHT_CACHE: RefCell<WeightCacheMap> = RefCell::new(HashMap::new());
 }
 
 pub(crate) fn resident_weight_buffer(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     weights: &[u8],
 ) -> Result<Arc<ResidentWeightBuffer>, MetalError> {
-    let key = (weights.as_ptr() as usize, weights.len());
-    // The fingerprint guards against an address being freed and reused
-    // by different bytes. That cannot happen to a registered mmap: the
-    // cached entry holds an `Arc<ResidentMmapFile>` keeping the mapping
-    // alive, so the range stays valid and unchanged for as long as the
-    // entry does. Every real GGUF weight takes that path, and computing
-    // the fingerprint touches 64 pages -- per weight, per call, on the
-    // hot side of the cache lookup. So compute it lazily, only for the
-    // owned/unregistered slices that can actually alias.
-    let fingerprint_of = |c: &ResidentWeightBuffer| -> bool {
-        c.mmap_backed || c.fingerprint == weight_fingerprint(weights)
-    };
-    if let Some(cached) = TL_WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        if fingerprint_of(&cached) {
-            return Ok(cached);
-        }
-        // Address reused by different bytes: drop the stale alias and
-        // fall through to rebuild.
-        TL_WEIGHT_CACHE.with(|c| {
-            c.borrow_mut().remove(&key);
-        });
-    }
-    let cached = {
-        let mut guard = WEIGHT_CACHE.lock().unwrap();
-        let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some(cached) = cache.get(&key).filter(|c| fingerprint_of(c)) {
-            cached.clone()
-        } else {
-            let budget = weight_cache_budget_bytes();
-            let used: usize = cache.values().map(|b| b.nbytes).sum();
-            if used.saturating_add(weights.len()) > budget {
-                // Drop everything and retry with a clean slate for this matrix.
-                // Better than silently re-uploading forever under a tight budget.
-                cache.clear();
-                TL_WEIGHT_CACHE.with(|c| c.borrow_mut().clear());
-            }
-            if weights.len() > budget {
-                // Matrix alone exceeds budget: one-shot upload, do not cache.
-                return Ok(Arc::new(build_resident_weight_buffer(device, weights)?));
-            }
-            let cached = Arc::new(build_resident_weight_buffer(device, weights)?);
-            cache.insert(key, cached.clone());
-            cached
-        }
-    };
-    TL_WEIGHT_CACHE.with(|c| {
-        c.borrow_mut().insert(key, cached.clone());
-    });
-    Ok(cached)
+    get_or_build(&WEIGHT_CACHE, &TL_WEIGHT_CACHE, weights, || {
+        build_resident_weight_buffer(device, weights)
+    })
 }
 
 /// VM page size used for `BytesNoCopy` alignment. Apple Silicon uses
@@ -5453,77 +5341,74 @@ pub(crate) struct ResidentF32Buffer {
     nbytes: usize,
 }
 
+impl Resident for ResidentF32Buffer {
+    /// An exhaustive compare, because this entry can prove nothing
+    /// else: it always copies, so it neither aliases the host bytes nor
+    /// keeps their allocation alive, and what it caches are the RMSNorm
+    /// gammas and RoPE frequency factors owned by a `Decoder` that
+    /// `/admin/models/load` drops.
+    ///
+    /// Exact rather than sampled, and affordable for the same reason it
+    /// is needed: these are `hidden_dim` floats, single-digit KB, so
+    /// the compare costs a fraction of the upload it avoids. That
+    /// leaves no residual probability of serving one model's norms to
+    /// another (GitHub issue #180).
+    fn still_holds(&self, host: &[u8]) -> bool {
+        if self.nbytes != host.len() {
+            return false;
+        }
+        // SAFETY: `buffer` is a `StorageModeShared` buffer this process
+        // allocated with exactly `nbytes` bytes and only ever reads on
+        // the GPU, so its contents pointer is valid and readable for
+        // that length for as long as this entry lives.
+        let device = unsafe {
+            std::slice::from_raw_parts(self.buffer.contents().as_ptr() as *const u8, self.nbytes)
+        };
+        device == host
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.nbytes
+    }
+}
+
 // SAFETY: same justification as `SharedMetal` -- `MTLBuffer` created
 // once and only read by compute kernels is safe to share across threads
 // that each build their own command buffer/encoder.
 unsafe impl Send for ResidentF32Buffer {}
 unsafe impl Sync for ResidentF32Buffer {}
 
-type F32CacheKey = (usize, usize);
-type F32CacheMap = HashMap<F32CacheKey, Arc<ResidentF32Buffer>>;
+type F32CacheMap = HashMap<HostKey, Arc<ResidentF32Buffer>>;
 
 static F32_CACHE: Mutex<Option<F32CacheMap>> = Mutex::new(None);
 
 thread_local! {
-    static TL_F32_CACHE: RefCell<HashMap<(usize, usize), Arc<ResidentF32Buffer>>> =
-        RefCell::new(HashMap::new());
+    static TL_F32_CACHE: RefCell<F32CacheMap> = RefCell::new(HashMap::new());
 }
 
 pub(crate) fn resident_f32_buffer(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     data: &[f32],
 ) -> Result<Arc<ResidentF32Buffer>, MetalError> {
-    let key = (data.as_ptr() as usize, data.len());
-    if let Some(cached) = TL_F32_CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        return Ok(cached);
-    }
     let nbytes = std::mem::size_of_val(data);
-    let cached = {
-        let mut guard = F32_CACHE.lock().unwrap();
-        let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some(cached) = cache.get(&key) {
-            cached.clone()
-        } else {
-            let budget = weight_cache_budget_bytes();
-            let used: usize = cache.values().map(|b| b.nbytes).sum();
-            if used.saturating_add(nbytes) > budget {
-                // Drop everything and retry with a clean slate for this matrix.
-                // Better than silently re-uploading forever under a tight budget.
-                cache.clear();
-                TL_F32_CACHE.with(|c| c.borrow_mut().clear());
-            }
-            if nbytes > budget {
-                // Matrix alone exceeds budget: one-shot upload, do not cache.
-                let mut data_owned = data.to_vec();
-                let buffer = unsafe {
-                    device.newBufferWithBytes_length_options(
-                        NonNull::new(data_owned.as_mut_ptr() as *mut _).unwrap(),
-                        nbytes,
-                        MTLResourceOptions::StorageModeShared,
-                    )
-                }
-                .ok_or(MetalError::BufferAllocFailed)?;
-                return Ok(Arc::new(ResidentF32Buffer { buffer, nbytes }));
-            }
-
-            let mut data_owned = data.to_vec();
-            let buffer = unsafe {
-                device.newBufferWithBytes_length_options(
-                    NonNull::new(data_owned.as_mut_ptr() as *mut _).unwrap(),
-                    nbytes,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            }
-            .ok_or(MetalError::BufferAllocFailed)?;
-            let cached = Arc::new(ResidentF32Buffer { buffer, nbytes });
-            cache.insert(key, cached.clone());
-            cached
+    // SAFETY: an initialised `[f32]` is `nbytes` initialised bytes, and
+    // `u8` has no alignment requirement. Read-only, and the borrow of
+    // `data` outlives the view.
+    let host = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, nbytes) };
+    get_or_build(&F32_CACHE, &TL_F32_CACHE, host, || {
+        let mut data_owned = data.to_vec();
+        // SAFETY: `data_owned` holds `nbytes` initialised bytes and is
+        // alive across the call, which copies them into the buffer.
+        let buffer = unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(data_owned.as_mut_ptr() as *mut _).unwrap(),
+                nbytes,
+                MTLResourceOptions::StorageModeShared,
+            )
         }
-    };
-    TL_F32_CACHE.with(|c| {
-        c.borrow_mut().insert(key, cached.clone());
-    });
-    Ok(cached)
+        .ok_or(MetalError::BufferAllocFailed)?;
+        Ok(ResidentF32Buffer { buffer, nbytes })
+    })
 }
 
 /// One quantized matvec to encode into a fused Metal command buffer
@@ -5541,6 +5426,14 @@ pub struct MatvecLaunch<'a> {
     pub rows_per_tg: usize,
 }
 
+/// What runs over every output vector after the matvecs, in the same
+/// command buffer, before the wait.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MatvecEpilogue {
+    /// Gemma-2's `final_logit_softcapping`: `y = cap * tanh(y / cap)`.
+    pub softcap: Option<f32>,
+}
+
 /// Encodes every launch into a single compute command buffer sharing
 /// one uploaded `x`, then waits once. Independent projections that
 /// share an activation (e.g. Q/K/V) should use this instead of N
@@ -5548,6 +5441,42 @@ pub struct MatvecLaunch<'a> {
 pub fn launch_matvec_fused(
     x: &[f32],
     launches: &[MatvecLaunch<'_>],
+) -> Result<Vec<Vec<f32>>, MetalError> {
+    launch_matvec_fused_with(x, launches, MatvecEpilogue::default())
+}
+
+/// One matvec of the kind named as `matvec_launch_meta` names it, with
+/// an epilogue: the lm_head of a sampled Gemma-2 decode token, softcap
+/// included, so the host never touches the 256k logits before sampling
+/// them. `None` when the kind has no Metal matvec.
+pub fn launch_matvec_kind_with(
+    kind: &str,
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    epilogue: MatvecEpilogue,
+) -> Option<Result<Vec<f32>, MetalError>> {
+    let (kernel_src, fn_name, block_bytes, block_elems, rows_per_tg) = matvec_launch_meta(kind)?;
+    let launch = MatvecLaunch {
+        kernel_src,
+        fn_name,
+        block_bytes,
+        block_elems,
+        weights,
+        rows,
+        row_bytes,
+        rows_per_tg,
+    };
+    Some(launch_matvec_fused_with(x, &[launch], epilogue).map(|mut outs| outs.pop().unwrap()))
+}
+
+/// [`launch_matvec_fused`] with an [`MatvecEpilogue`] applied to every
+/// output in the same command buffer.
+pub fn launch_matvec_fused_with(
+    x: &[f32],
+    launches: &[MatvecLaunch<'_>],
+    epilogue: MatvecEpilogue,
 ) -> Result<Vec<Vec<f32>>, MetalError> {
     if launches.is_empty() {
         return Ok(Vec::new());
@@ -5570,24 +5499,11 @@ pub fn launch_matvec_fused(
     let device = &shared.device;
     let queue = &shared.queue;
 
-    // Check if x is already resident from the dense stack (final_norm
-    // output). If so, skip upload and use the resident buffer. Always
-    // clear TLS afterward to prevent stale matches.
-    let x_buf = if let Some(resident) = take_resident_activation_if_matches(x) {
-        resident
-    } else {
-        // No match or no TLS set — clear any stale TLS and upload normally.
-        clear_resident_activation();
-        let mut x_owned = x.to_vec();
-        unsafe {
-            device.newBufferWithBytes_length_options(
-                NonNull::new(x_owned.as_mut_ptr() as *mut _).unwrap(),
-                x_owned.len() * 4,
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .ok_or(MetalError::BufferAllocFailed)?
-    };
+    // Reuses the dense stack's own `x` buffer when `x` IS the vector
+    // that stack just returned, and uploads otherwise. One helper, not
+    // one copy per consumer: see `crate::resident_act`.
+    let clock = crate::timing::SubmitClock::start();
+    let x_buf = crate::resident_act::upload_or_reuse(device, x)?;
 
     let mut weight_bufs = Vec::with_capacity(launches.len());
     let mut out_bufs = Vec::with_capacity(launches.len());
@@ -5617,9 +5533,18 @@ pub fn launch_matvec_fused(
             &out_bufs[i],
         )?;
     }
+    // A serial encoder: the epilogue reads what the matvecs wrote
+    // without a barrier of its own.
+    if let Some(cap) = epilogue.softcap {
+        for (i, launch) in launches.iter().enumerate() {
+            crate::elem::encode_softcap(&encoder, device, &out_bufs[i], launch.rows as u32, cap)?;
+        }
+    }
     encoder.endEncoding();
-    cmd_buf.commit();
-    cmd_buf.waitUntilCompleted();
+    // The lm_head of every sampled (non-greedy) decode token runs here,
+    // in a SECOND command buffer after the dense stack. Untimed, its GPU
+    // time read as host time (GitHub issue #149).
+    crate::timing::commit_wait_note(&cmd_buf, "matvec-fused", 32, clock);
 
     let mut outs = Vec::with_capacity(launches.len());
     for (i, launch) in launches.iter().enumerate() {
@@ -5665,20 +5590,7 @@ pub fn launch_dense_ffn_swiglu(
     let device = &shared.device;
     let queue = &shared.queue;
 
-    let x_buf = if let Some(resident) = take_resident_activation_if_matches(x) {
-        resident
-    } else {
-        clear_resident_activation();
-        let mut x_owned = x.to_vec();
-        unsafe {
-            device.newBufferWithBytes_length_options(
-                NonNull::new(x_owned.as_mut_ptr() as *mut _).unwrap(),
-                x_owned.len() * 4,
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .ok_or(MetalError::BufferAllocFailed)?
-    };
+    let x_buf = crate::resident_act::upload_or_reuse(device, x)?;
 
     let gate_w = resident_weight_buffer(device, gate.weights)?;
     let up_w = resident_weight_buffer(device, up.weights)?;
@@ -5918,7 +5830,8 @@ fn encode_moe_matvec_id(
             encoder.setThreadgroupMemoryLength_atIndex(disp.tg_mem, 0);
         }
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: (n_rows as usize).div_ceil(disp.rows_per_tg),
             height: 1,
@@ -5997,7 +5910,8 @@ fn encode_moe_down_id(
             encoder.setThreadgroupMemoryLength_atIndex(disp.tg_mem, 0);
         }
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: (hidden_rows as usize).div_ceil(disp.rows_per_tg),
             height: 1,
@@ -6406,7 +6320,8 @@ pub(crate) fn encode_q4_0_moe_id(
                 4,
             );
         }
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            encoder,
             MTLSize {
                 width: packed.hidden_rows.div_ceil(SUM_TG),
                 height: 1,
@@ -6444,7 +6359,8 @@ pub(crate) fn encode_q4_0_moe_id(
             );
         }
         let sum_elems = (n_tokens as usize) * packed.hidden_rows;
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            encoder,
             MTLSize {
                 width: sum_elems.div_ceil(SUM_TG),
                 height: 1,
@@ -6821,7 +6737,8 @@ pub(crate) fn encode_q4_0_moe_topk(
             21,
         );
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: experts.len() * ffn.div_ceil(ROWS_PER_TG),
             height: 1,
@@ -6877,7 +6794,8 @@ pub(crate) fn encode_q4_0_moe_topk(
             14,
         );
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: experts.len() * hidden.div_ceil(ROWS_PER_TG),
             height: 1,
@@ -6915,7 +6833,8 @@ pub(crate) fn encode_q4_0_moe_topk(
         );
     }
     const SUM_TG: usize = 256;
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: hidden.div_ceil(SUM_TG),
             height: 1,
@@ -7006,20 +6925,7 @@ pub fn launch_moe_topk_swiglu(
     let device = &shared.device;
     let queue = &shared.queue;
 
-    let x_buf = if let Some(resident) = take_resident_activation_if_matches(x) {
-        resident
-    } else {
-        clear_resident_activation();
-        let mut x_owned = x.to_vec();
-        unsafe {
-            device.newBufferWithBytes_length_options(
-                NonNull::new(x_owned.as_mut_ptr() as *mut _).unwrap(),
-                x_owned.len() * 4,
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .ok_or(MetalError::BufferAllocFailed)?
-    };
+    let x_buf = crate::resident_act::upload_or_reuse(device, x)?;
 
     let q4_0_batched = experts.len() <= 8
         && experts.iter().all(|ex| {
@@ -7277,7 +7183,8 @@ pub(crate) fn encode_matvec_with_offsets(
         // threadgroup, NSG = min(4, ceil(ne00/128)) simdgroups sharing the
         // reduction axis. `MAX_NSG` in the kernel is 8.
         let nsg = cols.div_ceil(128).clamp(1, 4);
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            encoder,
             MTLSize {
                 width: launch.rows.div_ceil(2),
                 height: 1,
@@ -7348,7 +7255,8 @@ pub(crate) fn encode_matvec_with_offsets(
             encoder.setThreadgroupMemoryLength_atIndex(tg_mem_bytes, 0);
         }
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,

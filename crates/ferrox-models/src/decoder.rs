@@ -13,17 +13,21 @@
 //! checkpoint to be present.
 
 mod attn_block;
-mod ffn_act;
+mod entry;
+mod ffn_block;
 pub mod kv_window;
 mod lm_head;
 mod qk_norm;
+mod qkv_bias;
 mod rope;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::skip_stream::SkipStream;
 pub(crate) use attn_block::KvStep;
 use ferrox_core::attention::{
-    causal_gqa_attention_prefill_shared_kv_windowed, causal_gqa_attention_softcap,
+    causal_gqa_attention_prefill_shared_kv_split, causal_gqa_attention_row,
+    causal_gqa_attention_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedStoreExhausted, SharedPagedKv};
 use ferrox_core::matmul::rms_norm;
@@ -55,13 +59,18 @@ use ferrox_moe::{
 };
 
 use crate::config::ModelConfig;
+use crate::norm::NormOp;
+use crate::scalar_multipliers::residual_add;
 
 pub struct AttnWeights {
     pub q_proj: WeightMatrix, // [n_heads*head_dim, hidden_dim]
     pub k_proj: WeightMatrix, // [n_kv_heads*head_dim, hidden_dim]
     pub v_proj: WeightMatrix, // [n_kv_heads*head_dim, hidden_dim]
     pub o_proj: WeightMatrix, // [hidden_dim, n_heads*head_dim]
-    pub norm_weight: Vec<f32>,
+    /// The PRE-attention norm, or [`NormOp::None`] for the
+    /// post-norm-only topology (`olmo2` / `exaone4`), which projects
+    /// Q/K/V straight off the raw residual. See [`crate::norm`].
+    pub norm_weight: NormOp,
     /// OLMoE-style QK-RMSNorm (`attn_q_norm`/`attn_k_norm` GGUF tensors),
     /// applied to the *whole* q_proj/k_proj output (width `n_heads*head_dim`
     /// / `n_kv_heads*head_dim`) before RoPE -- confirmed against
@@ -96,6 +105,50 @@ pub struct AttnWeights {
     pub post_attn_norm: Option<Vec<f32>>,
     /// Gemma 2+/3 post-FFN RMSNorm (`blk.N.post_ffw_norm.weight`).
     pub post_ffn_norm: Option<Vec<f32>>,
+    /// The learned output gate, `blk.N.attn_gate.weight`, applied to the
+    /// attention output before `o_proj` (`afmoe`, `laguna`, `step35`).
+    /// See [`crate::attn_gate`] for the two axes it varies on and the
+    /// one input it always reads. `None` for every architecture whose
+    /// graph has no such op; a file carrying the tensor on one of those
+    /// is refused as unconsumed rather than gated.
+    pub output_gate: Option<crate::attn_gate::AttnGate>,
+    /// `blk.N.attn_sinks.weight`, one learned logit per query head that
+    /// joins every softmax and contributes nothing to the output
+    /// (`ggml_soft_max_add_sinks`, `llama-graph.cpp:2600`).
+    ///
+    /// Used to live on the gpt-oss side table alone, which spelled the
+    /// rule as "arch is gpt-oss". Four llama.cpp graphs pass this
+    /// tensor into `build_attn` -- `openai-moe.cpp:115`,
+    /// `mimo2.cpp:177`, `dflash.cpp`, `deepseek4.cpp` -- through the
+    /// SAME `build_attn_mha` path, so the rule is "the tensor is
+    /// present". gpt-oss requires it (`openai-moe.cpp:44`) and
+    /// `loader.rs` still refuses a gpt-oss file without one; the fused
+    /// Metal launches refuse any layer that has one, by the exhaustive
+    /// destructure in `Decoder::metal_attn_view`.
+    pub sinks: Option<Vec<f32>>,
+    /// BitNet's `blk.N.attn_sub_norm.weight`, `[hidden_dim]`: an RMSNorm
+    /// on the attention output BEFORE `o_proj` (`bitnet.cpp:101-106`),
+    /// the other side of that matmul from `post_attn_norm`. Loaded
+    /// only for a model whose `ModelConfig::block_sub_norms` says so
+    /// (`crate::sub_norms`); the fused Metal launches refuse the model
+    /// through `metal_can_serve_model` and the layer through the
+    /// exhaustive destructure in `Decoder::metal_attn_view`.
+    pub attn_sub_norm: Option<Vec<f32>>,
+    /// `blk.N.attn_output.scale`, the `{1}` companion `build_lora_mm`
+    /// multiplies the attention branch by right after `wo`
+    /// (`llama-graph.cpp:1492-1494`; `talkie` writes it on every export,
+    /// `crate::weight_scales`). The fused Metal launches refuse a layer
+    /// that has one through the destructure in `metal_attn_view`.
+    pub o_scale: Option<f32>,
+    /// `blk.N.attn_output.bias`, added right after `wo` (and after
+    /// `o_scale`, the order `build_attn` has). Loaded for the
+    /// architectures whose graph creates the tensor
+    /// (`crate::proj_bias::ATTN_OUT_BIAS_CREATORS`), which includes
+    /// gpt-oss, whose bias used to live on its side table; `None`
+    /// everywhere else, where a present tensor is refused as unread.
+    /// The fused Metal launches refuse a layer that has one through
+    /// the destructure in `metal_attn_view`.
+    pub o_bias: Option<Vec<f32>>,
 }
 
 /// How a layer's routed experts are held. `Resident` is the original
@@ -149,7 +202,10 @@ pub struct MoeWeights {
     /// (DeepSeek-V3's shared experts, for one real confirmed contrast,
     /// add unconditionally with no gate at all).
     pub shared_expert_gate: Option<Vec<f32>>,
-    pub norm_weight: Vec<f32>,
+    /// The PRE-FFN norm, or [`NormOp::None`] for the post-norm-only
+    /// topology (`olmo2` / `exaone4`), which runs the FFN on the raw
+    /// post-attention residual. See [`crate::norm`].
+    pub norm_weight: NormOp,
     /// DeepSeek-V3's aux-loss-free expert-selection bias, on disk as
     /// `blk.{N}.exp_probs_b.bias` (llama.cpp's `LLM_TENSOR_FFN_EXP_PROBS_B`
     /// -- note the on-disk name has no `ffn_` prefix, `llama-arch.cpp:416`).
@@ -164,6 +220,48 @@ pub struct MoeWeights {
     /// *is* present, the GPU MoE fast paths refuse the layer rather than
     /// route without it -- their kernels have no bias input.
     pub exp_probs_bias: Option<Vec<f32>>,
+    /// BitNet's `blk.N.ffn_sub_norm.weight`, `[ffn_dim]`: an RMSNorm on
+    /// `silu(gate) * up` BEFORE `down` (`bitnet.cpp:135-140`), inside
+    /// the dense FFN. `Some` only for a model whose
+    /// `ModelConfig::block_sub_norms` says so (`crate::sub_norms`), and
+    /// only on a dense layer: no MoE graph has this site. Read by
+    /// `Decoder::run_dense_expert` and `Decoder::dense_ffn_batch`, the
+    /// two dense FFN bodies; the fused kernels never see it because
+    /// `metal_can_serve_model` refuses the model.
+    pub ffn_sub_norm: Option<Vec<f32>>,
+    /// `blk.N.ffn_down.scale`, the `{1}` companion multiplied onto the
+    /// dense FFN's output right after `down` (`crate::weight_scales`);
+    /// refused on a routed layer, whose experts carry their own.
+    pub down_scale: Option<f32>,
+    /// The dense FFN's `blk.N.ffn_{up,gate,down}.bias`
+    /// (`crate::proj_bias`), on a dense layer whose architecture's
+    /// graph creates them and whose file carries at least one; `None`
+    /// otherwise. Applied by `run_dense_expert` and `dense_ffn_batch`,
+    /// whose fused Metal launch has no bias site and is fenced on it.
+    pub dense_bias: Option<ferrox_moe::DenseBias>,
+    /// Arctic's `blk.N.ffn_norm_exps.weight`, `[hidden_dim]`: the SECOND
+    /// per-layer norm, applied to the layer INPUT to make the routed
+    /// branch's operand (`arctic.cpp:45,136-139`;
+    /// `RouterInput::NormedLayerInput`). REQUIRED on a routed layer of
+    /// such a model, `None` everywhere else. Read by
+    /// `Decoder::router_operand`, the one constructor of the operand.
+    pub exps_norm: Option<Vec<f32>>,
+    /// The factor on `ffn_out + moe_out` for a layer whose dense FFN is
+    /// summed with its experts (`crate::parallel_dense_ffn`): `Some`
+    /// only when the loader filled `shared_experts` from the dense
+    /// names AND the row scales the sum (`grok.cpp:180`, `sqrt(2)/2`).
+    /// Applied by the FFN bodies to the whole branch output before the
+    /// post-FFN norm.
+    pub parallel_sum_scale: Option<f32>,
+    /// `Some` when this layer is a PARALLEL residual, `x + attn(norm(x))
+    /// + ffn(norm(x))`, and under which norm the FFN reads the layer
+    /// input (`crate::parallel_residual`): the vector attention read
+    /// (`SharedNorm`, and then `norm_weight` is `NormOp::None` because
+    /// there is no tensor) or its own `ffn_norm` of the layer input
+    /// (`TwoNorms`). `None` is the sequential layer, `ffn_norm(h)` over
+    /// the post-attention residual. Read by ONE constructor,
+    /// `Decoder::branch_inputs`, before attention runs.
+    pub parallel: Option<crate::parallel_residual::ParallelNorm>,
     /// How many times each routed expert (index into `experts`) has been
     /// selected by `route_top_k` across every `forward_token`/
     /// `forward_batch` call so far. Real observed hotness, not a
@@ -337,6 +435,11 @@ impl MoeWeights {
 pub struct LayerWeights {
     pub attn: AttnWeights,
     pub moe: MoeWeights,
+    /// Talkie's `blk.N.layer_output_scale.weight`, the scalar its
+    /// embedding skip stream is multiplied by before joining this
+    /// layer's output (`talkie.cpp:123-126`, `crate::skip_stream`).
+    /// `Some` only on a `ModelConfig::skip_stream` model.
+    pub out_scale: Option<f32>,
 }
 
 /// The per-layer weights the gpt-oss graph carries and the generic GQA
@@ -350,16 +453,21 @@ pub struct LayerWeights {
 /// checkpoint either has the whole gpt-oss graph or none of it, so
 /// `Decoder::gpt_oss.is_some()` is a single, checkable predicate for
 /// "this model needs the gpt-oss path", which is what the CPU-only and
-/// paged-attention refusals below key off. Scattering five independent
+/// paged-attention refusals below key off. Scattering four independent
 /// `Option`s would make "half the graph is wired" representable, and
 /// that state is precisely the silent-wrong-answer bug this work exists
 /// to remove.
+///
+/// The attention sinks used to be the fifth field here and are
+/// [`AttnWeights::sinks`] now, because they are NOT gpt-oss-only:
+/// `mimo2.cpp:58,177` passes the same tensor into the same
+/// `build_attn_mha`. What keeps the whole-graph rule intact is that
+/// the loader refuses a gpt-oss file whose sinks are absent.
 pub struct GptOssLayer {
-    /// `blk.N.attn_sinks.weight`, one learned logit per query head.
-    pub attn_sinks: Vec<f32>,
-    /// `blk.N.attn_output.bias`, added after the output projection.
-    pub o_bias: Vec<f32>,
     /// `blk.N.ffn_gate_inp.bias`, added to the router logits.
+    /// (`attn_output.bias` used to be here too and is
+    /// [`AttnWeights::o_bias`] now: `crate::proj_bias` fills that slot
+    /// for every graph that creates the tensor, gpt-oss among them.)
     pub router_bias: Vec<f32>,
     /// `blk.N.ffn_{gate,up,down}_exps.bias`, one entry per expert.
     pub expert_bias: Vec<ferrox_moe::ExpertBias>,
@@ -380,7 +488,17 @@ pub struct Decoder {
     /// row-wise.
     pub embedding: WeightMatrix,
     pub layers: Vec<LayerWeights>,
-    pub final_norm: Vec<f32>,
+    /// The norm before the LM head.
+    ///
+    /// A [`NormOp`] rather than a `Vec<f32>` because `olmo` is the first
+    /// architecture whose final norm is not an RMSNorm: `olmo.cpp:128-130`
+    /// is `build_norm(cur, NULL, NULL, LLM_NORM, -1)`, and `olmo.cpp:15-36`
+    /// creates no `output_norm` tensor for it to weight. The fused Metal
+    /// stacks that fold `final_norm + lm_head + argmax` had
+    /// `Some(&self.final_norm)` written into them unconditionally; now
+    /// they ask [`NormOp::rms_weights`] and fall back to the host body
+    /// when there is nothing to hand over.
+    pub final_norm: NormOp,
     pub output_head: WeightMatrix, // [vocab_size, hidden_dim]
     /// Real VRAM budget for GPU-resident routed experts.
     /// `None` (both constructors below
@@ -435,6 +553,11 @@ pub struct Decoder {
     /// rather than a cached global so a test can run both arms in one
     /// process and compare tokens.
     pub kv_window: KvWindowPolicy,
+    /// LoRA adapters attached after load, by id. Each one's deltas
+    /// live INSIDE the `WeightMatrix` values above
+    /// (`WeightMatrix::Adapted`); this list is what a server lists and
+    /// rescales. See [`crate::lora_attach`].
+    pub lora_adapters: Vec<crate::lora_attach::LoraAttached>,
     /// Cache key hit → fused caps last used for that geometry (enables
     /// decode/prefill plan reuse without rebuilding residency).
     pub plan_cache: std::sync::Mutex<
@@ -604,7 +727,7 @@ impl Decoder {
                     rng.vec(hidden * n_heads * head_dim),
                     vec![hidden, n_heads * head_dim],
                 ),
-                norm_weight: vec![1.0; hidden],
+                norm_weight: NormOp::Rms(vec![1.0; hidden]),
                 q_norm: None,
                 k_norm: None,
                 q_bias: None,
@@ -612,6 +735,11 @@ impl Decoder {
                 v_bias: None,
                 post_attn_norm: None,
                 post_ffn_norm: None,
+                output_gate: None,
+                sinks: None,
+                attn_sub_norm: None,
+                o_scale: None,
+                o_bias: None,
             };
 
             // Leading dense layers (see ModelConfig::layer_is_dense's
@@ -652,20 +780,30 @@ impl Decoder {
 
             let moe = MoeWeights {
                 exp_probs_bias: None,
+                ffn_sub_norm: None,
+                down_scale: None,
+                exps_norm: None,
+                parallel_sum_scale: None,
+                parallel: None,
+                dense_bias: None,
                 router: wm(rng.vec(n_experts * hidden), vec![n_experts, hidden]),
                 experts: ExpertBacking::Resident(experts),
                 shared_experts,
                 shared_expert_gate: None,
-                norm_weight: vec![1.0; hidden],
+                norm_weight: NormOp::Rms(vec![1.0; hidden]),
                 activation_counts,
                 #[cfg(feature = "metal")]
                 packed_q4: None,
             };
 
-            layers.push(LayerWeights { attn, moe });
+            layers.push(LayerWeights {
+                attn,
+                moe,
+                out_scale: None,
+            });
         }
 
-        let final_norm = vec![1.0; hidden];
+        let final_norm = NormOp::Rms(vec![1.0; hidden]);
         let output_head = wm(rng.vec(vocab_size * hidden), vec![vocab_size, hidden]);
         let execution_plan = crate::execution_plan::ExecutionPlan::from_config(
             &config,
@@ -691,6 +829,7 @@ impl Decoder {
             execution_plan,
             kv_window: KvWindowPolicy::from_env(),
             plan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            lora_adapters: Vec::new(),
         }
     }
 
@@ -752,8 +891,102 @@ impl Decoder {
                     rows_per_tg,
                 })
             }
-            _ => None,
+            // No fused kernel adds a LoRA delta, and the safetensors
+            // MXFP4 pair has no Metal matvec. Spelled out rather than
+            // `_` so a fifth storage has to answer here.
+            WeightMatrix::Mxfp4 { .. } | WeightMatrix::Adapted { .. } => None,
         }
+    }
+
+    /// The per-model facts no fused Metal kernel implements, as ONE
+    /// predicate the four Metal eligibility checks share.
+    ///
+    /// Five today. `residual_scale`: every fused launch that folds a
+    /// residual add in -- the dense decode stack, the resident MoE
+    /// decode stack, and both prefill stacks -- adds the branch output
+    /// to the stream on device, with no uniform for a multiplier, so a
+    /// Granite layer served by any of them would be scaled by the host
+    /// bodies and not by the GPU. `clamp_kqv`: the fused launches apply
+    /// the QKV bias inside their kernels (`AttnExtras`) and clamp
+    /// nothing, so a DBRX or clamped-OLMo layer served by any of them
+    /// would run unclamped projections while the host bodies clamp
+    /// (`decoder/qkv_bias.rs`). An FFN activation the kernels cannot
+    /// spell: every fused dense launch takes a `gelu: bool`, so the
+    /// ungated ReLU-squared FFN (`GluAct::Reglu`, arcee) has no value to
+    /// pass and every site that asks `fused_kernel_gelu_flag` gets
+    /// `None` -- this predicate keeps the whole model off the stacks so
+    /// that a layer is never half-served. And per-layer shapes: the
+    /// stacks size Q/K/V and the Metal KV plane from ONE head count
+    /// (`n_heads` is a launch argument, `MetalKvBuffers` one geometry),
+    /// so a model whose layers disagree (`crate::layer_shapes`, deci /
+    /// openelm) stays on the host bodies, which read each layer's own.
+    /// And the per-position attention temperature
+    /// (`crate::attn_temperature`): no fused launch takes a per-token Q
+    /// scale, so a Ministral-3 layer served by any of them would attend
+    /// at temperature 1 while the host bodies step it with position.
+    /// Either way it is the same weights answering differently
+    /// depending on which backend took the token, the exact failure
+    /// `attention_scale` is fenced off for next door.
+    ///
+    /// It is one function rather than four spellings because the GPU
+    /// router's eligibility check has already drifted four ways in this
+    /// file -- prefill tested three conditions, fused decode two, and
+    /// the whole-stack decode NONE.
+    ///
+    /// `lora_attached` is the fifth fact, and the first that is not a
+    /// property of the file: a LoRA delta lives inside a
+    /// `WeightMatrix::Adapted` and is served by that type's methods,
+    /// while every fused stack takes its weights as raw bytes through
+    /// `metal_matvec_launch` / `mul_mm_sg_launch` (both answer `None`
+    /// for an adapted matrix). Fencing the whole model here, too, is
+    /// what keeps a model with an adapter on one layer from being served
+    /// half by a stack and half by the host.
+    #[cfg(feature = "metal")]
+    fn metal_can_serve_model(config: &ModelConfig, lora_attached: bool) -> bool {
+        !lora_attached
+            && config.residual_scale.is_none()
+            && config.clamp_kqv.is_none()
+            && config.attn_temperature.is_none()
+            // BitNet's two inner norms (`crate::sub_norms`): no fused
+            // kernel norms between attention and `wo`, or between the
+            // activation and `down`.
+            && !config.block_sub_norms
+            // Every fused launch bakes the pre-FFN norm over the
+            // POST-ATTENTION residual into its kernel; a parallel layer
+            // norms the layer INPUT (`crate::parallel_residual`).
+            && !config.parallel_residual
+            // Every fused launch takes ONE head width for K and V (the
+            // KV buffers, the attention tile, the `wo` fold); MiMo-V2's
+            // split widths stay on the host (`crate::kv_head_dims`).
+            && !config.kv_head_dims_split()
+            // No fused kernel scales the branch after its `wo` fold
+            // (`crate::attn_value_scale`).
+            && config.attn_value_scale.is_none()
+            // Every fused launch indexes `layers[l]` and `metal_kvs[l]`
+            // with ONE `l`; a looped model's logical layers outnumber
+            // its weights (`crate::layer_loops`).
+            && config.layer_loops.is_none()
+            // Talkie: an embedding norm no gather kernel applies, a
+            // second residual no stack carries, a per-head SCALAR Q gain
+            // and a weightless K norm no `AttnExtras` spells
+            // (`crate::skip_stream`, `QkNormStyle::PerHeadScalar`).
+            && !config.skip_stream
+            && config.qk_norm_style != crate::capability::QkNormStyle::PerHeadScalar
+            // `model_ffn_act` is `None` for an activation that varies
+            // by layer (xIELU's parameters), which no fused kernel
+            // takes; `fused_kernel_gelu_flag` is `None` for one no
+            // kernel spells.
+            && config
+                .model_ffn_act()
+                .and_then(GluAct::fused_kernel_gelu_flag)
+                .is_some()
+            && config.layer_shapes.is_uniform()
+            // Each fused launch takes ONE rotary width (`MetalRope::
+            // rot_dim`); a model whose sliding layers rotate a
+            // different width from its full ones (`rope_dim_swa`,
+            // Step-3.5 and Laguna-XS.2) stays on the host bodies, which
+            // read each layer's own through `layer_rope`.
+            && !config.rope_dim_varies_by_layer()
     }
 
     /// True when this layer can use the fused Metal attention block
@@ -762,11 +995,22 @@ impl Decoder {
     #[cfg(feature = "metal")]
     fn layer_supports_metal_attn(&self, layer: &LayerWeights) -> bool {
         use crate::config::RopeLayout;
-        // gpt-oss: no Metal kernel implements attention sinks, so the
-        // fused stacks would compute a *different* attention than the
-        // CPU path for the same weights. Keep this family on CPU rather
-        // than letting the two backends disagree. See `Decoder::gpt_oss`.
+        if !Self::metal_can_serve_model(&self.config, self.lora_attached()) {
+            return false;
+        }
+        // gpt-oss: no Metal kernel adds the `o_bias` or runs the biased
+        // router, so the fused stacks would compute a *different* graph
+        // than the CPU path for the same weights. Keep this family on
+        // CPU rather than letting the two backends disagree. See
+        // `Decoder::gpt_oss`. Its attention sinks are refused one line
+        // down, by the tensor rather than by the name.
         if self.gpt_oss.is_some() {
+            return false;
+        }
+        // The output gate and the attention sinks: `metal_attn_view` is
+        // the one place that knows which `AttnWeights` fields the
+        // launches serve, and it answers `None` for a layer they cannot.
+        if self.metal_attn_view(layer).is_none() {
             return false;
         }
         if !matches!(self.config.rope_layout, RopeLayout::Norm | RopeLayout::Neox) {
@@ -848,8 +1092,14 @@ impl Decoder {
         layer.attn.post_attn_norm.is_some()
             || layer.attn.post_ffn_norm.is_some()
             || self.config.layer_sliding_window(layer_idx).is_some()
-            || !GluAct::from(self.config.ffn_activation).is_swiglu()
-            || self.config.layer_rope_theta(layer_idx) != self.config.rope_theta
+            || !self.config.layer_ffn_acts(layer_idx).all_swiglu()
+            // `Some(base)` when this layer rotates at the model's own
+            // base, so this ONE comparison covers both stack-only RoPE
+            // facts: a per-layer base (Gemma-3's sliding layers) and a
+            // layer that does not rotate at all (`crate::rope_layers`,
+            // EXAONE-4 32B's full-attention layers). A second predicate
+            // beside it is exactly the drift this file keeps paying for.
+            || self.config.layer_rope_theta(layer_idx) != Some(self.config.rope_theta)
     }
 
     /// BOTH halves of layer `il`'s RoPE, in the shape the Metal
@@ -864,25 +1114,103 @@ impl Decoder {
     /// Gemma-3 4B/12B/27B off the fused path entirely rather than rope
     /// five layers in six at the wrong scale.
     #[cfg(feature = "metal")]
-    fn metal_layer_rope(&self, layer_idx: usize) -> ferrox_metal::attn::LayerRope<'_> {
-        let (theta, freq_factors) = self.config.layer_rope(layer_idx);
-        ferrox_metal::attn::LayerRope {
+    fn metal_layer_rope(&self, layer_idx: usize) -> Option<ferrox_metal::attn::LayerRope<'_>> {
+        // Exhaustive on purpose: the third field is the rotary width,
+        // which the Metal kernels take as ONE uniform for every layer
+        // (`MetalRope::rot_dim`, from `metal_rope`). A layer whose width
+        // differs from the model's must never reach a launch, and
+        // `metal_can_serve_model` refuses such a model up front; this
+        // is the check that the fence held, not a second fence.
+        let crate::config::LayerRopeParams {
             theta,
             freq_factors,
-        }
+            rot_dim,
+        } = self.config.layer_rope(layer_idx)?;
+        assert_eq!(
+            rot_dim,
+            self.config.rope_dim.filter(|w| *w < self.config.head_dim),
+            "layer {layer_idx} rotates a different width from the model's; \
+             `metal_can_serve_model` must have refused this model"
+        );
+        Some(ferrox_metal::attn::LayerRope {
+            theta,
+            freq_factors,
+        })
     }
 
-    /// Optional QKV bias / QK-norm ops for the Metal attn paths.
+    /// What the fused Metal attention launches can take from one
+    /// layer's attention weights, or `None` when the layer carries
+    /// something none of them applies.
+    ///
+    /// An EXHAUSTIVE destructure with no `..`, on purpose: every field
+    /// of [`AttnWeights`] is named here and either handed to
+    /// [`ferrox_metal::attn::AttnExtras`], consumed by the launch some
+    /// other way (the four projections, the pre-norm, the post-norms
+    /// that `layer_needs_metal_stack` routes to the stack), or the
+    /// reason for the `None`. A field added to `AttnWeights` therefore
+    /// fails to compile until this function says which of the three it
+    /// is. The output gate and the attention sinks are the two the
+    /// launches cannot serve: both sit between the softmax and `wo`,
+    /// which the kernels fuse with no host round-trip, so a launch that
+    /// ignored them would answer differently from the host bodies for
+    /// the same weights -- the fifth and sixth things found written into
+    /// the stacks unconditionally, after the final norm, the rotation,
+    /// the residual scale and the activation.
+    #[cfg(feature = "metal")]
+    fn metal_attn_view<'a>(
+        &self,
+        layer: &'a LayerWeights,
+    ) -> Option<ferrox_metal::attn::AttnExtras<'a>> {
+        let AttnWeights {
+            q_proj: _,
+            k_proj: _,
+            v_proj: _,
+            o_proj: _,
+            norm_weight: _,
+            q_norm,
+            k_norm,
+            q_bias,
+            k_bias,
+            v_bias,
+            post_attn_norm: _,
+            post_ffn_norm: _,
+            output_gate,
+            sinks,
+            attn_sub_norm,
+            o_scale,
+            o_bias,
+        } = &layer.attn;
+        // No Metal attention kernel gates, sinks, norms between the V
+        // sum and `wo`, scales after it, or adds a bias to it; a layer
+        // with any of the five runs on the host.
+        if output_gate.is_some()
+            || sinks.is_some()
+            || attn_sub_norm.is_some()
+            || o_scale.is_some()
+            || o_bias.is_some()
+        {
+            return None;
+        }
+        Some(ferrox_metal::attn::AttnExtras {
+            q_bias: q_bias.as_deref(),
+            k_bias: k_bias.as_deref(),
+            v_bias: v_bias.as_deref(),
+            q_norm: q_norm.as_deref(),
+            k_norm: k_norm.as_deref(),
+            attn_logit_softcap: self.config.attn_logit_softcap,
+        })
+    }
+
+    /// Optional QKV bias / QK-norm ops for the Metal attn paths, for a
+    /// layer [`Self::layer_supports_metal_attn`] has admitted. The
+    /// `expect` can only fire when a launch site runs without asking
+    /// that predicate, which is the drift this file's eligibility
+    /// checks exist to stop, and a panic there beats a silent answer
+    /// without the gate or the sinks.
     #[cfg(feature = "metal")]
     fn metal_attn_extras<'a>(&self, layer: &'a LayerWeights) -> ferrox_metal::attn::AttnExtras<'a> {
-        ferrox_metal::attn::AttnExtras {
-            q_bias: layer.attn.q_bias.as_deref(),
-            k_bias: layer.attn.k_bias.as_deref(),
-            v_bias: layer.attn.v_bias.as_deref(),
-            q_norm: layer.attn.q_norm.as_deref(),
-            k_norm: layer.attn.k_norm.as_deref(),
-            attn_logit_softcap: self.config.attn_logit_softcap,
-        }
+        self.metal_attn_view(layer)
+            .expect("layer_supports_metal_attn admits this layer, so its weights have a Metal view")
     }
 
     /// GPU expert residency only when Metal attention stays on-device
@@ -931,6 +1259,10 @@ impl Decoder {
     #[cfg(feature = "metal")]
     fn layer_supports_metal_dense_ffn(layer: &LayerWeights) -> bool {
         Self::is_dense_layer(layer)
+            // No fused FFN kernel scales after `down` (`crate::weight_scales`)
+            // or adds a bias anywhere (`crate::proj_bias`).
+            && layer.moe.down_scale.is_none()
+            && layer.moe.dense_bias.is_none()
             && layer.moe.with_expert(0, |ex| {
                 Self::metal_matvec_launch(&ex.gate).is_some()
                     && Self::metal_matvec_launch(&ex.up).is_some()
@@ -942,8 +1274,15 @@ impl Decoder {
     /// QKV bias / QK-norm are applied on-GPU via [`AttnExtras`] (same as
     /// decode); SWA fit is checked separately.
     #[cfg(feature = "metal")]
-    fn metal_prefill_dense_layer_eligible(layer: &LayerWeights) -> bool {
+    fn metal_prefill_dense_layer_eligible(
+        layer: &LayerWeights,
+        config: &ModelConfig,
+        lora_attached: bool,
+    ) -> bool {
         Self::is_dense_layer(layer)
+            && layer.moe.down_scale.is_none()
+            && layer.moe.dense_bias.is_none()
+            && Self::metal_can_serve_model(config, lora_attached)
     }
 
     #[cfg(feature = "metal")]
@@ -969,10 +1308,12 @@ impl Decoder {
     fn metal_prefill_moe<'a>(
         layer: &'a LayerWeights,
         config: &ModelConfig,
+        lora_attached: bool,
     ) -> Option<ferrox_metal::gpu::PrefillMoeMetal<'a>> {
-        if Self::is_dense_layer(layer)
+        if !Self::metal_can_serve_model(config, lora_attached)
+            || Self::is_dense_layer(layer)
             || !layer.moe.shared_experts.is_empty()
-            || !GluAct::from(config.ffn_activation).is_swiglu()
+            || !config.model_ffn_act().is_some_and(GluAct::is_swiglu)
             // See `gpu_router_matches_host_routing`: the GPU router
             // takes router weights and nothing else.
             || !Self::gpu_router_matches_host_routing(layer, config)
@@ -998,8 +1339,9 @@ impl Decoder {
     fn metal_prefill_ffn<'a>(
         layer: &'a LayerWeights,
         config: &ModelConfig,
+        lora_attached: bool,
     ) -> Option<ferrox_metal::attn::PrefillFfnMetal<'a>> {
-        if let Some(moe) = Self::metal_prefill_moe(layer, config) {
+        if let Some(moe) = Self::metal_prefill_moe(layer, config, lora_attached) {
             return Some(ferrox_metal::attn::PrefillFfnMetal::Moe(moe));
         }
         if !Self::is_dense_layer(layer) {
@@ -1048,7 +1390,7 @@ impl Decoder {
                 && layer.attn.k_proj.mul_mm_sg_launch().is_some()
                 && layer.attn.v_proj.mul_mm_sg_launch().is_some()
                 && layer.attn.o_proj.mul_mm_sg_launch().is_some()
-                && Self::metal_prefill_ffn(layer, &self.config).is_some();
+                && Self::metal_prefill_ffn(layer, &self.config, self.lora_attached()).is_some();
             if !ok {
                 break;
             }
@@ -1074,11 +1416,16 @@ impl Decoder {
         kv_caches: &mut [KvCache],
         host_kv_authoritative: bool,
     ) -> Option<Vec<f32>> {
-        let gelu = !GluAct::from(self.config.ffn_activation).is_swiglu();
+        // `None` for an activation no fused kernel implements: the
+        // stack does not launch, rather than running it as GELU.
+        let gelu = self
+            .config
+            .model_ffn_act()
+            .and_then(GluAct::fused_kernel_gelu_flag)?;
         let mut prefill_layers = Vec::with_capacity(run_len);
         for li in start..start + run_len {
             let layer = &self.layers[li];
-            let ffn = Self::metal_prefill_ffn(layer, &self.config)?;
+            let ffn = Self::metal_prefill_ffn(layer, &self.config, self.lora_attached())?;
             if matches!(ffn, ferrox_metal::attn::PrefillFfnMetal::Dense { .. }) {
                 layer.moe.record_activations(&[0]);
             }
@@ -1089,8 +1436,12 @@ impl Decoder {
                 layer.attn.o_proj.mul_mm_sg_launch()?,
             );
             prefill_layers.push(ferrox_metal::attn::PrefillDenseLayerMetal {
-                attn_norm_w: &layer.attn.norm_weight,
-                ffn_norm_w: &layer.moe.norm_weight,
+                // `?`, not a `&`: the kernel applies the RMSNorm itself
+                // and the post-norm-only topology has no weight to give
+                // it, so the stack declines and the host body runs. See
+                // `crate::norm`.
+                attn_norm_w: layer.attn.norm_weight.rms_weights()?,
+                ffn_norm_w: layer.moe.norm_weight.rms_weights()?,
                 q,
                 k,
                 v,
@@ -1153,6 +1504,10 @@ impl Decoder {
     #[cfg_attr(not(feature = "metal"), allow(dead_code))]
     fn gpu_router_matches_host_routing(layer: &LayerWeights, config: &ModelConfig) -> bool {
         matches!(config.moe.gating, ferrox_moe::GatingFunction::Softmax)
+            // Every GPU router reads `normed2`; a model whose router
+            // reads the raw layer input (`crate::router_input`) would
+            // route on the wrong tensor at full speed.
+            && config.router_input == crate::router_input::RouterInput::NormedFfnInput
             // Conservative on purpose: `route_for_layer` only takes its
             // grouped arm for `n_groups > 1`, but a checkpoint that
             // declares the key at all is one this kernel was never
@@ -1167,11 +1522,16 @@ impl Decoder {
     /// experts, Resident expert backing, Metal router/QKV/O, and a
     /// routing decision the GPU router reproduces exactly.
     #[cfg(feature = "metal")]
-    fn layer_supports_metal_moe_resident(layer: &LayerWeights, config: &ModelConfig) -> bool {
-        !Self::is_dense_layer(layer)
+    fn layer_supports_metal_moe_resident(
+        layer: &LayerWeights,
+        config: &ModelConfig,
+        lora_attached: bool,
+    ) -> bool {
+        Self::metal_can_serve_model(config, lora_attached)
+            && !Self::is_dense_layer(layer)
             && layer.moe.shared_experts.is_empty()
             && Self::gpu_router_matches_host_routing(layer, config)
-            && GluAct::from(config.ffn_activation).is_swiglu()
+            && config.model_ffn_act().is_some_and(GluAct::is_swiglu)
             // Streamed experts are eligible too. They were excluded
             // while the fused launch could not hold all of top-k at
             // once; it can now, by materialising each expert into an
@@ -1322,6 +1682,7 @@ impl Decoder {
     /// Returns FFN outs `[T, H]` or `None`.
     #[cfg(feature = "metal")]
     fn try_metal_moe_prefill_batch(
+        layer_idx: usize,
         layer: &LayerWeights,
         normed2_batch: &[f32],
         router_logits_batch: &[f32],
@@ -1329,9 +1690,10 @@ impl Decoder {
         hidden_dim: usize,
         config: &ModelConfig,
     ) -> Option<Vec<f32>> {
+        let acts = config.layer_ffn_acts(layer_idx);
         if batch_size == 0
             || !ferrox_core::metal_dense_enabled()
-            || !GluAct::from(config.ffn_activation).is_swiglu()
+            || !acts.routed.is_swiglu()
             // The GPU router kernels take router weights and nothing
             // else: no `exp_probs_b` input, no `expert_weights_scale`
             // uniform, no groups. See `gpu_router_matches_host_routing`.
@@ -1389,10 +1751,9 @@ impl Decoder {
             batch_size,
             hidden_dim,
             &mut out,
-            // Guaranteed `Swiglu` by the fence at the top of this
-            // function; read from the config anyway so the two cannot
-            // drift apart.
-            GluAct::from(config.ffn_activation),
+            // The shared experts are `build_ffn`'s site, not the routed
+            // experts' the fence above checked; on the host either way.
+            acts.dense,
         );
         Some(out)
     }
@@ -1416,18 +1777,21 @@ impl Decoder {
                     shex.gate.mul_mm_sg_launch(),
                     shex.up.mul_mm_sg_launch(),
                     shex.down.mul_mm_sg_launch(),
+                    // The launch's last argument selects GELU over
+                    // SiLU inside the kernel; hardcoding `false` here
+                    // ran a shared expert as SwiGLU on a GeGLU model,
+                    // and `!is_swiglu()` would run a third activation
+                    // as GELU. `None` keeps the host path.
+                    act.fused_kernel_gelu_flag(),
                 ) {
-                    (Some(g), Some(u), Some(d)) => {
-                        // The launch's last argument selects GELU over
-                        // SiLU inside the kernel; hardcoding `false` here
-                        // ran a shared expert as SwiGLU on a GeGLU model.
+                    (Some(g), Some(u), Some(d), Some(gelu)) => {
                         ferrox_metal::gpu::launch_dense_ffn_swiglu_batch(
                             &g,
                             &u,
                             &d,
                             normed2_batch,
                             batch_size,
-                            !act.is_swiglu(),
+                            gelu,
                         )
                         .ok()
                     }
@@ -1600,10 +1964,23 @@ impl Decoder {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// True once a fused Metal attention launch has allocated this
+    /// decoder's per-layer Metal KV, i.e. once a token has actually been
+    /// served by a fused launch rather than by the host bodies.
+    ///
+    /// For tests that switch Metal ON and need to know whether the
+    /// switch reached a kernel: a model the eligibility predicates keep
+    /// on the host answers `false` forever, and a test asserting logits
+    /// alone could not tell that from a launch that happened to agree.
+    #[cfg(feature = "metal")]
+    pub fn metal_attn_kv_allocated(&self) -> bool {
+        Self::lock_metal_attn_kv(&self.metal_attn_kv).is_some()
+    }
+
     /// store, continuous-batch / CPU readers). Safe no-op without Metal KV.
     #[cfg(feature = "metal")]
     pub fn sync_metal_attn_kv_to_host(&self, kv_caches: &mut [KvCache]) {
-        assert_eq!(kv_caches.len(), self.layers.len());
+        assert_eq!(kv_caches.len(), self.config.n_layers);
         let guard = Self::lock_metal_attn_kv(&self.metal_attn_kv);
         let Some(metal_kvs) = guard.as_ref() else {
             return;
@@ -1636,7 +2013,7 @@ impl Decoder {
     ) -> Vec<f32> {
         #[cfg(feature = "cuda")]
         {
-            if cuda_gqa_enabled() {
+            if cuda_gqa_enabled() && self.config.layer_shapes.is_uniform() {
                 match ferrox_cuda::attn::launch_gqa_decode_resident(
                     layer, q, k, v, n_heads, n_kv_heads, head_dim, seq_len,
                 ) {
@@ -1670,10 +2047,9 @@ impl Decoder {
         )
     }
 
-    /// Runs one decode step for `token_id` at position `pos`, updating
-    /// `kv_caches` (one per layer) in place, and returns the logits over
-    /// the (test-scale) vocabulary.
-    pub fn forward_token(
+    /// The body of [`Self::forward_token`], already running on a
+    /// CPU-pool worker. See `entry.rs` for why the split exists.
+    fn forward_token_on_worker(
         &self,
         token_id: usize,
         pos: usize,
@@ -1684,11 +2060,12 @@ impl Decoder {
         #[cfg(feature = "metal")]
         ferrox_metal::gpu::clear_resident_activation();
 
-        assert_eq!(kv_caches.len(), self.layers.len());
-        let hidden_dim = self.config.hidden_dim;
+        assert_eq!(kv_caches.len(), self.config.n_layers);
         // Read only by the Metal arms below: the host layer body moved
-        // into `attn_block`, which reads the geometry off `self.config`
-        // itself.
+        // into `attn_block` / `ffn_block_row`, which read the geometry
+        // off `self.config` themselves.
+        #[cfg(feature = "metal")]
+        let hidden_dim = self.config.hidden_dim;
         #[cfg(feature = "metal")]
         let head_dim = self.config.head_dim;
         #[cfg(feature = "metal")]
@@ -1726,9 +2103,12 @@ impl Decoder {
         #[cfg(not(feature = "metal"))]
         let mut hidden = self.embed_token(token_id);
         #[cfg(feature = "cuda")]
-        if cuda_gqa_enabled() {
+        if cuda_gqa_enabled() && self.config.layer_shapes.is_uniform() {
             // Fixed capacity so ensure_layer_kv does not recreate (and
-            // wipe) mid-sequence as pos grows.
+            // wipe) mid-sequence as pos grows. ONE geometry for every
+            // layer, which is why a per-layer-shape model never seeds it
+            // (`gqa_attention` skips the resident hook on the same
+            // predicate).
             const CUDA_KV_CAP: usize = 4096;
             if let Err(e) = ferrox_cuda::attn::ensure_layer_kv(
                 self.layers.len(),
@@ -1858,7 +2238,7 @@ impl Decoder {
                 // Latent today because OLMoE and Qwen3-MoE ship none
                 // of the four, which is exactly how `attention_scale`
                 // stayed latent.
-                Self::layer_supports_metal_moe_resident(l, &self.config)
+                Self::layer_supports_metal_moe_resident(l, &self.config, self.lora_attached())
                     && !self.layer_needs_metal_stack(l, i)
             })
             && !self.layers.iter().all(Self::layer_supports_metal_dense_ffn)
@@ -1877,19 +2257,23 @@ impl Decoder {
                                 ok = false;
                                 break;
                             };
-                            let (Some(q), Some(k), Some(v), Some(o), Some(r)) = (
+                            let (Some(q), Some(k), Some(v), Some(o), Some(r), Some(an), Some(fnw)) = (
                                 Self::metal_matvec_launch(&layer.attn.q_proj),
                                 Self::metal_matvec_launch(&layer.attn.k_proj),
                                 Self::metal_matvec_launch(&layer.attn.v_proj),
                                 Self::metal_matvec_launch(&layer.attn.o_proj),
                                 Self::metal_matvec_launch(&layer.moe.router),
+                                // The kernel bakes both RMSNorms in; the
+                                // post-norm-only topology has neither.
+                                layer.attn.norm_weight.rms_weights(),
+                                layer.moe.norm_weight.rms_weights(),
                             ) else {
                                 ok = false;
                                 break;
                             };
                             moe_layers.push(ferrox_metal::attn::MoeLayerMetal {
-                                attn_norm_w: &layer.attn.norm_weight,
-                                ffn_norm_w: &layer.moe.norm_weight,
+                                attn_norm_w: an,
+                                ffn_norm_w: fnw,
                                 q,
                                 k,
                                 v,
@@ -1909,7 +2293,19 @@ impl Decoder {
                             // stack" and "the stack returns an argmax id",
                             // so the second cannot drift off the first.
                             // See `decoder::lm_head`.
-                            let folded = FoldedLmHead::permit(greedy_gpu, lm_head_gpu_launch);
+                            let folded = FoldedLmHead::permit(
+                                greedy_gpu,
+                                &self.final_norm,
+                                lm_head_gpu_launch,
+                            );
+                            // The MoE stack used to be handed
+                            // `Some(&self.final_norm)` unconditionally,
+                            // which is unrepresentable now: a model whose
+                            // final norm has no RMS weights leaves the
+                            // norm to the host body below, and
+                            // `final_norm_done_in_stack` is read off the
+                            // SAME value rather than hardcoded `true`.
+                            let final_norm_w = self.final_norm.rms_weights();
                             let embd_launch = Self::metal_matvec_launch(&self.embedding);
                             // Gemma scales embd on host; GPU gather has no scale.
                             let embd_gather = if self.config.embedding_scale.is_some() {
@@ -1945,6 +2341,13 @@ impl Decoder {
                             let hidden_ref: &[f32] =
                                 if embd_gather.is_some() { &[] } else { &hidden };
                             match seed.and_then(|_| {
+                                // A stack whose layer 0 does not rotate
+                                // cannot ride this launch; refuse rather
+                                // than rotate, and the CPU body serves
+                                // the token.
+                                let stack_rope = self
+                                    .metal_layer_rope(0)
+                                    .ok_or(ferrox_metal::gpu::MetalError::CommandFailed)?;
                                 ferrox_metal::attn::launch_moe_decode_stack(
                                     hidden_ref,
                                     &moe_layers,
@@ -1953,18 +2356,19 @@ impl Decoder {
                                     self.config.moe.norm_topk_prob,
                                     n_heads,
                                     self.metal_rope(),
-                                    self.config.rope_theta,
-                                    // The stack-wide theta above is
-                                    // sound because no layer here
-                                    // `layer_needs_metal_stack`, which
-                                    // means none slides; the divisors
-                                    // are taken through the same
-                                    // accessor so the two stay one
-                                    // answer.
-                                    self.config.layer_rope_freqs(0),
+                                    // ONE `LayerRope` for the whole
+                                    // stack, sound because no layer here
+                                    // `layer_needs_metal_stack`: none
+                                    // slides, none has a base of its
+                                    // own, and none is unrotated -- that
+                                    // predicate now covers all three
+                                    // through the same accessor, so the
+                                    // stack-wide answer and the
+                                    // per-layer one cannot disagree.
+                                    stack_rope,
                                     pos,
                                     self.config.rms_norm_eps,
-                                    Some(&self.final_norm),
+                                    final_norm_w,
                                     folded.as_ref().map(FoldedLmHead::launch),
                                     folded.as_ref().is_some_and(FoldedLmHead::argmax_only),
                                     true,
@@ -1987,10 +2391,11 @@ impl Decoder {
                                             out,
                                             self.output_head.rows(),
                                             self.config.final_logit_softcap,
+                                            self.config.logit_multiplier,
                                         );
                                     }
                                     hidden = out;
-                                    final_norm_done_in_stack = true;
+                                    final_norm_done_in_stack = final_norm_w.is_some();
                                     metal_stack_done = true;
                                 }
                                 Err(e) => {
@@ -2024,14 +2429,30 @@ impl Decoder {
                     if seq_ok {
                         // Build launches only for resident dense experts (Llama path).
                         let mut dense_layers = Vec::with_capacity(self.layers.len());
-                        let mut ok = true;
+                        // The stack's activation uniform, or no stack
+                        // at all for an activation it cannot spell.
+                        let stack_gelu = self
+                            .config
+                            .model_ffn_act()
+                            .and_then(GluAct::fused_kernel_gelu_flag);
+                        let mut ok = stack_gelu.is_some();
                         for (li, layer) in self.layers.iter().enumerate() {
                             let ExpertBacking::Resident(experts) = &layer.moe.experts else {
                                 ok = false;
                                 break;
                             };
                             let ex = &experts[0];
-                            let (Some(q), Some(k), Some(v), Some(o), Some(g), Some(u), Some(d)) = (
+                            let (
+                                Some(q),
+                                Some(k),
+                                Some(v),
+                                Some(o),
+                                Some(g),
+                                Some(u),
+                                Some(d),
+                                Some(an),
+                                Some(fnw),
+                            ) = (
                                 Self::metal_matvec_launch(&layer.attn.q_proj),
                                 Self::metal_matvec_launch(&layer.attn.k_proj),
                                 Self::metal_matvec_launch(&layer.attn.v_proj),
@@ -2039,13 +2460,18 @@ impl Decoder {
                                 Self::metal_matvec_launch(&ex.gate),
                                 Self::metal_matvec_launch(&ex.up),
                                 Self::metal_matvec_launch(&ex.down),
-                            ) else {
+                                // The kernel bakes both RMSNorms in; the
+                                // post-norm-only topology has neither.
+                                layer.attn.norm_weight.rms_weights(),
+                                layer.moe.norm_weight.rms_weights(),
+                            )
+                            else {
                                 ok = false;
                                 break;
                             };
                             dense_layers.push(ferrox_metal::attn::DenseLayerMetal {
-                                attn_norm_w: &layer.attn.norm_weight,
-                                ffn_norm_w: &layer.moe.norm_weight,
+                                attn_norm_w: an,
+                                ffn_norm_w: fnw,
                                 q,
                                 k,
                                 v,
@@ -2070,12 +2496,21 @@ impl Decoder {
                             // See `decoder::lm_head`: folding lm_head into
                             // the stack and the stack returning an argmax id
                             // are one decision, held in one value.
-                            let folded = FoldedLmHead::permit(greedy_gpu, lm_head_gpu_launch);
+                            let folded = FoldedLmHead::permit(
+                                greedy_gpu,
+                                &self.final_norm,
+                                lm_head_gpu_launch,
+                            );
                             // Pass final_norm_w when: (1) lm_head runs in stack (folded),
                             // OR (2) lm_head will route to GPU after stack (lm_head_gpu_launch
                             // but no fold) so we can skip download→reupload via TLS.
+                            //
+                            // `rms_weights()` is what makes the second
+                            // case safe for a non-RMS final norm: it is
+                            // `None` there, so the stack does not norm
+                            // and the host body does.
                             let final_norm_w = if folded.is_some() || lm_head_gpu_launch.is_some() {
-                                Some(self.final_norm.as_slice())
+                                self.final_norm.rms_weights()
                             } else {
                                 None
                             };
@@ -2114,7 +2549,7 @@ impl Decoder {
                                 folded.as_ref().map(FoldedLmHead::launch),
                                 folded.as_ref().is_some_and(FoldedLmHead::argmax_only),
                                 embd_gather.as_ref(),
-                                !GluAct::from(self.config.ffn_activation).is_swiglu(),
+                                stack_gelu.expect("`ok` is false without it"),
                             ) {
                                 Ok(out) => {
                                     // Metal KV advanced in-place. Skip host
@@ -2134,6 +2569,7 @@ impl Decoder {
                                             out,
                                             self.output_head.rows(),
                                             self.config.final_logit_softcap,
+                                            self.config.logit_multiplier,
                                         );
                                     }
                                     // Stack downloaded hidden (possibly normalized if
@@ -2188,13 +2624,23 @@ impl Decoder {
             hidden = self.embed_token(token_id);
         }
 
+        // The skip source: the (normed) embedding, before any layer
+        // touches `hidden` (`crate::skip_stream`). Captured here and
+        // not at `embed_token`, because the Metal arms above leave
+        // `hidden` empty on purpose -- and a skip-stream model never
+        // reaches them (`metal_can_serve_model`).
+        let skip_rows = self.config.skip_stream.then(|| hidden.clone());
         if run_cpu_layers {
-            for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
+            for (l, cache) in kv_caches.iter_mut().enumerate() {
+                let layer = self.layer_for(l);
                 // --- attention block ---
                 #[cfg(feature = "metal")]
                 if metal_moe_resident
-                    && (!Self::layer_supports_metal_moe_resident(layer, &self.config)
-                        || self.layer_needs_metal_stack(layer, l))
+                    && (!Self::layer_supports_metal_moe_resident(
+                        layer,
+                        &self.config,
+                        self.lora_attached(),
+                    ) || self.layer_needs_metal_stack(layer, l))
                 {
                     if let Some(h) = ferrox_metal::attn::moe_decode_take_hidden() {
                         hidden = h;
@@ -2202,15 +2648,27 @@ impl Decoder {
                     metal_moe_resident = false;
                 }
 
+                // The router's operand, captured where llama.cpp reads it:
+                // BEFORE attention (`smallthinker.cpp:111`). A resident
+                // Metal stack never serves that shape
+                // (`gpu_router_matches_host_routing`), so `hidden` is not
+                // stale for the one architecture that reads it here.
+                let inputs = self.branch_inputs(layer, &hidden, 1);
                 #[cfg(feature = "metal")]
                 let normed = if metal_moe_resident {
                     // Residual is on-device; host rms_norm would use stale hidden.
                     Vec::new()
                 } else {
-                    rms_norm(&hidden, &layer.attn.norm_weight, self.config.rms_norm_eps)
+                    layer
+                        .attn
+                        .norm_weight
+                        .apply(&hidden, self.config.rms_norm_eps)
                 };
                 #[cfg(not(feature = "metal"))]
-                let normed = rms_norm(&hidden, &layer.attn.norm_weight, self.config.rms_norm_eps);
+                let normed = layer
+                    .attn
+                    .norm_weight
+                    .apply(&hidden, self.config.rms_norm_eps);
 
                 #[cfg(feature = "metal")]
                 {
@@ -2227,11 +2685,39 @@ impl Decoder {
                             if metal_kvs[l].seq_len == pos
                                 && !self.layer_needs_metal_stack(layer, l)
                             {
-                                if let (Some(q_l), Some(k_l), Some(v_l), Some(o_l)) = (
+                                // The two pre-norm weights join the four
+                                // projection launches in ONE gate, because every
+                                // fused launch below bakes the RMSNorm into its
+                                // kernel and there is no weight to bake for the
+                                // post-norm-only topology (`olmo2` / `exaone4`).
+                                // `NormOp::rms_weights` returning `None` sends
+                                // the whole layer to the host body, which reads
+                                // the raw residual the way llama.cpp does.
+                                // `metal_layer_rope` joins the six because
+                                // these four launches all rope
+                                // unconditionally, and a layer llama.cpp
+                                // does not rotate must reach the host
+                                // body instead. It is the same `None`
+                                // `layer_needs_metal_stack` reads two
+                                // lines up, from the same accessor, so
+                                // the two cannot disagree about which
+                                // layers those are.
+                                if let (
+                                    Some(q_l),
+                                    Some(k_l),
+                                    Some(v_l),
+                                    Some(o_l),
+                                    Some(attn_norm_w),
+                                    Some(ffn_norm_w),
+                                    Some(layer_rope),
+                                ) = (
                                     Self::metal_matvec_launch(&layer.attn.q_proj),
                                     Self::metal_matvec_launch(&layer.attn.k_proj),
                                     Self::metal_matvec_launch(&layer.attn.v_proj),
                                     Self::metal_matvec_launch(&layer.attn.o_proj),
+                                    layer.attn.norm_weight.rms_weights(),
+                                    layer.moe.norm_weight.rms_weights(),
+                                    self.metal_layer_rope(l),
                                 ) {
                                     // Full dense layer on one CB when FFN is Metal-capable.
                                     if Self::layer_supports_metal_dense_ffn(layer) {
@@ -2245,20 +2731,19 @@ impl Decoder {
                                         };
                                         match ferrox_metal::attn::launch_decode_dense_layer(
                                             &hidden,
-                                            &layer.attn.norm_weight,
+                                            attn_norm_w,
                                             &q_l,
                                             &k_l,
                                             &v_l,
                                             &o_l,
                                             &mut metal_kvs[l],
-                                            &layer.moe.norm_weight,
+                                            ffn_norm_w,
                                             &g_l,
                                             &u_l,
                                             &d_l,
                                             n_heads,
                                             self.metal_rope(),
-                                            self.config.rope_theta,
-                                            self.config.layer_rope_freqs(l),
+                                            layer_rope,
                                             pos,
                                             self.config.rms_norm_eps,
                                             &self.metal_attn_extras(layer),
@@ -2298,6 +2783,7 @@ impl Decoder {
                                         && Self::layer_supports_metal_moe_resident(
                                             layer,
                                             &self.config,
+                                            self.lora_attached(),
                                         )
                                     {
                                         if let Some(router_l) =
@@ -2334,21 +2820,20 @@ impl Decoder {
                                                             Self::moe_packed_q4(&layer.moe)
                                                         {
                                                             match ferrox_metal::attn::launch_moe_decode_layer_fused(
-                                                                &layer.attn.norm_weight,
+                                                                attn_norm_w,
                                                                 &q_l,
                                                                 &k_l,
                                                                 &v_l,
                                                                 &o_l,
                                                                 &mut metal_kvs[l],
-                                                                &layer.moe.norm_weight,
+                                                                ffn_norm_w,
                                                                 &router_l,
                                                                 &packed,
                                                                 self.config.moe.n_experts_active,
                                                                 self.config.moe.norm_topk_prob,
                                                                 n_heads,
                                                                 self.metal_rope(),
-                                                                self.config.rope_theta,
-                                                                self.config.layer_rope_freqs(l),
+                                                                layer_rope,
                                                                 pos,
                                                                 self.config.rms_norm_eps,
                                                                 &self.metal_attn_extras(layer),
@@ -2375,18 +2860,17 @@ impl Decoder {
 
                                                 if !fused_ok {
                                                     match ferrox_metal::attn::launch_moe_decode_pre(
-                                                        &layer.attn.norm_weight,
+                                                        attn_norm_w,
                                                         &q_l,
                                                         &k_l,
                                                         &v_l,
                                                         &o_l,
                                                         &mut metal_kvs[l],
-                                                        &layer.moe.norm_weight,
+                                                        ffn_norm_w,
                                                         &router_l,
                                                         n_heads,
                                                         self.metal_rope(),
-                                                        self.config.rope_theta,
-                                                        self.config.layer_rope_freqs(l),
+                                                        layer_rope,
                                                         pos,
                                                         self.config.rms_norm_eps,
                                                         &self.metal_attn_extras(layer),
@@ -2416,24 +2900,28 @@ impl Decoder {
                                                             hidden = h;
                                                             metal_moe_resident = false;
                                                             // KV already advanced; finish FFN on host.
-                                                            let normed2 = rms_norm(
+                                                            let normed2 = layer
+                                                                .moe
+                                                                .norm_weight
+                                                                .apply(
                                                                 &hidden,
-                                                                &layer.moe.norm_weight,
                                                                 self.config.rms_norm_eps,
                                                             );
                                                             let ffn_out = Self::combine_ffn_outputs_for_position(
+                                                                l,
                                                                 layer,
+                                                                &normed2,
                                                                 &normed2,
                                                                 &logits,
                                                                 &self.config,
                                                                 hidden_dim,
-                                                                residency.as_ref().map(|p| p.layer_plan(l)),
+                                                                residency.as_ref().map(|p| p.layer_plan(self.physical_index(l))),
                                                             );
-                                                            for (h, f) in
-                                                                hidden.iter_mut().zip(ffn_out.iter())
-                                                            {
-                                                                *h += f;
-                                                            }
+                                                            residual_add(
+                                                                &mut hidden,
+                                                                &ffn_out,
+                                                                self.config.residual_scale,
+                                                            );
                                                             did_metal_attn = true;
                                                             did_metal_moe = true; // skip second FFN
                                                         }
@@ -2473,8 +2961,7 @@ impl Decoder {
                                             &mut metal_kvs[l],
                                             n_heads,
                                             self.metal_rope(),
-                                            self.config.rope_theta,
-                                            self.config.layer_rope_freqs(l),
+                                            layer_rope,
                                             pos,
                                             &self.metal_attn_extras(layer),
                                             self.config.rms_norm_eps,
@@ -2483,11 +2970,11 @@ impl Decoder {
                                                 // Keep Metal KV authoritative — skip per-layer
                                                 // host catch-up (dense-stack style). Host is
                                                 // flushed on CPU fallback / prefix sync.
-                                                for (h, p) in
-                                                    hidden.iter_mut().zip(projected.iter())
-                                                {
-                                                    *h += p;
-                                                }
+                                                residual_add(
+                                                    &mut hidden,
+                                                    &projected,
+                                                    self.config.residual_scale,
+                                                );
                                                 did_metal_attn = true;
                                             }
                                             Err(e) => {
@@ -2514,48 +3001,42 @@ impl Decoder {
                     }
                     if did_metal_attn {
                         if !did_metal_dense && !did_metal_moe {
-                            let normed2 =
-                                rms_norm(&hidden, &layer.moe.norm_weight, self.config.rms_norm_eps);
-                            let ffn_out = Self::run_ffn_block(
+                            self.ffn_block_row(
+                                l,
                                 layer,
-                                &normed2,
-                                &self.config,
-                                hidden_dim,
-                                residency.as_ref().map(|p| p.layer_plan(l)),
+                                &mut hidden,
+                                None,
+                                residency
+                                    .as_ref()
+                                    .map(|p| p.layer_plan(self.physical_index(l))),
+                                inputs,
+                                skip_rows.as_deref().map(|rows| SkipStream { rows }),
                             );
-                            for (h, f) in hidden.iter_mut().zip(ffn_out.iter()) {
-                                *h += f;
-                            }
                         }
                         continue;
                     }
                 }
 
-                let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
-                let projected =
-                    self.attn_block(l, layer, &normed, pos, KvStep::Decode(&mut *cache));
-                for (h, p) in hidden.iter_mut().zip(projected.iter()) {
-                    *h += p;
+                let oai = self
+                    .gpt_oss
+                    .as_ref()
+                    .map(|g| &g.layers[self.physical_index(l)]);
+                if let Some(projected) =
+                    self.attn_block(l, layer, &normed, pos, KvStep::Decode(&mut *cache))
+                {
+                    residual_add(&mut hidden, &projected, self.config.residual_scale);
                 }
-
-                // --- MoE FFN block ---
-                let normed2 = rms_norm(&hidden, &layer.moe.norm_weight, self.config.rms_norm_eps);
-                let mut ffn_out = match oai {
-                    Some(oai) => Self::gpt_oss_ffn(layer, oai, &normed2, &self.config, hidden_dim),
-                    None => Self::run_ffn_block(
-                        layer,
-                        &normed2,
-                        &self.config,
-                        hidden_dim,
-                        residency.as_ref().map(|p| p.layer_plan(l)),
-                    ),
-                };
-                if let Some(post) = &layer.attn.post_ffn_norm {
-                    ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
-                }
-                for (h, f) in hidden.iter_mut().zip(ffn_out.iter()) {
-                    *h += f;
-                }
+                self.ffn_block_row(
+                    l,
+                    layer,
+                    &mut hidden,
+                    oai,
+                    residency
+                        .as_ref()
+                        .map(|p| p.layer_plan(self.physical_index(l))),
+                    inputs,
+                    skip_rows.as_deref().map(|rows| SkipStream { rows }),
+                );
             }
         } // run_cpu_layers
 
@@ -2572,10 +3053,10 @@ impl Decoder {
         let final_normed = if final_norm_done_in_stack {
             hidden.clone()
         } else {
-            rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps)
+            self.final_norm.apply(&hidden, self.config.rms_norm_eps)
         };
         #[cfg(not(feature = "metal"))]
-        let final_normed = rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps);
+        let final_normed = self.final_norm.apply(&hidden, self.config.rms_norm_eps);
 
         let logits = self.logits_from_normed(&final_normed);
         // Clear dense-stack activation TLS after lm_head (may have consumed it).
@@ -2586,33 +3067,17 @@ impl Decoder {
         logits
     }
 
-    /// Same computation as `forward_token`, but each layer's K/V cache
-    /// is a `PagedKvCache` (block-table-indexed into a per-layer
-    /// `PagedKvStore`) instead of a `KvCache`'s contiguous buffer --
-    /// exercises the paged attention kernel in a real decode loop
-    /// instead of only in isolation. `kv_caches`/`stores` are parallel
-    /// per-layer arrays, mirroring `forward_token`'s `kv_caches: &mut
-    /// [KvCache]`. Must produce bit-identical output to `forward_token`
-    /// given stores sized so no layer ever exhausts its blocks --
-    /// pinned by
-    /// `forward_token_paged_matches_forward_token_bit_identical` and,
-    /// per attention arm, by
-    /// `every_paged_attention_arm_is_bit_identical_to_its_contiguous_twin`.
-    ///
-    /// This used to refuse gpt-oss outright, because the paged kernel
-    /// had no attention-sink term and no sliding-window arm and would
-    /// have answered differently from the contiguous path without
-    /// saying so. It now mirrors all three arms of that dispatch, so
-    /// the refusal is gone rather than merely relaxed.
-    pub fn forward_token_paged(
+    /// The body of [`Self::forward_token_paged`], already running on a
+    /// CPU-pool worker. See `entry.rs` for why the split exists.
+    fn forward_token_paged_on_worker(
         &self,
         token_id: usize,
         pos: usize,
         kv_caches: &mut [PagedKvCache],
         stores: &SharedPagedKv,
     ) -> Result<Vec<f32>, PagedStoreExhausted> {
-        assert_eq!(kv_caches.len(), self.layers.len());
-        assert_eq!(stores.layer_count(), self.layers.len());
+        assert_eq!(kv_caches.len(), self.config.n_layers);
+        assert_eq!(stores.layer_count(), self.config.n_layers);
         // All layers advance or none do. Pushing per layer with `?` and
         // failing at layer 3 of 4 leaves layers 0..2 holding a position
         // the rest do not, and nothing downstream reports it: the next
@@ -2640,14 +3105,19 @@ impl Decoder {
                     .expect("checked against free_block_count under this same guard");
             }
         }
-        let hidden_dim = self.config.hidden_dim;
 
         let mut hidden = self.embed_token(token_id);
+        let skip_rows = self.config.skip_stream.then(|| hidden.clone());
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
 
-        for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
+        for (l, cache) in kv_caches.iter_mut().enumerate() {
+            let layer = self.layer_for(l);
             // --- attention block ---
-            let normed = rms_norm(&hidden, &layer.attn.norm_weight, self.config.rms_norm_eps);
+            let inputs = self.branch_inputs(layer, &hidden, 1);
+            let normed = layer
+                .attn
+                .norm_weight
+                .apply(&hidden, self.config.rms_norm_eps);
 
             // The same body the contiguous path runs, with the paged
             // backing as its one parameter. It used to be a copy, and
@@ -2655,8 +3125,11 @@ impl Decoder {
             // `post_attn_norm`, `post_ffn_norm`, gpt-oss's `o_bias` and
             // `gpt_oss_ffn` -- five features that each produce a
             // plausible distribution rather than an error.
-            let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
-            let projected = self.attn_block(
+            let oai = self
+                .gpt_oss
+                .as_ref()
+                .map(|g| &g.layers[self.physical_index(l)]);
+            if let Some(projected) = self.attn_block(
                 l,
                 layer,
                 &normed,
@@ -2665,32 +3138,23 @@ impl Decoder {
                     cache: &mut *cache,
                     stores,
                 },
+            ) {
+                residual_add(&mut hidden, &projected, self.config.residual_scale);
+            }
+            self.ffn_block_row(
+                l,
+                layer,
+                &mut hidden,
+                oai,
+                residency
+                    .as_ref()
+                    .map(|p| p.layer_plan(self.physical_index(l))),
+                inputs,
+                skip_rows.as_deref().map(|rows| SkipStream { rows }),
             );
-            for (h, p) in hidden.iter_mut().zip(projected.iter()) {
-                *h += p;
-            }
-
-            // --- MoE FFN block ---
-            let normed2 = rms_norm(&hidden, &layer.moe.norm_weight, self.config.rms_norm_eps);
-            let mut ffn_out = match oai {
-                Some(oai) => Self::gpt_oss_ffn(layer, oai, &normed2, &self.config, hidden_dim),
-                None => Self::run_ffn_block(
-                    layer,
-                    &normed2,
-                    &self.config,
-                    hidden_dim,
-                    residency.as_ref().map(|p| p.layer_plan(l)),
-                ),
-            };
-            if let Some(post) = &layer.attn.post_ffn_norm {
-                ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
-            }
-            for (h, f) in hidden.iter_mut().zip(ffn_out.iter()) {
-                *h += f;
-            }
         }
 
-        let final_normed = rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps);
+        let final_normed = self.final_norm.apply(&hidden, self.config.rms_norm_eps);
         Ok(self.logits_from_normed(&final_normed))
     }
 
@@ -2772,7 +3236,10 @@ impl Decoder {
         hidden_dim: usize,
         act: GluAct,
     ) -> Option<Vec<(Vec<f32>, f32)>> {
-        if !ferrox_core::weight_matrix::cpu_int_dot_enabled() || !normed2.len().is_multiple_of(32) {
+        if !ferrox_core::weight_matrix::cpu_int_dot_for(
+            ferrox_core::weight_matrix::IntDotShape::Matvec,
+        ) || !normed2.len().is_multiple_of(32)
+        {
             return None;
         }
         let n_slots = decision.expert_ids.len();
@@ -2836,18 +3303,16 @@ impl Decoder {
             }
         });
         let mut activated = vec![0f32; n_slots * ffn_rows];
-        // Generic over the gate nonlinearity rather than two copies of
-        // the loop, and monomorphised so the call still inlines: the
-        // combine here is always parallel (decode's `n_slots * ffn_rows`
-        // sits under `ferrox_core::matmul`'s own fork threshold), which
-        // is why this does not just call `act.apply`.
-        fn combine<F: Fn(f32) -> f32 + Sync>(out: &mut [f32], gate: &[f32], up: &[f32], f: F) {
-            ferrox_core::par::items_mut(out, 1, |idx, a| *a = f(gate[idx]) * up[idx]);
-        }
-        match act {
-            GluAct::Swiglu => combine(&mut activated, &gate, &up, ferrox_core::matmul::silu),
-            GluAct::Geglu => combine(&mut activated, &gate, &up, ferrox_core::matmul::gelu),
-        }
+        // The combine here is always parallel (decode's `n_slots *
+        // ffn_rows` sits under `ferrox_core::matmul`'s own fork
+        // threshold), which is why this does not just call `act.apply`.
+        // `GluAct::combine` is that function one element at a time --
+        // this used to match the variant here and multiply `f(gate) *
+        // up` itself, a second spelling of the activation that a
+        // parameterised variant (xIELU reads `up` alone) could not fit.
+        ferrox_core::par::items_mut(&mut activated, 1, |idx, a| {
+            *a = act.combine(gate[idx], up[idx])
+        });
         let mut outs: Vec<(Vec<f32>, f32)> = decision
             .weights
             .iter()
@@ -2876,8 +3341,9 @@ impl Decoder {
         plan: Option<&PlacementPlan>,
         act: GluAct,
     ) -> Vec<(Vec<f32>, f32)> {
-        let shared_act = if ferrox_core::weight_matrix::cpu_int_dot_enabled()
-            && normed2.len().is_multiple_of(32)
+        let shared_act = if ferrox_core::weight_matrix::cpu_int_dot_for(
+            ferrox_core::weight_matrix::IntDotShape::Matvec,
+        ) && normed2.len().is_multiple_of(32)
             && plan
                 .map(|p| {
                     decision
@@ -2980,16 +3446,26 @@ impl Decoder {
         }
     }
 
+    /// `normed2` is what the DENSE half (the shared experts) reads;
+    /// `routed_input` is what the routed experts read -- the same slice
+    /// for every architecture but Arctic, whose routed branch reads
+    /// `ffn_norm_exps(inpSA)` (`crate::router_input`). Two arguments
+    /// rather than one so a caller cannot hand the experts the wrong
+    /// vector without saying so.
+    #[allow(clippy::too_many_arguments)]
     fn combine_ffn_outputs_for_position(
+        layer_idx: usize,
         layer: &LayerWeights,
         normed2: &[f32],
+        routed_input: &[f32],
         router_logits: &[f32],
         config: &ModelConfig,
         hidden_dim: usize,
         plan: Option<&PlacementPlan>,
     ) -> Vec<f32> {
         let decision = Self::route_for_layer(layer, router_logits, config);
-        let act = GluAct::from(config.ffn_activation);
+        let acts = config.layer_ffn_acts(layer_idx);
+        let act = acts.routed;
         layer.moe.record_activations(&decision.expert_ids);
         // Best-effort warm of the routed experts for this layer into
         // the store cache (SSD streaming overlap). Resident-backed
@@ -3022,7 +3498,7 @@ impl Decoder {
             && act.is_swiglu()
             && layer.moe.shared_experts.is_empty()
         {
-            if let Some(fused) = Self::try_metal_moe_topk(layer, normed2, &decision) {
+            if let Some(fused) = Self::try_metal_moe_topk(layer, routed_input, &decision) {
                 return fused;
             }
         }
@@ -3040,15 +3516,19 @@ impl Decoder {
                 })
                 .unwrap_or(true);
             if let (true, ExpertBacking::Resident(experts)) = (all_cpu, &layer.moe.experts) {
-                if let Some(outs) =
-                    Self::cpu_moe_topk_parallel_slots(experts, normed2, &decision, hidden_dim, act)
-                {
+                if let Some(outs) = Self::cpu_moe_topk_parallel_slots(
+                    experts,
+                    routed_input,
+                    &decision,
+                    hidden_dim,
+                    act,
+                ) {
                     outs
                 } else {
-                    Self::cpu_moe_serial_experts(layer, normed2, &decision, plan, act)
+                    Self::cpu_moe_serial_experts(layer, routed_input, &decision, plan, act)
                 }
             } else {
-                Self::cpu_moe_serial_experts(layer, normed2, &decision, plan, act)
+                Self::cpu_moe_serial_experts(layer, routed_input, &decision, plan, act)
             }
         };
         // Shared experts fire on every token regardless of routing, so
@@ -3058,7 +3538,7 @@ impl Decoder {
             .moe
             .shared_experts
             .iter()
-            .map(|e| run_expert(normed2, e, act))
+            .map(|e| run_expert(normed2, e, acts.dense))
             .collect();
         // Qwen2-MoE-specific: see `MoeWeights::shared_expert_gate`'s doc
         // comment. Scaling here (before `combine_expert_outputs`, which
@@ -3105,11 +3585,13 @@ impl Decoder {
     /// Decode (`batch_size == 1`) still takes the fused per-position
     /// launch, which is the right shape there.
     fn dense_ffn_batch(
+        layer_idx: usize,
         layer: &LayerWeights,
         normed2_batch: &[f32],
         batch_size: usize,
         config: &ModelConfig,
     ) -> Option<Vec<f32>> {
+        let act = config.layer_ffn_acts(layer_idx).dense;
         // Match the GPU `mul_mm` threshold: below it the per-call launch
         // overhead outweighs the weight reuse.
         if !Self::is_dense_layer(layer) || batch_size < 4 {
@@ -3142,10 +3624,17 @@ impl Decoder {
         // simdgroup GEMM: gate and up feed the activation and the down
         // projection without the intermediates ever touching the host.
         // Three separate launches cost three round trips per layer plus
-        // four copies of a `batch x ffn_dim` tensor.
+        // four copies of a `batch x ffn_dim` tensor. Not for a layer
+        // with a norm between the activation and `down`
+        // (`ffn_sub_norm`): the kernel has no such site.
+        // ...nor a bias at any of its three sites (`crate::proj_bias`).
         #[cfg(feature = "metal")]
-        if ferrox_core::weight_matrix::metal_dense_enabled() {
-            let gelu = !GluAct::from(config.ffn_activation).is_swiglu();
+        if let (true, Some(gelu), None, None) = (
+            ferrox_core::weight_matrix::metal_dense_enabled(),
+            act.fused_kernel_gelu_flag(),
+            layer.moe.ffn_sub_norm.as_ref(),
+            layer.moe.dense_bias.as_ref(),
+        ) {
             let fused = layer.moe.with_expert(0, |ex| {
                 let (g, u, d) = (
                     ex.gate.mul_mm_sg_launch()?,
@@ -3168,14 +3657,35 @@ impl Decoder {
         }
         Some(layer.moe.with_expert(0, |ex| {
             let ffn_acts = ex.gate.quantize_batch_acts(normed2_batch, batch_size);
-            let gate = ex
-                .gate
-                .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
-            let up = ex
+            let mut gate =
+                ex.gate
+                    .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
+            let mut up = ex
                 .up
                 .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
-            let activated = GluAct::from(config.ffn_activation).apply(&gate, &up);
-            ex.down.apply_batch(&activated, batch_size)
+            // `build_ffn`: `up_b` / `gate_b` before the activation
+            // (`crate::proj_bias`). On an ungated layer `gate` is an
+            // alias of `up` and only `up_b` exists; `act.apply` reads
+            // `up` alone for it, so the gate copy going unbiased is not
+            // read.
+            if let Some(bias) = &layer.moe.dense_bias {
+                bias.add_pre_activation(&mut gate, &mut up, batch_size);
+            }
+            let mut activated = act.apply(&gate, &up);
+            // bitnet.cpp:135-140, per row, on the same vector the row
+            // body norms in `ferrox_moe::run_expert_sub_normed`.
+            if let Some(w) = &layer.moe.ffn_sub_norm {
+                let width = w.len();
+                activated = activated
+                    .chunks(width)
+                    .flat_map(|row| rms_norm(row, w, config.rms_norm_eps))
+                    .collect();
+            }
+            let mut down = ex.down.apply_batch(&activated, batch_size);
+            if let Some(bias) = &layer.moe.dense_bias {
+                bias.add_post_down(&mut down, batch_size);
+            }
+            down
         }))
     }
 
@@ -3187,15 +3697,21 @@ impl Decoder {
     /// GPU-placed expert). Both gated activations are served here --
     /// the combine goes through [`GluAct`], so GeGLU no longer falls out
     /// to the per-position path.
+    /// `routed_batch` is what the experts read, `normed2_batch` what the
+    /// shared experts read: the same rows for every architecture but
+    /// Arctic (see `combine_ffn_outputs_for_position`).
+    #[allow(clippy::too_many_arguments)]
     fn moe_ffn_batch(
+        layer_idx: usize,
         layer: &LayerWeights,
         normed2_batch: &[f32],
+        routed_batch: &[f32],
         router_logits_batch: &[f32],
         batch_size: usize,
-        hidden_dim: usize,
         config: &ModelConfig,
         plan: Option<&PlacementPlan>,
     ) -> Option<Vec<f32>> {
+        let hidden_dim = config.hidden_dim;
         if batch_size < 32 || Self::is_dense_layer(layer) {
             return None;
         }
@@ -3205,7 +3721,8 @@ impl Decoder {
         if ferrox_core::metal_dense_enabled() {
             return None;
         }
-        let act = GluAct::from(config.ffn_activation);
+        let acts = config.layer_ffn_acts(layer_idx);
+        let act = acts.routed;
         let ExpertBacking::Resident(experts) = &layer.moe.experts else {
             return None;
         };
@@ -3236,7 +3753,7 @@ impl Decoder {
             let mut gathered = vec![0f32; n * hidden_dim];
             for (i, &(tok, _)) in toks.iter().enumerate() {
                 gathered[i * hidden_dim..(i + 1) * hidden_dim]
-                    .copy_from_slice(&normed2_batch[tok * hidden_dim..(tok + 1) * hidden_dim]);
+                    .copy_from_slice(&routed_batch[tok * hidden_dim..(tok + 1) * hidden_dim]);
             }
             let ex = &experts[eid];
             let ffn_acts = ex.gate.quantize_batch_acts(&gathered, n);
@@ -3261,7 +3778,7 @@ impl Decoder {
             batch_size,
             hidden_dim,
             &mut acc,
-            act,
+            acts.dense,
         );
         Some(acc)
     }
@@ -3322,99 +3839,40 @@ impl Decoder {
     /// fast path (see `is_dense_layer`) or the full router+combine path
     /// with the router computed inline via a single-position `apply`.
     fn run_ffn_block(
+        layer_idx: usize,
         layer: &LayerWeights,
         normed2: &[f32],
         config: &ModelConfig,
         hidden_dim: usize,
         plan: Option<&PlacementPlan>,
+        operand: ffn_block::RouterOperand,
     ) -> Vec<f32> {
         if Self::is_dense_layer(layer) {
             layer.moe.record_activations(&[0]);
             // One expert, run exactly the way a routed one is. The GeGLU
             // arm used to be spelled out here and nowhere else, which is
             // precisely how the routed paths ended up SwiGLU-only.
-            let act = GluAct::from(config.ffn_activation);
-            return layer.moe.with_expert(0, |ex| run_expert(normed2, ex, act));
+            let act = config.layer_ffn_acts(layer_idx).dense;
+            return Self::run_dense_expert(layer, normed2, act, config.rms_norm_eps);
         }
-        let router_logits = layer.moe.router.apply(normed2);
+        // What the router reads is the caller's fact (`crate::router_input`):
+        // the normed FFN input here, logits computed before attention, or
+        // Arctic's normed layer input, which its experts read too.
+        let (router_logits, routed_input): (Vec<f32>, &[f32]) = match &operand {
+            ffn_block::RouterOperand::FfnInput => (layer.moe.router.apply(normed2), normed2),
+            ffn_block::RouterOperand::Precomputed(logits) => (logits.clone(), normed2),
+            ffn_block::RouterOperand::BranchInput(x) => (layer.moe.router.apply(x), x.as_slice()),
+        };
         Self::combine_ffn_outputs_for_position(
+            layer_idx,
             layer,
             normed2,
+            routed_input,
             &router_logits,
             config,
             hidden_dim,
             plan,
         )
-    }
-
-    /// Processes multiple new positions in one call instead of calling
-    /// `forward_token` once per position. `tokens[i]` is the token at
-    /// absolute position `start_pos + i`; all positions attend
-    /// causally (position `i` sees positions `0..=i` of this batch
-    /// plus everything already in `kv_caches`, nothing later).
-    ///
-    /// The attention block's Q/K/V/O projections and the MoE router
-    /// are computed as batched matmuls (`WeightMatrix::apply_batch`),
-    /// which for quantized weights means each weight row is read from
-    /// memory once and dotted against every position in the batch,
-    /// not once per position -- see `apply_batch`'s doc comment for
-    /// why that's a real memory-bandwidth saving, not just fewer
-    /// function calls. The expert FFN stage is *not* batched: which
-    /// expert(s) a position routes to is data-dependent per position,
-    /// so positions routed to different experts can't share a single
-    /// matmul the way the shared Q/K/V/router projections can. RoPE
-    /// and attention itself (causal masking, softmax) are also
-    /// per-position, since they're cheap relative to the matmuls and
-    /// batching them would add complexity for little benefit.
-    ///
-    /// This is what makes prompt-lookup speculative decoding
-    /// (`speculative` module) actually save work rather than just
-    /// reshuffle it: verifying `k` draft tokens costs one batched call
-    /// here, not `k` calls to `forward_token`.
-    ///
-    /// Thin wrapper over [`Self::forward_hidden_batch`] + `output_head`.
-    pub fn forward_batch(
-        &self,
-        tokens: &[usize],
-        start_pos: usize,
-        kv_caches: &mut [KvCache],
-    ) -> Vec<Vec<f32>> {
-        let hiddens = self.forward_hidden_batch(tokens, start_pos, kv_caches);
-        if hiddens.is_empty() {
-            return Vec::new();
-        }
-        let batch_size = hiddens.len();
-        let flat: Vec<f32> = hiddens.into_iter().flatten().collect();
-        self.logits_from_flat_hidden(flat, batch_size)
-    }
-
-    /// [`Self::forward_batch`] that also hands back the final-layer
-    /// hidden state for every position instead of dropping it.
-    ///
-    /// `forward_batch` computes these and throws them away; a
-    /// hidden-state-conditioned drafter (EAGLE, MTP, dFlash) needs
-    /// exactly the vector for the last *verified* position, so
-    /// recomputing it would mean running the target model twice for
-    /// something the first pass already had in hand. The extra cost
-    /// here is one copy of `[batch x hidden]`, which is why
-    /// `forward_batch` keeps its move-only path for the prefill case
-    /// that does not want them.
-    ///
-    /// Returns `(logits_per_position, hidden_per_position)`, both
-    /// indexed by position in `tokens`.
-    pub fn forward_batch_with_hidden(
-        &self,
-        tokens: &[usize],
-        start_pos: usize,
-        kv_caches: &mut [KvCache],
-    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
-        let hiddens = self.forward_hidden_batch(tokens, start_pos, kv_caches);
-        if hiddens.is_empty() {
-            return (Vec::new(), Vec::new());
-        }
-        let batch_size = hiddens.len();
-        let flat: Vec<f32> = hiddens.iter().flatten().copied().collect();
-        (self.logits_from_flat_hidden(flat, batch_size), hiddens)
     }
 
     /// One token's embedding row, scaled if this checkpoint scales it.
@@ -3425,12 +3883,21 @@ impl Decoder {
     /// every other -- which is why it survived as a drift for as long as
     /// it did. The lookup and the scale live in one function so a caller
     /// cannot obtain the row without it.
+    /// The embedding row, scaled by `embedding_scale` where the
+    /// architecture has one, and -- for a skip-stream model
+    /// (`crate::skip_stream`) -- RMS-normed without a weight, as
+    /// `talkie.cpp:50` norms `inpL` before layer 0. The ONE embedding
+    /// site; what it returns is both layer 0's input and the skip
+    /// source.
     fn embed_token(&self, token_id: usize) -> Vec<f32> {
         let mut row = self.embedding.dequant_row(token_id);
         if let Some(scale) = self.config.embedding_scale {
             for v in row.iter_mut() {
                 *v *= scale;
             }
+        }
+        if self.config.skip_stream {
+            row = crate::norm::rms_norm_no_params(&row, self.config.rms_norm_eps);
         }
         row
     }
@@ -3451,9 +3918,11 @@ impl Decoder {
     /// capping produces a different distribution -- not an error, just a
     /// quietly wrong one.
     fn logits_from_normed(&self, final_normed: &[f32]) -> Vec<f32> {
-        Logits::from_output_head(
-            self.output_head.apply(final_normed),
+        Logits::project(
+            &self.output_head,
+            final_normed,
             self.config.final_logit_softcap,
+            self.config.logit_multiplier,
         )
         .into_vec()
     }
@@ -3466,63 +3935,13 @@ impl Decoder {
         let logits_batch = Logits::from_output_head(
             self.output_head.apply_batch(&flat, batch_size),
             self.config.final_logit_softcap,
+            self.config.logit_multiplier,
         );
         logits_batch
             .as_slice()
             .chunks(vocab_size)
             .map(|c| c.to_vec())
             .collect()
-    }
-
-    /// [`Self::forward_batch`] for the common case where only the final
-    /// position's logits are wanted: prefill a prompt, then sample the
-    /// next token. Runs `output_head` on **one** row instead of all
-    /// `batch_size` of them.
-    ///
-    /// The KV cache and every hidden state are identical either way —
-    /// only the vocabulary projection is skipped, and only for rows
-    /// whose logits the caller was going to drop. That projection is not
-    /// a rounding error: it is `[batch x hidden] x [hidden x vocab]`,
-    /// which for a large-vocabulary model with a small body is a large
-    /// share of prefill. `V*H / (V*H + L*P_layer)` comes to 30% on
-    /// Gemma-3-1B, 21% on Llama-3.2-1B and SmolLM2, 23% on Gemma-2-2B.
-    /// llama.cpp does not do this work at all during `pp512` —
-    /// `llama_batch_get_one` leaves `logits` unset, so `inp_out_ids`
-    /// selects a single row.
-    ///
-    /// [`Self::forward_batch`] stays for the callers that genuinely need
-    /// every row: speculative verification checks each draft position,
-    /// and `/v1/embeddings` pools over all of them.
-    pub fn forward_batch_last(
-        &self,
-        tokens: &[usize],
-        start_pos: usize,
-        kv_caches: &mut [KvCache],
-    ) -> Vec<f32> {
-        self.forward_batch_last_inner(tokens, start_pos, kv_caches, false)
-    }
-
-    /// [`Self::forward_batch_last`] for a caller that will READ the
-    /// caches afterwards rather than only decode from them.
-    ///
-    /// A Metal prefill otherwise leaves K/V on the device and the host
-    /// rows zero-filled, which is invisible to a caller that keeps
-    /// decoding (the device buffers stay authoritative) and fatal to
-    /// one that copies the rows somewhere else. Two callers do copy
-    /// them: `forward_batch_last_paged`, into the page store, and
-    /// `ferrox-server`'s prefix cache, into a snapshot a later request
-    /// restores from. Both used to get zeros, and both answered fluent
-    /// nonsense from a prompt the model never attended over.
-    ///
-    /// Costs one KV download per layer. Use [`Self::forward_batch_last`]
-    /// when nothing will read the caches back.
-    pub fn forward_batch_last_host_kv(
-        &self,
-        tokens: &[usize],
-        start_pos: usize,
-        kv_caches: &mut [KvCache],
-    ) -> Vec<f32> {
-        self.forward_batch_last_inner(tokens, start_pos, kv_caches, true)
     }
 
     /// [`Self::forward_batch_last`], plus the choice of whether the host
@@ -3544,53 +3963,17 @@ impl Decoder {
         self.logits_from_normed(last)
     }
 
-    /// [`Self::forward_batch_last`] over paged KV: the prefill twin of
-    /// [`Self::forward_token_paged`].
-    ///
-    /// # Why this gathers instead of paging the kernel
-    ///
-    /// `forward_hidden_batch`'s fast arm hands `cache.k` / `cache.v` to
-    /// `causal_gqa_attention_prefill_shared_kv_windowed`, which is Rayon
-    /// over `[query-block x head]` against one flat KV buffer. That
-    /// blocking is why CPU prefill is not the per-query path, and a
-    /// block table cannot be handed to it as a slice.
-    ///
-    /// The alternative was a second blocked kernel that reads through
-    /// the table. This file has just finished paying for what a second
-    /// copy of a rule costs: the paged decode path silently lost the
-    /// window arm, the sink term, the attention softcap, the embedding
-    /// scale and the final logit softcap, one at a time, because it was
-    /// a copy. A prefill kernel is a much larger surface to keep in
-    /// step than any of those. So the pages are materialised, the ONE
-    /// prefill implementation every other path uses runs against them,
-    /// and the new rows go back.
-    ///
-    /// Bit-identity is therefore by construction rather than by
-    /// agreement between two kernels: this calls the same function with
-    /// the same values. What the tests pin is that the gather and the
-    /// scatter are faithful, not that two implementations of attention
-    /// happen to match.
-    ///
-    /// The cost is one KV-sized copy per layer per call, against the
-    /// matmuls that dominate prefill. Decode is untouched: it still
-    /// reads through the block table and copies nothing, which is where
-    /// page sharing pays.
-    ///
-    /// # Failure is checked before anything is written
-    ///
-    /// Every layer's blocks are reserved up front, so a store too small
-    /// for the batch refuses with `PagedStoreExhausted` having mutated
-    /// no layer. A partial append would leave some layers longer than
-    /// others, and no caller can recover from that.
-    pub fn forward_batch_last_paged(
+    /// The body of [`Self::forward_batch_last_paged`], already running on a
+    /// CPU-pool worker. See `entry.rs` for why the split exists.
+    fn forward_batch_last_paged_on_worker(
         &self,
         tokens: &[usize],
         start_pos: usize,
         kv_caches: &mut [PagedKvCache],
         stores: &SharedPagedKv,
     ) -> Result<Vec<f32>, PagedStoreExhausted> {
-        assert_eq!(kv_caches.len(), self.layers.len());
-        assert_eq!(stores.layer_count(), self.layers.len());
+        assert_eq!(kv_caches.len(), self.config.n_layers);
+        assert_eq!(stores.layer_count(), self.config.n_layers);
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
@@ -3651,18 +4034,6 @@ impl Decoder {
         Ok(logits)
     }
 
-    /// Like [`Self::forward_batch`], but returns final RMS-normed hidden
-    /// states (pre-`output_head`) — one `hidden_dim` vector per input
-    /// token. Used by `/v1/embeddings` pooling (mean / last).
-    pub fn forward_hidden_batch(
-        &self,
-        tokens: &[usize],
-        start_pos: usize,
-        kv_caches: &mut [KvCache],
-    ) -> Vec<Vec<f32>> {
-        self.forward_hidden_batch_inner(tokens, start_pos, kv_caches, false)
-    }
-
     /// [`Self::forward_hidden_batch`] with one extra promise the public
     /// signature cannot express.
     ///
@@ -3684,7 +4055,7 @@ impl Decoder {
         // host cache with real rows on every path and has nothing to
         // choose between.
         let _ = host_kv_authoritative;
-        assert_eq!(kv_caches.len(), self.layers.len());
+        assert_eq!(kv_caches.len(), self.config.n_layers);
         let batch_size = tokens.len();
         if batch_size == 0 {
             return Vec::new();
@@ -3692,11 +4063,17 @@ impl Decoder {
 
         let hidden_dim = self.config.hidden_dim;
         let head_dim = self.config.head_dim;
-        let n_heads = self.config.n_heads;
+        let v_head_dim = self.config.v_head_dim();
+        // The Metal KV plane holds ONE geometry, and `use_metal_attn`
+        // below is false for a per-layer-shape model
+        // (`metal_can_serve_model`), so the widest layer's count is
+        // every layer's wherever this is read.
+        #[cfg(feature = "metal")]
         let n_kv_heads = self.config.n_kv_heads;
 
         // [batch, hidden], flattened row-major.
         let mut hidden_batch: Vec<f32> = self.embed_tokens(tokens);
+        let skip_rows = self.config.skip_stream.then(|| hidden_batch.clone());
 
         #[cfg(feature = "metal")]
         let use_metal_attn = ferrox_core::metal_dense_enabled()
@@ -3771,12 +4148,24 @@ impl Decoder {
             }
         }
 
-        let n_layers = self.layers.len();
+        let n_layers = self.config.n_layers;
         let mut l = 0usize;
-        while l < n_layers {
-            let layer = &self.layers[l];
+        // Labelled for the Metal arm inside the `'attention` block below,
+        // whose `continue` must name the loop it leaves.
+        #[allow(unused_labels)]
+        'layers: while l < n_layers {
+            let layer = self.layer_for(l);
+            // THIS layer's head counts. Zero for the two attention-less
+            // shapes, which leave the loop below before a width is used;
+            // the Metal arms only run on a uniform model
+            // (`metal_can_serve_model`), where every layer's counts are
+            // the config's.
+            let shape = self.config.layer_shape(l);
+            let (n_heads, n_kv_heads) = (shape.attention.n_heads(), shape.attention.n_kv_heads());
             let q_width = n_heads * head_dim;
             let kv_width = n_kv_heads * head_dim;
+            let v_width = n_kv_heads * v_head_dim;
+            let out_width = n_heads * v_head_dim;
 
             // Multi-layer dense prefill: one CB, activations stay on GPU.
             #[cfg(feature = "metal")]
@@ -3815,7 +4204,13 @@ impl Decoder {
             // One-CB dense prefill (RMSNorm→QKV GEMM→attn→O→FFN) when every
             // projection has mul_mm_sg and the layer has no QKV bias / QK-norm.
             #[cfg(feature = "metal")]
-            if use_metal_attn && batch_size >= 4 && Self::metal_prefill_dense_layer_eligible(layer)
+            if use_metal_attn
+                && batch_size >= 4
+                && Self::metal_prefill_dense_layer_eligible(
+                    layer,
+                    &self.config,
+                    self.lora_attached(),
+                )
             {
                 let swa_fits = self.metal_prefill_dense_swa_fits(l, start_pos, batch_size);
                 if swa_fits {
@@ -3838,12 +4233,16 @@ impl Decoder {
                                         up: ex.up.mul_mm_sg_launch()?,
                                         down: ex.down.mul_mm_sg_launch()?,
                                     };
-                                    let gelu =
-                                        !GluAct::from(self.config.ffn_activation).is_swiglu();
+                                    let gelu = self
+                                        .config
+                                        .model_ffn_act()
+                                        .and_then(GluAct::fused_kernel_gelu_flag)?;
                                     let prefill_layer =
                                         ferrox_metal::attn::PrefillDenseLayerMetal {
-                                            attn_norm_w: &layer.attn.norm_weight,
-                                            ffn_norm_w: &layer.moe.norm_weight,
+                                            // See `try_metal_prefill_dense_stack`:
+                                            // no weight, no fused launch.
+                                            attn_norm_w: layer.attn.norm_weight.rms_weights()?,
+                                            ffn_norm_w: layer.moe.norm_weight.rms_weights()?,
                                             q,
                                             k,
                                             v,
@@ -3887,551 +4286,349 @@ impl Decoder {
             }
 
             // --- attention block ---
+            let inputs = self.branch_inputs(layer, &hidden_batch, batch_size);
             let normed_batch: Vec<f32> = hidden_batch
                 .par_chunks(hidden_dim)
-                .map(|h| rms_norm(h, &layer.attn.norm_weight, self.config.rms_norm_eps))
+                .map(|h| layer.attn.norm_weight.apply(h, self.config.rms_norm_eps))
                 .flatten()
                 .collect();
+            let oai = self
+                .gpt_oss
+                .as_ref()
+                .map(|g| &g.layers[self.physical_index(l)]);
 
-            // One shared activation-quant pass for q/k/v (plan 1e): the
-            // three projections read the same normed batch, so quantize it
-            // once instead of once per projection. A kind mismatch inside
-            // the group just re-quantizes locally.
-            let qkv_acts = layer
-                .attn
-                .q_proj
-                .quantize_batch_acts(&normed_batch, batch_size);
-            let mut q_batch = layer.attn.q_proj.apply_batch_with_acts(
-                &normed_batch,
-                batch_size,
-                qkv_acts.as_ref(),
-            );
-            let mut k_batch = layer.attn.k_proj.apply_batch_with_acts(
-                &normed_batch,
-                batch_size,
-                qkv_acts.as_ref(),
-            );
-            let mut v_batch = layer.attn.v_proj.apply_batch_with_acts(
-                &normed_batch,
-                batch_size,
-                qkv_acts.as_ref(),
-            );
-            drop(qkv_acts);
-
-            if let Some(bias) = &layer.attn.q_bias {
-                for row in q_batch.chunks_mut(q_width) {
-                    for (x, b) in row.iter_mut().zip(bias.iter()) {
-                        *x += b;
+            // The GQA body, or the two shapes that have none of it
+            // (`crate::layer_shapes::AttnShape`): a labelled block so the
+            // FFN half below is reached by all three without a copy of
+            // it, and so the Metal arms inside keep their `continue`s.
+            'attention: {
+                match shape.attention {
+                    // deci.cpp:107-109: the residual passes straight through.
+                    crate::layer_shapes::AttnShape::Absent => break 'attention,
+                    // deci.cpp:115-118: `attn_norm` then `wo`, nothing else.
+                    crate::layer_shapes::AttnShape::Linear => {
+                        let projected = layer.attn.o_proj.apply_batch(&normed_batch, batch_size);
+                        residual_add(&mut hidden_batch, &projected, self.config.residual_scale);
+                        break 'attention;
                     }
+                    crate::layer_shapes::AttnShape::Gqa { .. } => {}
                 }
-            }
-            if let Some(bias) = &layer.attn.k_bias {
-                for row in k_batch.chunks_mut(kv_width) {
-                    for (x, b) in row.iter_mut().zip(bias.iter()) {
-                        *x += b;
-                    }
-                }
-            }
-            if let Some(bias) = &layer.attn.v_bias {
-                for row in v_batch.chunks_mut(kv_width) {
-                    for (x, b) in row.iter_mut().zip(bias.iter()) {
-                        *x += b;
-                    }
-                }
-            }
 
-            self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
-            // Host-side `mscale`, applied before either backend ropes.
-            // The Metal branch below therefore hands its kernels
-            // `attn_factor_applied_by_caller()` — folding it into cos/sin
-            // there as well would square it.
-            self.apply_rope_attn_factor(&mut q_batch, &mut k_batch);
-
-            #[cfg(feature = "metal")]
-            {
-                let mut did_metal_prefill = false;
-                // The Metal prefill kernel is full-causal: only safe on a
-                // SWA layer while every causal position is still inside
-                // the window. Longer prompts fall back to CPU attention.
-                let swa_fits = match self.config.layer_sliding_window(l) {
-                    Some(window) => start_pos + batch_size <= window,
-                    None => true,
-                };
-                // Metal prefill applies attn softcap in FA-vec / legacy GQA.
-                if let Some(guard) = metal_kv_guard.as_mut() {
-                    if let Some(metal_kvs) = guard.as_mut() {
-                        // POSITIONS: compared against `start_pos`.
-                        if metal_kvs[l].seq_len == cache.positions()
-                            && start_pos == cache.positions()
-                            && swa_fits
-                        {
-                            let prefill_res = {
-                                ferrox_metal::attn::launch_prefill_attn_block(
-                                    &q_batch,
-                                    &k_batch,
-                                    &v_batch,
-                                    &mut metal_kvs[l],
-                                    n_heads,
-                                    batch_size,
-                                    self.metal_rope().attn_factor_applied_by_caller(),
-                                    self.config.layer_rope_theta(l),
-                                    self.config.layer_rope_freqs(l),
-                                    start_pos,
-                                    self.config.attn_logit_softcap,
-                                    false,
-                                )
-                                .map(|(attn_out_batch, _, _)| {
-                                    Self::advance_host_kv_after_metal_prefill(
-                                        &metal_kvs[l],
-                                        cache,
-                                        batch_size,
-                                        host_kv_authoritative,
-                                    );
-                                    let projected_batch =
-                                        layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
-                                    let projected_batch =
-                                        if let Some(post) = &layer.attn.post_attn_norm {
-                                            projected_batch
-                                                .chunks(hidden_dim)
-                                                .flat_map(|row| {
-                                                    rms_norm(row, post, self.config.rms_norm_eps)
-                                                })
-                                                .collect::<Vec<_>>()
-                                        } else {
-                                            projected_batch
-                                        };
-                                    for (h, p) in
-                                        hidden_batch.iter_mut().zip(projected_batch.iter())
-                                    {
-                                        *h += p;
-                                    }
-                                    true
-                                })
-                            };
-                            match prefill_res {
-                                Ok(true) => {
-                                    did_metal_prefill = true;
-                                }
-                                Ok(false) => {}
-                                Err(e) => {
-                                    eprintln!(
-                                        "ferrox: Metal prefill attn failed, CPU fallback: {e}"
-                                    );
-                                    **guard = None;
-                                }
-                            }
-                        }
-                    }
-                }
-                if did_metal_prefill {
-                    // --- MoE FFN block (batched Metal when packed Q4) ---
-                    let normed2_batch: Vec<f32> = hidden_batch
-                        .chunks(hidden_dim)
-                        .flat_map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
-                        .collect();
-                    let dense = Self::is_dense_layer(layer);
-                    let router_logits_batch = if dense {
-                        Vec::new()
-                    } else {
-                        layer.moe.router.apply_batch(&normed2_batch, batch_size)
-                    };
-                    let metal_ffn = if !dense {
-                        Self::try_metal_moe_prefill_batch(
-                            layer,
-                            &normed2_batch,
-                            &router_logits_batch,
-                            batch_size,
-                            hidden_dim,
-                            &self.config,
-                        )
-                    } else {
-                        None
-                    };
-                    if let Some(mut ffn_batch) = metal_ffn {
-                        if let Some(post) = &layer.attn.post_ffn_norm {
-                            ffn_batch = ffn_batch
-                                .chunks(hidden_dim)
-                                .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                                .collect();
-                        }
-                        for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
-                            *h += f;
-                        }
-                    } else if let Some(mut ffn_batch) =
-                        Self::dense_ffn_batch(layer, &normed2_batch, batch_size, &self.config)
-                    {
-                        if let Some(post) = &layer.attn.post_ffn_norm {
-                            ffn_batch = ffn_batch
-                                .chunks(hidden_dim)
-                                .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                                .collect();
-                        }
-                        for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
-                            *h += f;
-                        }
-                    } else if let Some(mut ffn_batch) = Self::moe_ffn_batch(
-                        layer,
-                        &normed2_batch,
-                        &router_logits_batch,
-                        batch_size,
-                        hidden_dim,
-                        &self.config,
-                        residency.as_ref().map(|p| p.layer_plan(l)),
-                    ) {
-                        if let Some(post) = &layer.attn.post_ffn_norm {
-                            ffn_batch = ffn_batch
-                                .chunks(hidden_dim)
-                                .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                                .collect();
-                        }
-                        for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
-                            *h += f;
-                        }
-                    } else {
-                        let n_experts = layer.moe.n_experts().max(1);
-                        for b in 0..batch_size {
-                            let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                            let mut ffn_out = if dense {
-                                Self::run_ffn_block(
-                                    layer,
-                                    normed2,
-                                    &self.config,
-                                    hidden_dim,
-                                    residency.as_ref().map(|p| p.layer_plan(l)),
-                                )
-                            } else {
-                                let router_logits =
-                                    &router_logits_batch[b * n_experts..(b + 1) * n_experts];
-                                Self::combine_ffn_outputs_for_position(
-                                    layer,
-                                    normed2,
-                                    router_logits,
-                                    &self.config,
-                                    hidden_dim,
-                                    residency.as_ref().map(|p| p.layer_plan(l)),
-                                )
-                            };
-                            if let Some(post) = &layer.attn.post_ffn_norm {
-                                ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
-                            }
-                            let hidden_row =
-                                &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                            for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
-                                *h += f;
-                            }
-                        }
-                    }
-                    l += 1;
-                    continue;
-                }
-            }
-
-            // RoPE per token is independent; parallelize for CPU pp512.
-            q_batch
-                .par_chunks_mut(q_width)
-                .zip(k_batch.par_chunks_mut(kv_width))
-                .enumerate()
-                .for_each(|(b, (q_row, k_row))| {
-                    let pos = start_pos + b;
-                    for h in 0..n_heads {
-                        self.apply_rope_head_layer(
-                            &mut q_row[h * head_dim..(h + 1) * head_dim],
-                            pos,
-                            l,
-                        );
-                    }
-                    for h in 0..n_kv_heads {
-                        self.apply_rope_head_layer(
-                            &mut k_row[h * head_dim..(h + 1) * head_dim],
-                            pos,
-                            l,
-                        );
-                    }
-                });
-            // `maincoder` / `hunyuan-moe` norm HERE instead. Reachable
-            // only on the host path, which is why
-            // `layer_supports_metal_attn` refuses the layer outright
-            // rather than letting the Metal arms above consume a batch
-            // that has not been normed yet.
-            self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
-            // Elementwise, so the whole Q batch in one call. Like the
-            // multi-sequence path, this body did not apply it at all
-            // until the decoration audit. It is placed AFTER the Metal
-            // arms above deliberately: none of the seven fused launches
-            // has an `attention_scale` uniform, and Q never returns to
-            // the host inside `launch_prefill_dense_layer` /
-            // `launch_prefill_dense_stack` for it to be scaled. The
-            // refusal that keeps those arms out of reach when
-            // `attention_scale` is set is in `layer_supports_metal_attn`.
-            self.apply_attention_scale(&mut q_batch);
-
-            // ROWS, not positions: it is added to `b + 1` below to give
-            // each query in the batch the length of the KV it attends
-            // over, which is a count of resident rows.
-            let base_seq_len = cache.rows();
-            for b in 0..batch_size {
-                cache
-                    .push(
-                        &k_batch[b * kv_width..(b + 1) * kv_width],
-                        &v_batch[b * kv_width..(b + 1) * kv_width],
-                    )
-                    .expect("unbounded/planned KvCache growth is infallible");
-            }
-
-            // Prefill attention over the just-written KV prefix. Parallel
-            // over query positions — the serial loop was a dominant CPU
-            // pp512 bottleneck (each query still attends only its causal
-            // prefix; K/V slices are immutable after the pushes above).
-            let cache_k = &cache.k;
-            let cache_v = &cache.v;
-            let softcap = self.config.attn_logit_softcap;
-            let window = self.config.layer_sliding_window(l);
-            let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
-            // gpt-oss takes the per-query path on every layer, windowed
-            // or not: the blocked kernel has no sink term. Everything
-            // else goes through the blocked kernel, which is Rayon over
-            // `[query-block x head]` against one shared KV buffer,
-            // windowed or not. SWA layers used to take a per-query
-            // `causal_gqa_attention_windowed_softcap` instead, which is
-            // `online_attn_accumulate`: two scalar `exp` and a
-            // head_dim-wide rescale per KV position, with the head axis
-            // serial inside each task. On Gemma-3-1B (22 of 26 layers
-            // are SWA) that arm was 19.6% of non-idle CPU `pp512`
-            // samples while doing the *same* KV work as this one - at
-            // `pp512` the 512-wide window covers the whole prompt.
-            let attn_out_batch = if let Some(oai) = oai {
-                let mut out = vec![0f32; batch_size * q_width];
-                out.par_chunks_mut(q_width)
-                    .enumerate()
-                    .for_each(|(b, dest)| {
-                        let seq_len_b = base_seq_len + b + 1;
-                        let cache_elems = seq_len_b * kv_width;
-                        let attn_out = ferrox_core::causal_gqa_attention_sinks(
-                            &q_batch[b * q_width..(b + 1) * q_width],
-                            &cache_k[..cache_elems],
-                            &cache_v[..cache_elems],
-                            n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            seq_len_b,
-                            window,
-                            &oai.attn_sinks,
-                        );
-                        dest.copy_from_slice(&attn_out);
-                    });
-                out
-            } else {
-                causal_gqa_attention_prefill_shared_kv_windowed(
-                    &q_batch,
-                    cache_k,
-                    cache_v,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
+                // One shared activation-quant pass for q/k/v (plan 1e): the
+                // three projections read the same normed batch, so quantize it
+                // once instead of once per projection. A kind mismatch inside
+                // the group just re-quantizes locally.
+                let qkv_acts = layer
+                    .attn
+                    .q_proj
+                    .quantize_batch_acts(&normed_batch, batch_size);
+                let mut q_batch = layer.attn.q_proj.apply_batch_with_acts(
+                    &normed_batch,
                     batch_size,
-                    base_seq_len,
-                    softcap,
-                    window,
-                )
-            };
+                    qkv_acts.as_ref(),
+                );
+                let mut k_batch = layer.attn.k_proj.apply_batch_with_acts(
+                    &normed_batch,
+                    batch_size,
+                    qkv_acts.as_ref(),
+                );
+                let mut v_batch = layer.attn.v_proj.apply_batch_with_acts(
+                    &normed_batch,
+                    batch_size,
+                    qkv_acts.as_ref(),
+                );
+                drop(qkv_acts);
 
-            // Every query in this batch has now been answered, so the
-            // rows behind the window are rows nothing will read again
-            // (#61). This is why eviction is not inside `KvCache::push`:
-            // `base_seq_len` above was captured BEFORE the batch's
-            // pushes and every query's KV length is derived from it, so
-            // a drop between the push loop and here would attend the
-            // whole prompt over shifted keys.
-            //
-            // Per layer rather than after the stack, and that is where
-            // most of the prefill saving is: a windowed layer hands its
-            // prompt rows back before the next layer allocates its own,
-            // so a 32k prompt holds ONE layer's full history at a time
-            // instead of every windowed layer's at once.
-            self.evict_layer_kv(l, cache);
-
-            let mut projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
-            if let Some(oai) = oai {
-                for row in projected_batch.chunks_mut(hidden_dim) {
-                    for (x, b) in row.iter_mut().zip(oai.o_bias.iter()) {
-                        *x += b;
-                    }
-                }
-            }
-            let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {
-                projected_batch
-                    .chunks(hidden_dim)
-                    .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                    .collect::<Vec<_>>()
-            } else {
-                projected_batch
-            };
-            for (h, p) in hidden_batch.iter_mut().zip(projected_batch.iter()) {
-                *h += p;
-            }
-
-            // --- MoE FFN block ---
-            let normed2_batch: Vec<f32> = hidden_batch
-                .par_chunks(hidden_dim)
-                .map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
-                .flatten()
-                .collect();
-            if let Some(oai) = oai {
-                // gpt-oss: one position at a time through the single
-                // validated FFN. None of the batched fast paths below
-                // knows about router bias, expert bias or swiglu_oai.
-                for b in 0..batch_size {
-                    let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                    let ffn_out = Self::gpt_oss_ffn(layer, oai, normed2, &self.config, hidden_dim);
-                    let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                    for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
-                        *h += f;
-                    }
-                }
-                l += 1;
-                continue;
-            }
-            let dense = Self::is_dense_layer(layer);
-            // Skip the batched router matmul entirely for a dense
-            // layer -- there's nothing to route (see
-            // `is_dense_layer`'s doc comment), so computing it here
-            // just to ignore it below would waste the one matmul this
-            // fast path exists to avoid.
-            let router_logits_batch = if dense {
-                Vec::new()
-            } else {
-                layer.moe.router.apply_batch(&normed2_batch, batch_size)
-            };
-            #[cfg(feature = "metal")]
-            let metal_ffn = if !dense {
-                Self::try_metal_moe_prefill_batch(
+                self.apply_qkv_bias_and_clamp(
                     layer,
-                    &normed2_batch,
-                    &router_logits_batch,
-                    batch_size,
-                    hidden_dim,
-                    &self.config,
-                )
-            } else {
-                None
-            };
-            #[cfg(not(feature = "metal"))]
-            let metal_ffn: Option<Vec<f32>> = None;
-            if let Some(mut ffn_batch) = metal_ffn {
-                if let Some(post) = &layer.attn.post_ffn_norm {
-                    ffn_batch = ffn_batch
-                        .chunks(hidden_dim)
-                        .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                        .collect();
-                }
-                for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
-                    *h += f;
-                }
-            } else if let Some(mut ffn_batch) =
-                Self::dense_ffn_batch(layer, &normed2_batch, batch_size, &self.config)
-            {
-                // Dense FFN, batched. Without this the FFN -- the
-                // majority of a dense model's prefill work -- ran one
-                // position at a time while Q/K/V and the router were
-                // already batched, which is why `pp512` measured about
-                // the same as `tg128`.
-                if let Some(post) = &layer.attn.post_ffn_norm {
-                    ffn_batch = ffn_batch
-                        .chunks(hidden_dim)
-                        .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                        .collect();
-                }
-                for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
-                    *h += f;
-                }
-            } else if let Some(mut ffn_batch) = Self::moe_ffn_batch(
-                layer,
-                &normed2_batch,
-                &router_logits_batch,
-                batch_size,
-                hidden_dim,
-                &self.config,
-                residency.as_ref().map(|p| p.layer_plan(l)),
-            ) {
-                if let Some(post) = &layer.attn.post_ffn_norm {
-                    ffn_batch = ffn_batch
-                        .chunks(hidden_dim)
-                        .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                        .collect();
-                }
-                for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
-                    *h += f;
-                }
-            } else {
-                let n_experts = layer.moe.n_experts().max(1);
-                for b in 0..batch_size {
-                    let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                    let mut ffn_out = if dense {
-                        Self::run_ffn_block(
-                            layer,
-                            normed2,
-                            &self.config,
-                            hidden_dim,
-                            residency.as_ref().map(|p| p.layer_plan(l)),
-                        )
-                    } else {
-                        let router_logits =
-                            &router_logits_batch[b * n_experts..(b + 1) * n_experts];
-                        Self::combine_ffn_outputs_for_position(
-                            layer,
-                            normed2,
-                            router_logits,
-                            &self.config,
-                            hidden_dim,
-                            residency.as_ref().map(|p| p.layer_plan(l)),
-                        )
+                    &mut q_batch,
+                    &mut k_batch,
+                    &mut v_batch,
+                    q_width,
+                    kv_width,
+                    v_width,
+                );
+
+                self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
+                // Host-side `mscale`, applied before either backend ropes.
+                // The Metal branch below therefore hands its kernels
+                // `attn_factor_applied_by_caller()` — folding it into cos/sin
+                // there as well would square it.
+                self.apply_rope_attn_factor(&mut q_batch, &mut k_batch, l);
+
+                #[cfg(feature = "metal")]
+                {
+                    let mut did_metal_prefill = false;
+                    // The Metal prefill kernel is full-causal: only safe on a
+                    // SWA layer while every causal position is still inside
+                    // the window. Longer prompts fall back to CPU attention.
+                    let swa_fits = match self.config.layer_sliding_window(l) {
+                        Some(window) => start_pos + batch_size <= window,
+                        None => true,
                     };
-                    if let Some(post) = &layer.attn.post_ffn_norm {
-                        ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+                    // Metal prefill applies attn softcap in FA-vec / legacy GQA.
+                    if let Some(guard) = metal_kv_guard.as_mut() {
+                        if let Some(metal_kvs) = guard.as_mut() {
+                            // POSITIONS: compared against `start_pos`.
+                            // `layer_rope` is `None` where llama.cpp does
+                            // not rotate this layer at all
+                            // (`crate::rope_layers`); the Metal prefill
+                            // block always ropes, so such a layer takes the
+                            // CPU body below rather than a rotation the
+                            // checkpoint never trained.
+                            if let (true, Some(layer_rope)) = (
+                                metal_kvs[l].seq_len == cache.positions()
+                                    && start_pos == cache.positions()
+                                    && swa_fits,
+                                self.metal_layer_rope(l),
+                            ) {
+                                let prefill_res = {
+                                    ferrox_metal::attn::launch_prefill_attn_block(
+                                        &q_batch,
+                                        &k_batch,
+                                        &v_batch,
+                                        &mut metal_kvs[l],
+                                        n_heads,
+                                        batch_size,
+                                        self.metal_rope().attn_factor_applied_by_caller(),
+                                        layer_rope,
+                                        start_pos,
+                                        self.config.attn_logit_softcap,
+                                        false,
+                                    )
+                                    .map(
+                                        |(attn_out_batch, _, _)| {
+                                            Self::advance_host_kv_after_metal_prefill(
+                                                &metal_kvs[l],
+                                                cache,
+                                                batch_size,
+                                                host_kv_authoritative,
+                                            );
+                                            let projected_batch = layer
+                                                .attn
+                                                .o_proj
+                                                .apply_batch(&attn_out_batch, batch_size);
+                                            let projected_batch =
+                                                if let Some(post) = &layer.attn.post_attn_norm {
+                                                    projected_batch
+                                                        .chunks(hidden_dim)
+                                                        .flat_map(|row| {
+                                                            rms_norm(
+                                                                row,
+                                                                post,
+                                                                self.config.rms_norm_eps,
+                                                            )
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                } else {
+                                                    projected_batch
+                                                };
+                                            residual_add(
+                                                &mut hidden_batch,
+                                                &projected_batch,
+                                                self.config.residual_scale,
+                                            );
+                                            true
+                                        },
+                                    )
+                                };
+                                match prefill_res {
+                                    Ok(true) => {
+                                        did_metal_prefill = true;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        eprintln!(
+                                            "ferrox: Metal prefill attn failed, CPU fallback: {e}"
+                                        );
+                                        **guard = None;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                    for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
-                        *h += f;
+                    if did_metal_prefill {
+                        self.ffn_block_batch(
+                            l,
+                            layer,
+                            &mut hidden_batch,
+                            batch_size,
+                            oai,
+                            residency
+                                .as_ref()
+                                .map(|p| p.layer_plan(self.physical_index(l))),
+                            inputs,
+                            ffn_block::BatchedFfnKernels::Prefill,
+                            skip_rows.as_deref().map(|rows| SkipStream { rows }),
+                        );
+                        l += 1;
+                        continue 'layers;
                     }
                 }
-            }
+
+                // RoPE per token is independent; parallelize for CPU pp512.
+                q_batch
+                    .par_chunks_mut(q_width)
+                    .zip(k_batch.par_chunks_mut(kv_width))
+                    .enumerate()
+                    .for_each(|(b, (q_row, k_row))| {
+                        let pos = start_pos + b;
+                        for h in 0..n_heads {
+                            self.apply_rope_head_layer(
+                                &mut q_row[h * head_dim..(h + 1) * head_dim],
+                                pos,
+                                l,
+                            );
+                        }
+                        for h in 0..n_kv_heads {
+                            self.apply_rope_head_layer(
+                                &mut k_row[h * head_dim..(h + 1) * head_dim],
+                                pos,
+                                l,
+                            );
+                        }
+                    });
+                // `maincoder` / `hunyuan-moe` norm HERE instead. Reachable
+                // only on the host path, which is why
+                // `layer_supports_metal_attn` refuses the layer outright
+                // rather than letting the Metal arms above consume a batch
+                // that has not been normed yet.
+                self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
+                // Elementwise, so the whole Q batch in one call. Like the
+                // multi-sequence path, this body did not apply it at all
+                // until the decoration audit. It is placed AFTER the Metal
+                // arms above deliberately: none of the seven fused launches
+                // has an `attention_scale` uniform, and Q never returns to
+                // the host inside `launch_prefill_dense_layer` /
+                // `launch_prefill_dense_stack` for it to be scaled. The
+                // refusal that keeps those arms out of reach when
+                // `attention_scale` is set is in `layer_supports_metal_attn`.
+                self.apply_attention_scale(&mut q_batch);
+                // Same placement and same fence, per row: row `b` of this
+                // batch is position `start_pos + b`, which is what the
+                // RoPE loop above used for it.
+                self.apply_attn_temperature(&mut q_batch, q_width, |b| start_pos + b);
+
+                // ROWS, not positions: it is added to `b + 1` below to give
+                // each query in the batch the length of the KV it attends
+                // over, which is a count of resident rows.
+                let base_seq_len = cache.rows();
+                for b in 0..batch_size {
+                    cache
+                        .push(
+                            &k_batch[b * kv_width..(b + 1) * kv_width],
+                            &v_batch[b * v_width..(b + 1) * v_width],
+                        )
+                        .expect("unbounded/planned KvCache growth is infallible");
+                }
+
+                // Prefill attention over the just-written KV prefix. Parallel
+                // over query positions — the serial loop was a dominant CPU
+                // pp512 bottleneck (each query still attends only its causal
+                // prefix; K/V slices are immutable after the pushes above).
+                let cache_k = &cache.k;
+                let cache_v = &cache.v;
+                let softcap = self.config.attn_logit_softcap;
+                let window = self.config.layer_sliding_window(l);
+                // A layer with sinks takes the per-query path, windowed
+                // or not: the blocked kernel has no sink term. Everything
+                // else goes through the blocked kernel, which is Rayon over
+                // `[query-block x head]` against one shared KV buffer,
+                // windowed or not. SWA layers used to take a per-query
+                // `causal_gqa_attention_windowed_softcap` instead, which is
+                // `online_attn_accumulate`: two scalar `exp` and a
+                // head_dim-wide rescale per KV position, with the head axis
+                // serial inside each task. On Gemma-3-1B (22 of 26 layers
+                // are SWA) that arm was 19.6% of non-idle CPU `pp512`
+                // samples while doing the *same* KV work as this one - at
+                // `pp512` the 512-wide window covers the whole prompt.
+                let mut attn_out_batch = if let Some(sinks) = layer.attn.sinks.as_deref() {
+                    let mut out = vec![0f32; batch_size * out_width];
+                    out.par_chunks_mut(out_width)
+                        .enumerate()
+                        .for_each(|(b, dest)| {
+                            let seq_len_b = base_seq_len + b + 1;
+                            let attn_out = causal_gqa_attention_row(
+                                &q_batch[b * q_width..(b + 1) * q_width],
+                                &cache_k[..seq_len_b * kv_width],
+                                &cache_v[..seq_len_b * v_width],
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                v_head_dim,
+                                seq_len_b,
+                                window,
+                                Some(sinks),
+                                None,
+                            );
+                            dest.copy_from_slice(&attn_out);
+                        });
+                    out
+                } else {
+                    causal_gqa_attention_prefill_shared_kv_split(
+                        &q_batch,
+                        cache_k,
+                        cache_v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        v_head_dim,
+                        batch_size,
+                        base_seq_len,
+                        softcap,
+                        window,
+                    )
+                };
+
+                // Every query in this batch has now been answered, so the
+                // rows behind the window are rows nothing will read again
+                // (#61). This is why eviction is not inside `KvCache::push`:
+                // `base_seq_len` above was captured BEFORE the batch's
+                // pushes and every query's KV length is derived from it, so
+                // a drop between the push loop and here would attend the
+                // whole prompt over shifted keys.
+                //
+                // Per layer rather than after the stack, and that is where
+                // most of the prefill saving is: a windowed layer hands its
+                // prompt rows back before the next layer allocates its own,
+                // so a 32k prompt holds ONE layer's full history at a time
+                // instead of every windowed layer's at once.
+                self.evict_layer_kv(l, cache);
+
+                let projected_batch = self.attn_out_to_residual_rows(
+                    layer,
+                    &normed_batch,
+                    &mut attn_out_batch,
+                    batch_size,
+                );
+                residual_add(
+                    &mut hidden_batch,
+                    &projected_batch,
+                    self.config.residual_scale,
+                );
+            } // 'attention
+
+            // --- FFN block ---
+            self.ffn_block_batch(
+                l,
+                layer,
+                &mut hidden_batch,
+                batch_size,
+                oai,
+                residency
+                    .as_ref()
+                    .map(|p| p.layer_plan(self.physical_index(l))),
+                inputs,
+                ffn_block::BatchedFfnKernels::Prefill,
+                skip_rows.as_deref().map(|rows| SkipStream { rows }),
+            );
             l += 1;
         }
 
         hidden_batch
             .chunks(hidden_dim)
-            .map(|h| rms_norm(h, &self.final_norm, self.config.rms_norm_eps))
+            .map(|h| self.final_norm.apply(h, self.config.rms_norm_eps))
             .collect()
-    }
-
-    /// Continuous-batching primitive: one decode step across N
-    /// independent *sequences*, each contributing exactly one new
-    /// token at its own current position, sharing every layer's
-    /// projection/router matmuls the same way `forward_batch` shares
-    /// them across positions of a single sequence -- but each
-    /// sequence keeps its own `KvCache`, independent `seq_len`, and
-    /// independent position, so sequences admitted/evicted at
-    /// different times can still share one batched matmul per step
-    /// (this is what "continuous" batching means: the batch
-    /// membership can change every step, unlike `forward_batch`'s
-    /// fixed-size prompt-processing batch). `kv_caches[s][l]` is
-    /// sequence `s`'s layer-`l` cache; `tokens[s]`/`positions[s]` is
-    /// that sequence's next token and its position within its own
-    /// history. Returns one logits vector per sequence, same order as
-    /// `tokens`.
-    ///
-    /// Must produce bit-identical output to calling `forward_token`
-    /// once per sequence with that sequence's own cache/position --
-    /// batching independent sequences together is a scheduling detail,
-    /// not a math change (no sequence's attention ever reads another
-    /// sequence's cache).
-    pub fn forward_multi_seq(
-        &self,
-        tokens: &[usize],
-        positions: &[usize],
-        kv_caches: &mut [Vec<KvCache>],
-    ) -> Vec<Vec<f32>> {
-        self.forward_multi_seq_kv(tokens, positions, &mut MultiSeqKv::Contiguous(kv_caches))
     }
 
     /// Appends one position to sequence `b`'s layer-`l` KV, then
@@ -4452,10 +4649,10 @@ impl Decoder {
         kv: &mut MultiSeqKv<'_>,
         b: usize,
         l: usize,
+        layer: &LayerWeights,
         k: &[f32],
         v: &[f32],
         q: &[f32],
-        oai: Option<&GptOssLayer>,
     ) -> Vec<f32> {
         let step = match kv {
             // `Batched`, not `Decode`: the CUDA resident per-layer KV
@@ -4467,15 +4664,12 @@ impl Decoder {
                 stores,
             },
         };
-        self.push_and_attend_row(step, l, k, v, q, oai)
+        self.push_and_attend_row(step, l, layer, k, v, q)
     }
 
-    /// [`Self::forward_multi_seq`] over either KV backing.
-    ///
-    /// One body for both: the batched projections are identical, and
-    /// the per-sequence attention step is the only place the backing
-    /// shows through.
-    pub fn forward_multi_seq_kv(
+    /// The body of [`Self::forward_multi_seq_kv`], already running on a
+    /// CPU-pool worker. See `entry.rs` for why the split exists.
+    fn forward_multi_seq_kv_on_worker(
         &self,
         tokens: &[usize],
         positions: &[usize],
@@ -4488,193 +4682,166 @@ impl Decoder {
             return Vec::new();
         }
         for seq in 0..batch_size {
-            assert_eq!(kv.layers_per_seq(seq), self.layers.len());
+            assert_eq!(kv.layers_per_seq(seq), self.config.n_layers);
         }
 
         let hidden_dim = self.config.hidden_dim;
         let head_dim = self.config.head_dim;
-        let n_heads = self.config.n_heads;
-        let n_kv_heads = self.config.n_kv_heads;
+        let v_head_dim = self.config.v_head_dim();
 
         // [batch, hidden], flattened row-major.
         let mut hidden_batch: Vec<f32> = self.embed_tokens(tokens);
+        let skip_rows = self.config.skip_stream.then(|| hidden_batch.clone());
 
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
 
-        for (l, layer) in self.layers.iter().enumerate() {
+        for l in 0..self.config.n_layers {
+            let layer = self.layer_for(l);
+            // THIS layer's head counts; see the prefill body.
+            let shape = self.config.layer_shape(l);
+            let (n_heads, n_kv_heads) = (shape.attention.n_heads(), shape.attention.n_kv_heads());
             // --- attention block ---
+            let inputs = self.branch_inputs(layer, &hidden_batch, batch_size);
             let normed_batch: Vec<f32> = hidden_batch
                 .par_chunks(hidden_dim)
-                .map(|h| rms_norm(h, &layer.attn.norm_weight, self.config.rms_norm_eps))
+                .map(|h| layer.attn.norm_weight.apply(h, self.config.rms_norm_eps))
                 .flatten()
                 .collect();
+            let oai = self
+                .gpt_oss
+                .as_ref()
+                .map(|g| &g.layers[self.physical_index(l)]);
 
-            // One shared activation-quant pass for q/k/v (plan 1e): the
-            // three projections read the same normed batch, so quantize it
-            // once instead of once per projection. A kind mismatch inside
-            // the group just re-quantizes locally.
-            let qkv_acts = layer
-                .attn
-                .q_proj
-                .quantize_batch_acts(&normed_batch, batch_size);
-            let mut q_batch = layer.attn.q_proj.apply_batch_with_acts(
-                &normed_batch,
-                batch_size,
-                qkv_acts.as_ref(),
-            );
-            let mut k_batch = layer.attn.k_proj.apply_batch_with_acts(
-                &normed_batch,
-                batch_size,
-                qkv_acts.as_ref(),
-            );
-            let mut v_batch = layer.attn.v_proj.apply_batch_with_acts(
-                &normed_batch,
-                batch_size,
-                qkv_acts.as_ref(),
-            );
-            drop(qkv_acts);
-
-            let q_width = n_heads * head_dim;
-            let kv_width = n_kv_heads * head_dim;
-
-            if let Some(bias) = &layer.attn.q_bias {
-                for row in q_batch.chunks_mut(q_width) {
-                    for (x, b) in row.iter_mut().zip(bias.iter()) {
-                        *x += b;
+            'attention: {
+                match shape.attention {
+                    crate::layer_shapes::AttnShape::Absent => break 'attention,
+                    crate::layer_shapes::AttnShape::Linear => {
+                        let projected = layer.attn.o_proj.apply_batch(&normed_batch, batch_size);
+                        residual_add(&mut hidden_batch, &projected, self.config.residual_scale);
+                        break 'attention;
                     }
+                    crate::layer_shapes::AttnShape::Gqa { .. } => {}
                 }
-            }
-            if let Some(bias) = &layer.attn.k_bias {
-                for row in k_batch.chunks_mut(kv_width) {
-                    for (x, b) in row.iter_mut().zip(bias.iter()) {
-                        *x += b;
-                    }
-                }
-            }
-            if let Some(bias) = &layer.attn.v_bias {
-                for row in v_batch.chunks_mut(kv_width) {
-                    for (x, b) in row.iter_mut().zip(bias.iter()) {
-                        *x += b;
-                    }
-                }
-            }
 
-            self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
-            self.apply_rope_attn_factor(&mut q_batch, &mut k_batch);
-
-            for b in 0..batch_size {
-                let pos = positions[b];
-                let q_row = &mut q_batch[b * q_width..(b + 1) * q_width];
-                for h in 0..n_heads {
-                    self.apply_rope_head_layer(
-                        &mut q_row[h * head_dim..(h + 1) * head_dim],
-                        pos,
-                        l,
-                    );
-                }
-                let k_row = &mut k_batch[b * kv_width..(b + 1) * kv_width];
-                for h in 0..n_kv_heads {
-                    self.apply_rope_head_layer(
-                        &mut k_row[h * head_dim..(h + 1) * head_dim],
-                        pos,
-                        l,
-                    );
-                }
-            }
-            self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
-            // Applied to the whole Q batch at once because it is
-            // elementwise. This path did not apply it at all until the
-            // decoration audit: `attention_scale` reached only
-            // `forward_token`'s CPU arm and `forward_token_paged`, so a
-            // checkpoint carrying one answered at one temperature when
-            // decoded alone and another when batched with its neighbours.
-            self.apply_attention_scale(&mut q_batch);
-
-            let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
-            let mut attn_out_batch = vec![0f32; batch_size * q_width];
-            for b in 0..batch_size {
-                let attn_out = self.push_and_attend(
-                    kv,
-                    b,
-                    l,
-                    &k_batch[b * kv_width..(b + 1) * kv_width],
-                    &v_batch[b * kv_width..(b + 1) * kv_width],
-                    &q_batch[b * q_width..(b + 1) * q_width],
-                    oai,
+                // One shared activation-quant pass for q/k/v (plan 1e): the
+                // three projections read the same normed batch, so quantize it
+                // once instead of once per projection. A kind mismatch inside
+                // the group just re-quantizes locally.
+                let qkv_acts = layer
+                    .attn
+                    .q_proj
+                    .quantize_batch_acts(&normed_batch, batch_size);
+                let mut q_batch = layer.attn.q_proj.apply_batch_with_acts(
+                    &normed_batch,
+                    batch_size,
+                    qkv_acts.as_ref(),
                 );
-                attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);
-            }
+                let mut k_batch = layer.attn.k_proj.apply_batch_with_acts(
+                    &normed_batch,
+                    batch_size,
+                    qkv_acts.as_ref(),
+                );
+                let mut v_batch = layer.attn.v_proj.apply_batch_with_acts(
+                    &normed_batch,
+                    batch_size,
+                    qkv_acts.as_ref(),
+                );
+                drop(qkv_acts);
 
-            let mut projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
-            if let Some(oai) = oai {
-                for row in projected_batch.chunks_mut(hidden_dim) {
-                    for (x, b) in row.iter_mut().zip(oai.o_bias.iter()) {
-                        *x += b;
+                let q_width = n_heads * head_dim;
+                let kv_width = n_kv_heads * head_dim;
+                let v_width = n_kv_heads * v_head_dim;
+                let out_width = n_heads * v_head_dim;
+
+                self.apply_qkv_bias_and_clamp(
+                    layer,
+                    &mut q_batch,
+                    &mut k_batch,
+                    &mut v_batch,
+                    q_width,
+                    kv_width,
+                    v_width,
+                );
+
+                self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
+                self.apply_rope_attn_factor(&mut q_batch, &mut k_batch, l);
+
+                for b in 0..batch_size {
+                    let pos = positions[b];
+                    let q_row = &mut q_batch[b * q_width..(b + 1) * q_width];
+                    for h in 0..n_heads {
+                        self.apply_rope_head_layer(
+                            &mut q_row[h * head_dim..(h + 1) * head_dim],
+                            pos,
+                            l,
+                        );
+                    }
+                    let k_row = &mut k_batch[b * kv_width..(b + 1) * kv_width];
+                    for h in 0..n_kv_heads {
+                        self.apply_rope_head_layer(
+                            &mut k_row[h * head_dim..(h + 1) * head_dim],
+                            pos,
+                            l,
+                        );
                     }
                 }
-            }
-            let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {
-                projected_batch
-                    .chunks(hidden_dim)
-                    .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                    .collect::<Vec<_>>()
-            } else {
-                projected_batch
-            };
-            for (h, p) in hidden_batch.iter_mut().zip(projected_batch.iter()) {
-                *h += p;
-            }
+                self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
+                // Applied to the whole Q batch at once because it is
+                // elementwise. This path did not apply it at all until the
+                // decoration audit: `attention_scale` reached only
+                // `forward_token`'s CPU arm and `forward_token_paged`, so a
+                // checkpoint carrying one answered at one temperature when
+                // decoded alone and another when batched with its neighbours.
+                self.apply_attention_scale(&mut q_batch);
+                self.apply_attn_temperature(&mut q_batch, q_width, |b| positions[b]);
 
-            // --- MoE FFN block ---
-            let normed2_batch: Vec<f32> = hidden_batch
-                .par_chunks(hidden_dim)
-                .map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
-                .flatten()
-                .collect();
-            let dense = Self::is_dense_layer(layer);
-            let router_logits_batch = if dense || oai.is_some() {
-                Vec::new()
-            } else {
-                layer.moe.router.apply_batch(&normed2_batch, batch_size)
-            };
-            let n_experts = layer.moe.n_experts().max(1);
+                let mut attn_out_batch = vec![0f32; batch_size * out_width];
+                for b in 0..batch_size {
+                    let attn_out = self.push_and_attend(
+                        kv,
+                        b,
+                        l,
+                        layer,
+                        &k_batch[b * kv_width..(b + 1) * kv_width],
+                        &v_batch[b * v_width..(b + 1) * v_width],
+                        &q_batch[b * q_width..(b + 1) * q_width],
+                    );
+                    attn_out_batch[b * out_width..(b + 1) * out_width].copy_from_slice(&attn_out);
+                }
 
-            for b in 0..batch_size {
-                let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                let mut ffn_out = if let Some(oai) = oai {
-                    Self::gpt_oss_ffn(layer, oai, normed2, &self.config, hidden_dim)
-                } else if dense {
-                    Self::run_ffn_block(
-                        layer,
-                        normed2,
-                        &self.config,
-                        hidden_dim,
-                        residency.as_ref().map(|p| p.layer_plan(l)),
-                    )
-                } else {
-                    let router_logits = &router_logits_batch[b * n_experts..(b + 1) * n_experts];
-                    Self::combine_ffn_outputs_for_position(
-                        layer,
-                        normed2,
-                        router_logits,
-                        &self.config,
-                        hidden_dim,
-                        residency.as_ref().map(|p| p.layer_plan(l)),
-                    )
-                };
-                if let Some(post) = &layer.attn.post_ffn_norm {
-                    ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
-                }
-                let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
-                    *h += f;
-                }
-            }
+                let projected_batch = self.attn_out_to_residual_rows(
+                    layer,
+                    &normed_batch,
+                    &mut attn_out_batch,
+                    batch_size,
+                );
+                residual_add(
+                    &mut hidden_batch,
+                    &projected_batch,
+                    self.config.residual_scale,
+                );
+            } // 'attention
+
+            // --- FFN block --- per row, as this body has always run it;
+            // see `BatchedFfnKernels::PerRow`.
+            self.ffn_block_batch(
+                l,
+                layer,
+                &mut hidden_batch,
+                batch_size,
+                oai,
+                residency
+                    .as_ref()
+                    .map(|p| p.layer_plan(self.physical_index(l))),
+                inputs,
+                ffn_block::BatchedFfnKernels::PerRow,
+                skip_rows.as_deref().map(|rows| SkipStream { rows }),
+            );
         }
 
         let final_normed_batch: Vec<f32> = hidden_batch
             .par_chunks(hidden_dim)
-            .map(|h| rms_norm(h, &self.final_norm, self.config.rms_norm_eps))
+            .map(|h| self.final_norm.apply(h, self.config.rms_norm_eps))
             .flatten()
             .collect();
         self.logits_from_flat_hidden(final_normed_batch, batch_size)
@@ -4777,7 +4944,15 @@ mod tests {
         let expected_geglu = block_ref(&gelu);
         let expected_swiglu = block_ref(&silu);
 
-        let got = Decoder::run_ffn_block(layer, &normed2, &decoder.config, hidden_dim, None);
+        let got = Decoder::run_ffn_block(
+            1,
+            layer,
+            &normed2,
+            &decoder.config,
+            hidden_dim,
+            None,
+            ffn_block::RouterOperand::FfnInput,
+        );
         assert_eq!(got.len(), hidden_dim);
         for (i, (a, b)) in got.iter().zip(expected_geglu.iter()).enumerate() {
             assert!(
@@ -4799,9 +4974,7 @@ mod tests {
     fn forward_pass_produces_finite_logits_of_correct_shape() {
         let vocab = 10;
         let decoder = Decoder::new_random_small(tiny_test_config(), 2, vocab);
-        let mut caches: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
         let logits = decoder.forward_token(3, 0, &mut caches);
         assert_eq!(logits.len(), vocab);
@@ -4824,15 +4997,11 @@ mod tests {
     #[test]
     fn gpu_vram_budget_bytes_with_nothing_placed_matches_the_default() {
         let mut decoder = Decoder::new_random_small(tiny_test_config(), 2, 10);
-        let mut caches_default: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches_default: Vec<KvCache> = decoder.config.new_kv_caches();
         let default_logits = decoder.forward_token(3, 0, &mut caches_default);
 
         decoder.gpu_vram_budget_bytes = Some(0);
-        let mut caches_zero_budget: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches_zero_budget: Vec<KvCache> = decoder.config.new_kv_caches();
         let zero_budget_logits = decoder.forward_token(3, 0, &mut caches_zero_budget);
 
         assert_eq!(
@@ -4871,7 +5040,7 @@ mod tests {
         let shared_out_raw = run_expert(
             &normed2,
             &decoder.layers[1].moe.shared_experts[0],
-            GluAct::from(decoder.config.ffn_activation),
+            decoder.config.layer_ffn_acts(1).dense,
         );
         let gate_logit: f32 = gate_vec
             .iter()
@@ -4889,7 +5058,9 @@ mod tests {
         // same experts, same input).
         let router_logits = decoder.layers[1].moe.router.apply(&normed2);
         let ungated_total = Decoder::combine_ffn_outputs_for_position(
+            1,
             &decoder.layers[1],
+            &normed2,
             &normed2,
             &router_logits,
             &decoder.config,
@@ -4898,7 +5069,9 @@ mod tests {
         );
         decoder.layers[1].moe.shared_expert_gate = Some(gate_vec);
         let gated_total = Decoder::combine_ffn_outputs_for_position(
+            1,
             &decoder.layers[1],
+            &normed2,
             &normed2,
             &router_logits,
             &decoder.config,
@@ -4924,9 +5097,7 @@ mod tests {
     #[test]
     fn kv_cache_grows_by_one_position_per_layer_per_step() {
         let decoder = Decoder::new_random_small(tiny_test_config(), 3, 5);
-        let mut caches: Vec<KvCache> = (0..3)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
         decoder.forward_token(0, 0, &mut caches);
         decoder.forward_token(1, 1, &mut caches);
@@ -4940,12 +5111,8 @@ mod tests {
     #[test]
     fn same_token_same_position_is_deterministic() {
         let decoder = Decoder::new_random_small(tiny_test_config(), 2, 8);
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder.config.new_kv_caches();
+        let mut caches_b: Vec<KvCache> = decoder.config.new_kv_caches();
 
         let out_a = decoder.forward_token(4, 0, &mut caches_a);
         let out_b = decoder.forward_token(4, 0, &mut caches_b);
@@ -4955,9 +5122,7 @@ mod tests {
     #[test]
     fn multi_step_decode_stays_finite_across_positions() {
         let decoder = Decoder::new_random_small(tiny_test_config(), 2, 8);
-        let mut caches: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
         for pos in 0..16 {
             let logits = decoder.forward_token(pos % 8, pos, &mut caches);
@@ -4996,7 +5161,7 @@ mod tests {
             // Smaller than the decode length below, so the window really
             // drops positions rather than degenerating to full causal.
             cfg.sliding_window = Some(2);
-            cfg.swa_pattern = None;
+            cfg.swa_layers = crate::swa_layers::SwaLayers::All;
             cfg
         };
         let softcapped = || {
@@ -5019,7 +5184,7 @@ mod tests {
         let alternating = || {
             let mut cfg = tiny_test_config();
             cfg.sliding_window = Some(2);
-            cfg.swa_pattern = Some(2);
+            cfg.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
             cfg
         };
 
@@ -5115,19 +5280,22 @@ mod tests {
         }
     }
 
-    /// The whole gpt-oss side table: attention sinks, the O bias, the
-    /// router bias and the per-expert biases `gpt_oss_ffn` reads.
+    /// The whole gpt-oss graph: attention sinks on every layer's
+    /// attention weights, and the side table -- the O bias, the router
+    /// bias and the per-expert biases `gpt_oss_ffn` reads.
     fn with_gpt_oss_graph(d: &mut Decoder) {
         let hidden = d.config.hidden_dim;
         let n_heads = d.config.n_heads;
         let n_experts = d.config.moe.n_experts;
         let ffn = d.config.moe.expert_ffn_dim;
         let n_layers = d.layers.len();
+        for (l, layer) in d.layers.iter_mut().enumerate() {
+            layer.attn.sinks = Some((0..n_heads).map(|h| 0.1 + (l + h) as f32 * 0.05).collect());
+            layer.attn.o_bias = Some((0..hidden).map(|j| 0.02 * (j as f32 - 8.0)).collect());
+        }
         d.gpt_oss = Some(GptOssWeights {
             layers: (0..n_layers)
-                .map(|l| GptOssLayer {
-                    attn_sinks: (0..n_heads).map(|h| 0.1 + (l + h) as f32 * 0.05).collect(),
-                    o_bias: (0..hidden).map(|j| 0.02 * (j as f32 - 8.0)).collect(),
+                .map(|_| GptOssLayer {
                     router_bias: (0..n_experts).map(|e| 0.03 * e as f32).collect(),
                     expert_bias: (0..n_experts)
                         .map(|e| ferrox_moe::ExpertBias {
@@ -5157,9 +5325,7 @@ mod tests {
 
         let mut seq_decoder = Decoder::new_random_small(config.clone(), n_layers, vocab);
         prepare(&mut seq_decoder);
-        let mut seq_caches: Vec<KvCache> = (0..n_layers)
-            .map(|_| KvCache::new(seq_decoder.config.n_kv_heads, seq_decoder.config.head_dim))
-            .collect();
+        let mut seq_caches: Vec<KvCache> = seq_decoder.config.new_kv_caches();
         let sequential: Vec<Vec<f32>> = tokens
             .iter()
             .enumerate()
@@ -5170,14 +5336,7 @@ mod tests {
         // is deterministic, so this is a like-for-like comparison.
         let mut batch_decoder = Decoder::new_random_small(config, n_layers, vocab);
         prepare(&mut batch_decoder);
-        let mut batch_caches: Vec<KvCache> = (0..n_layers)
-            .map(|_| {
-                KvCache::new(
-                    batch_decoder.config.n_kv_heads,
-                    batch_decoder.config.head_dim,
-                )
-            })
-            .collect();
+        let mut batch_caches: Vec<KvCache> = batch_decoder.config.new_kv_caches();
         let batched = batch_decoder.forward_batch(&tokens, 0, &mut batch_caches);
 
         assert_eq!(sequential.len(), batched.len());
@@ -5258,9 +5417,7 @@ mod tests {
         let prompt = [3usize, 1, 4, 1, 5];
         let continuation = [9usize, 2, 6, 5];
 
-        let mut caches: Vec<KvCache> = (0..n_layers)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let mut plain = vec![decoder.forward_batch_last(&prompt, 0, &mut caches)];
         for (i, &tok) in continuation.iter().enumerate() {
             plain.push(decoder.forward_token(tok, prompt.len() + i, &mut caches));
@@ -5318,7 +5475,7 @@ mod tests {
         let windowed = || {
             let mut cfg = tiny_test_config();
             cfg.sliding_window = Some(2);
-            cfg.swa_pattern = None;
+            cfg.swa_layers = crate::swa_layers::SwaLayers::All;
             cfg
         };
         let scaled_and_capped = || {
@@ -5331,7 +5488,7 @@ mod tests {
         let alternating = || {
             let mut cfg = tiny_test_config();
             cfg.sliding_window = Some(2);
-            cfg.swa_pattern = Some(2);
+            cfg.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
             cfg
         };
 
@@ -5596,9 +5753,7 @@ mod tests {
         prepare(&mut decoder);
         let decoder = decoder;
 
-        let mut caches: Vec<KvCache> = (0..n_layers)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let steps = [3usize, 5, 7, 2, 9, 1];
         let mut plain_logits = Vec::new();
         for (pos, &tok) in steps.iter().enumerate() {
@@ -5657,9 +5812,7 @@ mod tests {
         let tokens = [1usize, 3, 5, 2, 7];
 
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         let sequential: Vec<Vec<f32>> = tokens
             .iter()
             .enumerate()
@@ -5671,9 +5824,7 @@ mod tests {
         // this is a fair like-for-like comparison against a fresh
         // cache rather than reusing decoder_a's now-mutated cache.
         let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         let batched = decoder_b.forward_batch(&tokens, 0, &mut caches_b);
 
         assert_eq!(batched.len(), sequential.len());
@@ -5701,15 +5852,11 @@ mod tests {
         let tokens = vec![1usize, 4, 7, 2, 9];
 
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         let all_rows = decoder_a.forward_batch(&tokens, 0, &mut caches_a);
 
         let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         let last = decoder_b.forward_batch_last(&tokens, 0, &mut caches_b);
 
         let expected = all_rows.last().expect("one row per prompt token");
@@ -5732,9 +5879,7 @@ mod tests {
         }
 
         // Empty prompt is the degenerate case both paths must survive.
-        let mut caches_c: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_c: Vec<KvCache> = decoder_b.config.new_kv_caches();
         assert!(decoder_b
             .forward_batch_last(&[], 0, &mut caches_c)
             .is_empty());
@@ -5763,7 +5908,7 @@ mod tests {
             {
                 let mut c = tiny_test_config();
                 c.sliding_window = Some(2);
-                c.swa_pattern = None;
+                c.swa_layers = crate::swa_layers::SwaLayers::All;
                 c
             },
             {
@@ -5783,9 +5928,7 @@ mod tests {
             let mut contiguous: Vec<Vec<KvCache>> = histories
                 .iter()
                 .map(|h| {
-                    let mut caches: Vec<KvCache> = (0..n_layers)
-                        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-                        .collect();
+                    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
                     for (pos, &tok) in h.iter().enumerate() {
                         decoder.forward_token(tok, pos, &mut caches);
                     }
@@ -5852,9 +5995,7 @@ mod tests {
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
         let mut independent_logits: Vec<Vec<f32>> = Vec::new();
         for history in seq_histories.iter() {
-            let mut caches: Vec<KvCache> = (0..2)
-                .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-                .collect();
+            let mut caches: Vec<KvCache> = decoder_a.config.new_kv_caches();
             let mut logits = Vec::new();
             for (pos, &tok) in history.iter().enumerate() {
                 logits = decoder_a.forward_token(tok, pos, &mut caches);
@@ -5867,11 +6008,7 @@ mod tests {
         let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
         let mut per_seq_caches: Vec<Vec<KvCache>> = seq_histories
             .iter()
-            .map(|_| {
-                (0..2)
-                    .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-                    .collect()
-            })
+            .map(|_| decoder_b.config.new_kv_caches())
             .collect();
 
         // Feed every sequence's prefix (all but its last token)
@@ -6016,11 +6153,7 @@ mod tests {
             cfg.attention_scale = Some(8.0);
             cfg
         };
-        let fresh_caches = |d: &Decoder| -> Vec<KvCache> {
-            (0..d.layers.len())
-                .map(|_| KvCache::new(d.config.n_kv_heads, d.config.head_dim))
-                .collect()
-        };
+        let fresh_caches = |d: &Decoder| -> Vec<KvCache> { d.config.new_kv_caches() };
 
         // Same seed -> identical weights, so the only difference between
         // these three decoders is the config field under test.
@@ -6087,9 +6220,7 @@ mod tests {
             let mut per_seq: Vec<Vec<KvCache>> = histories
                 .iter()
                 .map(|h| {
-                    let mut caches: Vec<KvCache> = (0..n_layers)
-                        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-                        .collect();
+                    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
                     for (pos, &tok) in h.iter().enumerate() {
                         decoder.forward_token(tok, pos, &mut caches);
                     }
@@ -6232,11 +6363,33 @@ mod tests {
         );
 
         // A non-softmax gate: the GPU kernel implements softmax only.
-        let mut sigmoid = base;
+        let mut sigmoid = base.clone();
         sigmoid.moe.gating = ferrox_moe::GatingFunction::Sigmoid;
         assert!(
             !Decoder::gpu_router_matches_host_routing(plain_layer, &sigmoid),
             "a non-softmax gate must make the layer ineligible for the GPU router"
+        );
+
+        // A router that reads the raw layer input (`smallthinker`):
+        // every GPU router reads `normed2`, so the SAME logits routed
+        // the same way are still the wrong experts. `agrees` cannot see
+        // this one -- it compares two routers over one logit vector --
+        // which is exactly why the predicate has to.
+        let mut raw = base.clone();
+        raw.router_input = crate::router_input::RouterInput::RawLayerInput;
+        assert!(
+            !Decoder::gpu_router_matches_host_routing(plain_layer, &raw),
+            "a raw-layer-input router must make the layer ineligible for the GPU router"
+        );
+
+        // A router (and experts) reading the normed layer input
+        // (`arctic`): the same predicate, for the same reason, and the
+        // experts would read the wrong tensor too.
+        let mut branch = base;
+        branch.router_input = crate::router_input::RouterInput::NormedLayerInput;
+        assert!(
+            !Decoder::gpu_router_matches_host_routing(plain_layer, &branch),
+            "a normed-layer-input branch must make the layer ineligible for the GPU router"
         );
     }
 
@@ -6261,9 +6414,7 @@ mod tests {
             layer.attn.q_norm = Some((0..q_width).map(|i| 1.0 + i as f32 * 0.1).collect());
             layer.attn.k_norm = Some((0..kv_width).map(|i| 0.5 + i as f32 * 0.05).collect());
         }
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         let sequential: Vec<Vec<f32>> = tokens
             .iter()
             .enumerate()
@@ -6275,9 +6426,7 @@ mod tests {
             layer.attn.q_norm = Some((0..q_width).map(|i| 1.0 + i as f32 * 0.1).collect());
             layer.attn.k_norm = Some((0..kv_width).map(|i| 0.5 + i as f32 * 0.05).collect());
         }
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         let batched = decoder_b.forward_batch(&tokens, 0, &mut caches_b);
 
         assert_eq!(batched.len(), sequential.len());
@@ -6315,12 +6464,8 @@ mod tests {
             layer.attn.k_norm = Some(vec![2.0; kv_width]);
         }
 
-        let mut caches_a: Vec<KvCache> = (0..1)
-            .map(|_| KvCache::new(without_norm.config.n_kv_heads, without_norm.config.head_dim))
-            .collect();
-        let mut caches_b: Vec<KvCache> = (0..1)
-            .map(|_| KvCache::new(with_norm.config.n_kv_heads, with_norm.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = without_norm.config.new_kv_caches();
+        let mut caches_b: Vec<KvCache> = with_norm.config.new_kv_caches();
 
         let mut out_a = Vec::new();
         let mut out_b = Vec::new();
@@ -6368,9 +6513,7 @@ mod tests {
             layer.attn.k_bias = Some((0..kv_width).map(|i| -0.2 + i as f32 * 0.03).collect());
             layer.attn.v_bias = Some((0..kv_width).map(|i| 0.1 - i as f32 * 0.01).collect());
         }
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         let sequential: Vec<Vec<f32>> = tokens
             .iter()
             .enumerate()
@@ -6383,9 +6526,7 @@ mod tests {
             layer.attn.k_bias = Some((0..kv_width).map(|i| -0.2 + i as f32 * 0.03).collect());
             layer.attn.v_bias = Some((0..kv_width).map(|i| 0.1 - i as f32 * 0.01).collect());
         }
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         let batched = decoder_b.forward_batch(&tokens, 0, &mut caches_b);
 
         assert_eq!(batched.len(), sequential.len());
@@ -6415,12 +6556,8 @@ mod tests {
             layer.attn.v_bias = Some(vec![0.5; kv_width]);
         }
 
-        let mut caches_a: Vec<KvCache> = (0..1)
-            .map(|_| KvCache::new(without_bias.config.n_kv_heads, without_bias.config.head_dim))
-            .collect();
-        let mut caches_b: Vec<KvCache> = (0..1)
-            .map(|_| KvCache::new(with_bias.config.n_kv_heads, with_bias.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = without_bias.config.new_kv_caches();
+        let mut caches_b: Vec<KvCache> = with_bias.config.new_kv_caches();
 
         let mut out_a = Vec::new();
         let mut out_b = Vec::new();
@@ -6445,17 +6582,13 @@ mod tests {
         let tokens = [2usize, 4, 6];
 
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, 8);
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         for (pos, &t) in tokens.iter().enumerate() {
             decoder_a.forward_token(t, pos, &mut caches_a);
         }
 
         let decoder_b = Decoder::new_random_small(cfg, 2, 8);
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         decoder_b.forward_batch(&tokens, 0, &mut caches_b);
 
         for (ca, cb) in caches_a.iter().zip(caches_b.iter()) {
@@ -6483,9 +6616,7 @@ mod tests {
     fn dense_layer_forward_pass_produces_finite_logits_of_correct_shape() {
         let vocab = 10;
         let decoder = Decoder::new_random_small(tiny_dense_test_config(), 2, vocab);
-        let mut caches: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
         let logits = decoder.forward_token(3, 0, &mut caches);
         assert_eq!(logits.len(), vocab);
@@ -6502,9 +6633,7 @@ mod tests {
         let tokens = [1usize, 3, 5, 2, 7];
 
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         let sequential: Vec<Vec<f32>> = tokens
             .iter()
             .enumerate()
@@ -6512,9 +6641,7 @@ mod tests {
             .collect();
 
         let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         let batched = decoder_b.forward_batch(&tokens, 0, &mut caches_b);
 
         assert_eq!(batched.len(), sequential.len());
@@ -6536,9 +6663,7 @@ mod tests {
         // depend on this being real for every model shape, not just
         // genuinely-MoE ones.
         let decoder = Decoder::new_random_small(tiny_dense_test_config(), 1, 8);
-        let mut caches: Vec<KvCache> = (0..1)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
         decoder.forward_token(0, 0, &mut caches);
         decoder.forward_token(1, 1, &mut caches);
@@ -6552,9 +6677,7 @@ mod tests {
     #[test]
     fn forward_batch_with_empty_tokens_returns_empty() {
         let decoder = Decoder::new_random_small(tiny_test_config(), 2, 8);
-        let mut caches: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let out = decoder.forward_batch(&[], 0, &mut caches);
         assert!(out.is_empty());
     }
@@ -6569,17 +6692,13 @@ mod tests {
         let cfg = tiny_test_config();
 
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, 8);
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         decoder_a.forward_token(1, 0, &mut caches_a);
         decoder_a.forward_token(3, 1, &mut caches_a);
         let seq_next = decoder_a.forward_token(5, 2, &mut caches_a);
 
         let decoder_b = Decoder::new_random_small(cfg, 2, 8);
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         decoder_b.forward_token(1, 0, &mut caches_b);
         let batch_next = decoder_b.forward_batch(&[3, 5], 1, &mut caches_b);
 
@@ -6600,9 +6719,7 @@ mod tests {
     fn placement_plan_reflects_real_observed_expert_activations() {
         let cfg = tiny_test_config(); // 6 experts, top-2 active/token
         let decoder = Decoder::new_random_small(cfg, 2, 16);
-        let mut caches: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
         let n_calls = 20;
         for pos in 0..n_calls {
@@ -6713,6 +6830,527 @@ mod metal_rope_tests {
         assert!(!supported(odd), "odd n_rot must keep the model off Metal");
     }
 
+    /// A `residual_scale` keeps every fused Metal path off the model,
+    /// through ONE predicate the four eligibility checks share.
+    ///
+    /// Granite multiplies both branch outputs before every residual add.
+    /// The fused launches -- dense decode, resident MoE decode, and both
+    /// prefill stacks -- fold the residual add in on device with no
+    /// uniform for a multiplier, so a Granite layer served by any of
+    /// them would be scaled by the host bodies and not by the GPU: the
+    /// same weights answering differently depending on which backend
+    /// took the token. That is exactly what `attention_scale` is fenced
+    /// off for next door, and this repo has already watched the GPU
+    /// router's eligibility check drift four ways when it was four
+    /// spellings instead of one.
+    ///
+    /// Only reachable in a `--features metal` build, which is where the
+    /// fence exists at all.
+    #[test]
+    fn a_residual_scale_keeps_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+
+        let mut scaled = plain;
+        scaled.residual_scale = Some(0.22);
+        let d = Decoder::new_random_small(scaled.clone(), 1, 32);
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a residual multiplier no Metal kernel applies must refuse the fused attention"
+        );
+        assert!(
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &scaled, false),
+            "...and the prefill dense stack"
+        );
+        assert!(
+            !Decoder::metal_can_serve_model(&scaled, false),
+            "the shared predicate is what all four read"
+        );
+    }
+
+    /// A `clamp_kqv` keeps every fused Metal path off the model too,
+    /// through the same predicate.
+    ///
+    /// The fused launches apply the QKV bias inside their kernels via
+    /// `AttnExtras` and clamp nothing, while the host bodies clamp
+    /// after the bias (`decoder/qkv_bias.rs`). A DBRX layer served by a
+    /// fused launch would therefore run unclamped projections -- the
+    /// disagreement the residual-scale fence exists for, on a different
+    /// scalar. Only reachable in a `--features metal` build.
+    #[test]
+    fn a_qkv_clamp_keeps_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+
+        let mut clamped = plain;
+        clamped.clamp_kqv = Some(8.0);
+        let d = Decoder::new_random_small(clamped.clone(), 1, 32);
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a clamp no Metal kernel applies must refuse the fused attention"
+        );
+        assert!(
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &clamped, false),
+            "...and the prefill dense stack"
+        );
+        assert!(!Decoder::metal_can_serve_model(&clamped, false));
+    }
+
+    /// Per-layer shapes keep every fused Metal path off the model,
+    /// through the same predicate.
+    ///
+    /// The fused launches take ONE `n_heads` argument and one
+    /// `MetalKvBuffers` geometry per run of layers, and the Metal KV
+    /// plane is sized once from the scalars. A deci or openelm layer
+    /// served by any of them would be projected and cached at another
+    /// layer's width -- the disagreement the two fences above exist
+    /// for, on a shape rather than a scalar. Only reachable in a
+    /// `--features metal` build.
+    #[test]
+    fn per_layer_shapes_keep_the_model_off_every_fused_metal_path() {
+        use crate::layer_shapes::{AttnShape, LayerShape, LayerShapes};
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+
+        let mut shaped = plain;
+        shaped.layer_shapes = LayerShapes::PerLayer(vec![LayerShape {
+            attention: AttnShape::Gqa {
+                n_heads: shaped.n_heads,
+                n_kv_heads: shaped.n_kv_heads,
+            },
+            ffn_dim: shaped.moe.expert_ffn_dim,
+        }]);
+        let d = Decoder::new_random_small(shaped.clone(), 1, 32);
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a per-layer table, even one whose single entry agrees with the scalars, must \
+             refuse the fused attention: the stacks hold one geometry"
+        );
+        assert!(
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &shaped, false),
+            "...and the prefill dense stack"
+        );
+        assert!(!Decoder::metal_can_serve_model(&shaped, false));
+    }
+
+    /// A per-position attention temperature keeps every fused Metal
+    /// path off the model, through the same predicate.
+    ///
+    /// No fused launch takes a per-token Q scale: the host bodies
+    /// multiply Q by `log(floor(pos / floor) + 1) * scale + 1` after
+    /// RoPE (`crate::attn_temperature`), and a Ministral-3 layer served
+    /// by a fused launch would attend at temperature 1 while its
+    /// neighbours on the host stepped with position -- the same
+    /// disagreement the three fences above exist for. Only reachable
+    /// in a `--features metal` build.
+    #[test]
+    fn a_per_position_temperature_keeps_the_model_off_every_fused_metal_path() {
+        use crate::attn_temperature::AttnTemperature;
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+
+        let mut tempered = plain;
+        tempered.attn_temperature = Some(AttnTemperature {
+            scale: 0.5,
+            floor_scale: std::num::NonZeroU32::new(2).unwrap(),
+            offset: 0.0,
+        });
+        let d = Decoder::new_random_small(tempered.clone(), 1, 32);
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a per-position Q scale no Metal kernel applies must refuse the fused attention"
+        );
+        assert!(
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &tempered, false),
+            "...and the prefill dense stack"
+        );
+        assert!(!Decoder::metal_can_serve_model(&tempered, false));
+    }
+
+    /// BitNet's two inner norms keep the model off every fused Metal
+    /// path, through the same predicate, and a layer that carries the
+    /// attention one off the per-layer fused attention through the
+    /// exhaustive destructure in `metal_attn_view`.
+    ///
+    /// No fused kernel norms between the V sum and `wo` or between the
+    /// activation and `down`; a BitNet layer served by one would skip
+    /// both norms at full speed (`crate::sub_norms`). Only reachable in
+    /// a `--features metal` build.
+    /// A parallel-residual model (`crate::parallel_residual`) stays off
+    /// every fused Metal path: each of them bakes the pre-FFN norm over
+    /// the POST-ATTENTION residual into its kernel, and a parallel layer
+    /// norms the layer INPUT. The model-level flag is what the
+    /// predicate reads, because the per-layer fact lives on
+    /// `MoeWeights` and the two config-only callers cannot see it. Only
+    /// reachable in a `--features metal` build.
+    #[test]
+    fn a_parallel_residual_keeps_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+        let mut parallel = plain;
+        parallel.parallel_residual = true;
+        let d = Decoder::new_random_small(parallel.clone(), 1, 32);
+        assert!(!d.layer_supports_metal_attn(&d.layers[0]));
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &parallel,
+            false
+        ));
+        assert!(!Decoder::metal_can_serve_model(&parallel, false));
+    }
+
+    #[test]
+    fn the_inner_norms_keep_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+
+        let mut sub_normed = plain;
+        sub_normed.block_sub_norms = true;
+        let d = Decoder::new_random_small(sub_normed.clone(), 1, 32);
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a norm between attention and `wo` that no Metal kernel applies must refuse the \
+             fused attention"
+        );
+        assert!(
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &sub_normed, false),
+            "...and the prefill dense stack"
+        );
+        assert!(!Decoder::metal_can_serve_model(&sub_normed, false));
+
+        // Independently of the config: the tensor on the layer is enough
+        // to lose the per-layer fused attention's view of it.
+        let mut d = Decoder::new_random_small(plain_config_with_metal_view(), 1, 32);
+        assert!(d.metal_attn_view(&d.layers[0]).is_some());
+        d.layers[0].attn.attn_sub_norm = Some(vec![1.0; d.config.hidden_dim]);
+        assert!(d.metal_attn_view(&d.layers[0]).is_none());
+    }
+
+    /// A V head width that differs from K's, and a scale after `wo`,
+    /// each keep the model off every fused Metal path through the same
+    /// predicate: every fused launch takes ONE head width for its KV
+    /// buffers, its attention tile and its `wo` fold, and none scales
+    /// after the fold (`crate::kv_head_dims`, `crate::attn_value_scale`).
+    /// Only reachable in a `--features metal` build.
+    #[test]
+    fn a_split_kv_head_width_or_a_value_scale_keeps_the_model_off_every_fused_metal_path() {
+        let plain = plain_config_with_metal_view();
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(d.layer_supports_metal_attn(&d.layers[0]), "the premise");
+
+        let mut split = plain.clone();
+        split.v_head_dim = Some(plain.head_dim / 2);
+        assert!(!Decoder::metal_can_serve_model(&split, false));
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &split,
+            false
+        ));
+
+        let mut scaled = plain;
+        scaled.attn_value_scale = Some(0.707);
+        assert!(!Decoder::metal_can_serve_model(&scaled, false));
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &scaled,
+            false
+        ));
+    }
+
+    /// A looped model keeps off every fused Metal path: each launch
+    /// indexes weights and KV buffers with one `l`, and a looped model's
+    /// logical layers outnumber its weights (`crate::layer_loops`). Only
+    /// reachable in a `--features metal` build.
+    #[test]
+    fn a_layer_loop_keeps_the_model_off_every_fused_metal_path() {
+        let plain = plain_config_with_metal_view();
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(d.layer_supports_metal_attn(&d.layers[0]), "the premise");
+        let mut looped = plain;
+        looped.layer_loops = Some(crate::layer_loops::LayerLoops {
+            n_phys: 1,
+            n_loops: 2,
+            skip_loop_final_norm: false,
+        });
+        assert!(!Decoder::metal_can_serve_model(&looped, false));
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &looped,
+            false
+        ));
+    }
+
+    /// Talkie's facts keep the model off every fused Metal path: the
+    /// skip stream and the per-head scalar QK gain through the model
+    /// predicate, and a projection gain on a layer through the
+    /// exhaustive destructure and the dense-FFN predicate
+    /// (`crate::skip_stream`, `crate::weight_scales`). Only reachable in
+    /// a `--features metal` build.
+    #[test]
+    fn talkie_s_facts_keep_the_model_off_every_fused_metal_path() {
+        let plain = plain_config_with_metal_view();
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(d.layer_supports_metal_attn(&d.layers[0]), "the premise");
+
+        let mut skip = plain.clone();
+        skip.skip_stream = true;
+        assert!(!Decoder::metal_can_serve_model(&skip, false));
+
+        let mut scalar = plain.clone();
+        scalar.qk_norm_style = crate::capability::QkNormStyle::PerHeadScalar;
+        assert!(!Decoder::metal_can_serve_model(&scalar, false));
+
+        let mut d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(d.metal_attn_view(&d.layers[0]).is_some());
+        d.layers[0].attn.o_scale = Some(1.5);
+        assert!(d.metal_attn_view(&d.layers[0]).is_none());
+
+        let mut d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &plain,
+            false
+        ));
+        d.layers[0].moe.down_scale = Some(0.5);
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &plain,
+            false
+        ));
+        assert!(!Decoder::layer_supports_metal_dense_ffn(&d.layers[0]));
+    }
+
+    fn plain_config_with_metal_view() -> ModelConfig {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        plain
+    }
+
+    /// An FFN activation no fused kernel spells keeps the model off
+    /// every fused Metal path, through the same predicate.
+    ///
+    /// Six launch sites used to derive the kernels' `gelu: bool` as
+    /// `!is_swiglu()`, which would have run the ungated ReLU-squared FFN
+    /// (`arcee`) as GELU; `GluAct::fused_kernel_gelu_flag` is `None`
+    /// there now, and this is the fence that keeps a layer from being
+    /// half-served. Only reachable in a `--features metal` build.
+    #[test]
+    fn an_activation_no_kernel_spells_keeps_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        plain.ffn_activation = crate::config::FfnActivation::Swiglu;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(d.layer_supports_metal_attn(&d.layers[0]));
+
+        let mut ungated = plain;
+        ungated.ffn_activation = crate::config::FfnActivation::ReluSqr;
+        let d = Decoder::new_random_small(ungated.clone(), 1, 32);
+        assert!(!d.layer_supports_metal_attn(&d.layers[0]));
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &ungated,
+            false
+        ));
+        assert!(!Decoder::metal_can_serve_model(&ungated, false));
+        assert_eq!(
+            ungated
+                .model_ffn_act()
+                .and_then(GluAct::fused_kernel_gelu_flag),
+            None
+        );
+
+        // The two PARAMETERISED activations answer no whole-model
+        // activation at all, and the two-width rotary is a fourth thing
+        // the fused stacks cannot take; each keeps the model off alone.
+        let mut xielu = ungated.clone();
+        xielu.ffn_activation =
+            crate::config::FfnActivation::Xielu(crate::act_layers::XieluLayers::new(vec![
+                ferrox_moe::XieluParams::from_gguf(
+                    0.8, 0.8, 0.5, -1e-6
+                );
+                xielu.n_layers
+            ]));
+        assert_eq!(xielu.model_ffn_act(), None);
+        assert!(!Decoder::metal_can_serve_model(&xielu, false));
+        let mut clamped = ungated.clone();
+        clamped.ffn_activation =
+            crate::config::FfnActivation::SwigluClamped(crate::act_layers::SwigluClamps::new(
+                vec![0.0; clamped.n_layers],
+                vec![7.0; clamped.n_layers],
+            ));
+        assert_eq!(clamped.model_ffn_act(), None);
+        assert!(!Decoder::metal_can_serve_model(&clamped, false));
+        let mut two_widths = ungated;
+        two_widths.ffn_activation = crate::config::FfnActivation::Swiglu;
+        assert!(Decoder::metal_can_serve_model(&two_widths, false));
+        two_widths.sliding_window = Some(4);
+        two_widths.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
+        two_widths.n_layers = 2;
+        two_widths.rope_dim_swa = Some(two_widths.head_dim / 2);
+        assert!(two_widths.rope_dim_varies_by_layer());
+        assert!(!Decoder::metal_can_serve_model(&two_widths, false));
+    }
+
+    /// An attention output gate or a set of attention sinks keeps THAT
+    /// LAYER off every fused Metal attention launch, through the one
+    /// exhaustive destructure in `metal_attn_view`.
+    ///
+    /// Both sit between the softmax and `wo`, which the fused kernels
+    /// run with no host round-trip; a launch that ignored either would
+    /// answer differently from the host bodies for the same weights.
+    /// The gate is `afmoe` / `laguna` (`crate::attn_gate`); the sinks
+    /// used to be refused by the gpt-oss NAME, and this pins that they
+    /// are refused by the TENSOR now, on a model that is not gpt-oss.
+    /// Only reachable in a `--features metal` build.
+    #[test]
+    fn an_output_gate_or_attention_sinks_keep_the_layer_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let mut d = Decoder::new_random_small(plain.clone(), 2, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+        assert!(d.metal_attn_view(&d.layers[1]).is_some());
+
+        // A gate on layer 0 only.
+        let (n_heads, hidden) = (plain.n_heads, plain.hidden_dim);
+        d.layers[0].attn.output_gate = Some(crate::attn_gate::AttnGate {
+            proj: WeightMatrix::F32(Tensor::new(
+                vec![0.1; n_heads * hidden],
+                vec![n_heads, hidden],
+            )),
+            act: crate::attn_gate::GateAct::Sigmoid,
+            width: crate::attn_gate::GateWidth::PerHead,
+        });
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a gate no Metal kernel applies must refuse the fused attention"
+        );
+        assert!(d.metal_attn_view(&d.layers[0]).is_none());
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[1]),
+            "the fence is per layer: the ungated layer is still served"
+        );
+
+        // Sinks on layer 1, with `gpt_oss` still `None`.
+        d.layers[1].attn.sinks = Some(vec![0.5; n_heads]);
+        assert!(d.gpt_oss.is_none());
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[1]),
+            "sinks are refused by the tensor, not by the gpt-oss name"
+        );
+        assert!(d.metal_attn_view(&d.layers[1]).is_none());
+    }
+
+    /// A LoRA adapter keeps the WHOLE model off every fused Metal
+    /// launch, through the shared predicate, and an adapted matrix has
+    /// no raw-bytes Metal descriptor at all -- so a stack that somehow
+    /// asked for one anyway could not build it. The delta lives inside
+    /// `WeightMatrix::Adapted` and is served by that type's methods;
+    /// the stacks read weight bytes past those methods.
+    /// Only reachable in a `--features metal` build.
+    #[test]
+    fn a_lora_adapter_keeps_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let mut d = Decoder::new_random_small(plain.clone(), 2, 32);
+        assert!(Decoder::metal_can_serve_model(&plain, false));
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+        assert!(Decoder::metal_matvec_launch(&d.layers[0].attn.q_proj).is_some());
+
+        // The fact the predicate reads.
+        assert!(!Decoder::metal_can_serve_model(&plain, true));
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &plain,
+            true
+        ));
+
+        // The variant, on one matrix: no descriptor, so no launch.
+        let (rows, cols) = (
+            d.layers[0].attn.q_proj.rows(),
+            d.layers[0].attn.q_proj.cols(),
+        );
+        let scale = ferrox_core::weight_matrix::LoraScale::new(1.0);
+        d.layers[0].attn.q_proj.attach_lora(
+            ferrox_core::weight_matrix::LoraDelta::new(
+                vec![0.01; 2 * cols],
+                vec![0.01; rows * 2],
+                2,
+                rows,
+                cols,
+                0.0,
+                scale.clone(),
+            )
+            .unwrap(),
+        );
+        assert!(Decoder::metal_matvec_launch(&d.layers[0].attn.q_proj).is_none());
+        assert!(d.layers[0].attn.q_proj.mul_mm_sg_launch().is_none());
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a layer whose projection has no Metal descriptor is not served"
+        );
+
+        // The list, on the decoder: what every eligibility check asks.
+        d.lora_adapters.push(crate::lora_attach::LoraAttached {
+            path: "x.gguf".into(),
+            alpha: 0.0,
+            task_name: String::new(),
+            prompt_prefix: String::new(),
+            scale,
+            n_tensors: 1,
+        });
+        assert!(d.lora_attached());
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[1]),
+            "the fence is the whole model, not the adapted layer alone"
+        );
+    }
+
     /// A Gemma-3-4B-shaped config: `rope_scaling {linear, factor 8}`
     /// folded into the full-attention layers' divisors, nothing on the
     /// sliding ones, `sliding_window_pattern = 6` last-dense.
@@ -6723,7 +7361,7 @@ mod metal_rope_tests {
         cfg.rope_theta = 1_000_000.0;
         cfg.rope_theta_swa = Some(10_000.0);
         cfg.sliding_window = Some(4);
-        cfg.swa_pattern = Some(6);
+        cfg.swa_layers = crate::swa_layers::SwaLayers::period(6, false);
         cfg.rope_freqs = Some(crate::config::RopeFreqs {
             full: vec![8.0; 4],
             swa: Some(vec![1.0; 4]),
@@ -6755,22 +7393,58 @@ mod metal_rope_tests {
         let decoder = Decoder::new_random_small(cfg, 6, 32);
 
         for il in 0..decoder.layers.len() {
-            let (theta, ff) = decoder.config.layer_rope(il);
-            let sent = decoder.metal_layer_rope(il);
-            assert_eq!(sent.theta, theta, "layer {il} base");
-            assert_eq!(sent.freq_factors, ff, "layer {il} divisors");
+            let rope = decoder
+                .config
+                .layer_rope(il)
+                .expect("every layer rotates here");
+            let sent = decoder
+                .metal_layer_rope(il)
+                .expect("so every layer is handed a rope");
+            assert_eq!(sent.theta, rope.theta, "layer {il} base");
+            assert_eq!(sent.freq_factors, rope.freq_factors, "layer {il} divisors");
         }
 
         // Not vacuous: with `swa_pattern = 6` last-dense, layers 0..=4
         // slide and layer 5 does not, so the run really does hold two
         // different answers.
-        let sliding = decoder.metal_layer_rope(0);
-        let full = decoder.metal_layer_rope(5);
+        let sliding = decoder.metal_layer_rope(0).unwrap();
+        let full = decoder.metal_layer_rope(5).unwrap();
         assert_eq!(sliding.freq_factors, Some(&[1.0f32; 4][..]));
         assert_eq!(full.freq_factors, Some(&[8.0f32; 4][..]));
         assert_ne!(
             sliding, full,
             "a run of layers that all rope alike proves nothing here"
+        );
+    }
+
+    /// The THIRD half of the answer: a layer llama.cpp does not rotate
+    /// reaches the Metal stacks as `None`, from the same accessor the
+    /// CPU bodies read, and `layer_needs_metal_stack` sees it through
+    /// the same `Option` -- so the per-layer launches, which always
+    /// rope, can never be handed such a layer.
+    #[test]
+    fn an_unrotated_layer_is_handed_no_rope_and_routed_to_the_stack() {
+        let mut cfg = gemma3_4b_shaped_config();
+        // Gemma-3's own graph rotates everything; borrow its shape and
+        // give it EXAONE-4 32B's rule so the full-attention layer 5 is
+        // the one that does not rotate.
+        cfg.rope_layers = crate::rope_layers::RopeLayers::SlidingOnly;
+        let decoder = Decoder::new_random_small(cfg, 6, 32);
+
+        for il in 0..5 {
+            assert!(
+                decoder.metal_layer_rope(il).is_some(),
+                "sliding layer {il} rotates"
+            );
+        }
+        assert_eq!(
+            decoder.metal_layer_rope(5),
+            None,
+            "the full-attention layer does not"
+        );
+        assert!(
+            decoder.layer_needs_metal_stack(&decoder.layers[5], 5),
+            "an unrotated layer must go to the fused stack, which implements `None`"
         );
     }
 }

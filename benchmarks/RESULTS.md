@@ -1,268 +1,82 @@
-# Results vs llama.cpp
-
-**Gap** = `llama.cpp / ferrox`, same host, same GGUF, same backend.
-**Below 1.0 means ferrox is faster.** 🟢 better · ⚪ within ~5% · 🔴 slower.
-
-**Two generated sections are behind the code.** Both are left as
-measured rather than adjusted, because a hand-edited receipt is not a
-measurement; re-running the suite replaces them.
-
-| Section | Predates | Understated by |
-|---|---|---|
-| CUDA | [#148](https://github.com/antonellof/ferrox/pull/148) | prefill, ~20–26% |
-| Metal | [#150](https://github.com/antonellof/ferrox/pull/150) | decode on Gemma-class models, ~8–13% |
-
-The summary and detail tables below are **generated** from
-[`receipts/engine/`](receipts/engine/) by `ferrox bench --render`. Do
-not hand-edit them. Rows are never compared across machines: a gap only
-means something against the host it was measured on. A GPU row also names
-the card it ran on; the 16 Metal rows predate that field and are
-attributable only by their host label, which does name the M2 Pro.
-
-## Measured elsewhere, no receipt
-
-Two hosts were benchmarked with `bench -m --compare` rather than
-`--suite`, so they wrote no receipt and are absent from the generated
-tables. They are the two most interesting results in this file.
-
-**aarch64 CPU** (rented 20-core Cortex-A725, idle). ferrox is **ahead**
-here, and the decode column depends on one switch:
-
-| Model | Test | ferrox | ferrox `spin` | llama.cpp | Gap |
-|---|---|---|---|---|---|
-| Llama-3.2-3B Q4_K_M | pp512 | **132.53** | | 46.40 | 🟢 **0.35×** |
-| Llama-3.2-3B Q4_K_M | tg128 | 10.38 | **23.14** | 17.86 | 🟢 **0.77×** |
-| Llama-3.1-8B Q4_K_M | pp512 | **61.17** | | 19.15 | 🟢 **0.31×** |
-| Llama-3.1-8B Q4_K_M | tg128 | 6.64 | **12.41** | 9.06 | 🟢 **0.73×** |
-| SmolLM2-135M Q8_0 | tg128 | 14.73 | 9.16 | 120.56 | 🔴 **8.2×** |
-
-`FERROX_CPU_POOL=spin` turns decode from a loss into a win at 3B and
-8B, and into a bigger loss at 135M. That is why it is still opt-in
-([#27](https://github.com/antonellof/ferrox/issues/27)).
-
-**CUDA now has receipts** and is in the generated table below, on an
-RTX 3060, so it is no longer described here. Decode reads 2.2× to 5.0×
-and prefill 22.6× to 33.8×. The one thing receipts cannot show is a
-before/after against the same engine, so that stays:
-
-**What coalescing the matvecs bought** (RTX 3070, runs interleaved
-`main, branch, main, branch`; PRs
-[#144](https://github.com/antonellof/ferrox/pull/144),
-[#145](https://github.com/antonellof/ferrox/pull/145),
-[#146](https://github.com/antonellof/ferrox/pull/146)). The old kernels
-gave one thread a whole super-block, so 32 lanes read addresses one
-block apart and every load instruction spread across as many cache
-lines as it had lanes. A warp now takes the super-block and each lane
-one contiguous slice.
-
-| Model | Before | After | Change | GB/s after | % of 448 GB/s |
-|---|---:|---:|---:|---:|---:|
-| Llama-3.2-1B Q5_K_M | 32.85 | **100.90** | 🟢 **+207%** | 92.0 | 20.5% |
-| Llama-3.2-3B Q4_K_M | 18.38 | **48.50** | 🟢 **+164%** | 97.9 | 21.9% |
-| Llama-3.2-1B Q8_0 | 45.75 | **59.81** | 🟢 **+31%** | 79.0 | 17.6% |
-
-Output stays byte-identical to the CPU reference on all three. Most of
-this is #146, and the reason is worth keeping: #144 and #145 routed
-only `launch_matvec`, while the fused FFN — gate, up and down, about
-83% of the weight bytes a 3B decode step reads — enqueues directly and
-kept the old kernels. The benchmarks said "coalesced" and the FFN was
-not. Q8_0 gains least because its old kernel already read 32 contiguous
-bytes per thread.
-
-Achieved bandwidth is the number to watch, not tok/s: 17% to 22% of the
-card, against llama.cpp's ~60%. The access pattern was a real cost and
-was not the last one.
-
-**Metal, what concurrent encode bought** (M2 Pro, interleaved
-`main, branch, main, branch`, `MTLCommandBuffer` GPU-clock, which is
-immune to host load; [#150](https://github.com/antonellof/ferrox/pull/150)).
-Gemma-class models were forced onto a serial encoder by a correctness
-fix that outlived its cause, so they ran with no dispatch overlap.
-
-| Model | Before | After | Change |
-|---|---:|---:|---:|
-| Gemma-3-1B Q8_0 | 8.24 | **7.15** ms/tok | 🟢 **−13.2%** |
-| Gemma-2-2B Q4_K_M | 13.09 | **12.00** ms/tok | 🟢 **−8.3%** |
-
-Output is byte-identical to `main`. That takes Gemma-2-2B decode from
-the table's 1.23× to about **1.12×**, and it is the worst Metal row.
-
-**Metal, where the rest of the gap is** (quiet host, GPU-clock and wall
-from one process; [#149](https://github.com/antonellof/ferrox/issues/149)).
-
-| Model | wall ms/tok | GPU ms/tok | host | gap | gap if host were 0 |
-|---|---:|---:|---:|---:|---:|
-| Llama-3.2-1B Q4_K_M | 6.53 | **4.82** | 26% | 0.97× | **0.72×** |
-| Gemma-2-2B Q4_K_M | 16.46 | **11.79** | 28% | 1.12× | **0.88×** |
-
-ferrox's Metal kernels already finish faster than llama.cpp's whole
-token. The remaining gap is host-side, and injecting dispatches to
-measure the slope directly says it is **not** op count: a dispatch costs
-**0.61 µs** of host time and **5.16 µs** of GPU time, so all ~515 of
-Gemma-2's dispatches are 7% of its host cost. The host lever is
-pipelining encode against execution; fusion is a GPU-side lever worth
-~22% of GPU time.
-
-## Open
-
-| Issue | Gap | What is known |
-|---|---|---|
-| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA prefill, 22× to 34× | ~4× is tensor cores (`mul_mm` has none), ~5× is undiagnosed kernel efficiency. #148 bought 20–26% and ruled out dequant redundancy and occupancy |
-| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, 2.2× to 5.0× | memory-bound: 17–22% of card bandwidth against llama.cpp's ~60%. Coalescing closed 9–19× to 2–5×. What limits the rest is not diagnosed — the access pattern was a real cost and was not the last one |
-| [#149](https://github.com/antonellof/ferrox/issues/149) | Metal decode, ~1.12× worst row | kernels already beat llama.cpp's whole token; ~28% of wall is fixed per-token host round-trip, not op count |
-| [#127](https://github.com/antonellof/ferrox/issues/127) | x86 CPU prefill, 6.3× to 10.1× | a missing kernel tier: all 15 `gemm_*` repack kernels have aarch64 SIMD and **zero** AVX2. The one x86 path in that tier is a GEMV. aarch64 runs 0.31–0.35× on the same code |
-| [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode default | `spin` wins at 3B/8B, loses at 135M, so it needs a size rule not a flag |
-| [#128](https://github.com/antonellof/ferrox/issues/128) | CPU fixed per-token cost | **82–87% of the main thread is `__psynch_cvwait`**, parked on rayon's condvar, at 1 and 6 threads alike. ferrox dispatches a parallel region per matmul; llama.cpp's threads all run the graph. Neither pool fixes it |
-
-## Method
-
-Both engines pick their own thread count: llama.cpp defaults to
-performance cores and loses 2× to 4× above them, so forcing a shared
-count makes the comparison worse, not fairer. A warmup rep is
-discarded; host load is recorded at both ends of every run.
-
-Four traps, each of which put a wrong number in this file before:
-
-- **A load average cannot see one busy core.** The `--max-load` guard
-  passed for a day while a daemon held 97% of a core. Check `ps` too.
-- **One instantaneous sample is not a measurement.** "CUDA decode at
-  36% GPU utilization" came from an `nvidia-smi` taken after the run.
-  The real figure was 86% to 93%, and the error cost a day and a PR.
-- **A label is not a backend.** 13 CPU rows were published whose own
-  receipts recorded `backend_active: "Metal"`. Deleted rather than
-  corrected; a receipt whose label disagrees with what ran is now
-  refused at write time.
-- **A gap column cannot show a missing kernel.** A CUDA K-quant prefill
-  read 4.88 tok/s and looked slow. There was no GEMM at all, and the
-  fallback still answered correctly.
-- **A ratio across two models is not a marginal cost.** Dividing Metal
-  host time by dispatch count across two models gave ~12 µs per
-  dispatch. Injecting dispatches and measuring the slope gave **0.61
-  µs** — wrong by 20×, and it pointed a whole plan at the wrong lever.
-- **Check the effect clears the noise before believing a null.** A
-  fusion removing 5% of dispatches was worth ~1.4% of wall against a
-  ~1.1% noise floor. "No difference" measured nothing either way.
-
-Do not compare this file to a pre-0.13 version: those receipts had no
-warmup, so their prefill numbers include cold mmap page faults.
-
 <!-- BEGIN ENGINE TABLE (generated by `ferrox bench --render`) -->
 
-## Engine (`ferrox bench` vs `llama-bench`)
+# ferrox vs llama.cpp
 
-Measured on **3 hosts**, one section each. Rows are never compared across machines.
+Same machine, same GGUF, same backend. `pp` is prefill, `tg` is decode.
 
-### Summary
+**Gap = llama.cpp ÷ ferrox. Below 1.00 means ferrox is faster.**
+🟢 faster · ⚪ within 5% · 🔴 slower
 
-| Host | Backend | Prefill gap | Decode gap |
+Measured on **3 machines**, one section each. A gap only means something against the machine it was measured on, so rows are never compared across sections.
+
+### At a glance
+
+| Machine | Backend | Prefill | Decode |
 |---|---|---|---|
 | AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic | CPU | 🔴 **6.26×** to 🔴 **10.14×** | 🔴 **1.06×** to 🔴 **1.92×** |
-| Apple M2 Pro (10c/6p) macOS 26.6.1 | METAL | ⚪ **1.00×** to 🔴 **1.10×** | 🟢 **0.64×** to 🔴 **1.23×** |
+| Apple M2 Pro (10c/6p) macOS 26.6.2 + Apple M2 Pro | METAL | ⚪ **0.99×** to 🔴 **1.09×** | 🟢 **0.60×** to ⚪ **0.96×** |
 | Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-186-generic + NVIDIA GeForce RTX 3060 | CUDA | 🔴 **22.55×** to 🔴 **33.79×** | 🔴 **2.18×** to 🔴 **5.04×** |
 
 ### AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic
 
 #### CPU
 
-| Model | Test | ferrox tok/s | llama.cpp tok/s | Gap |
-|---|---|---|---|---|
-| Llama-3.2-1B-Instruct Q4_K_M | pp512 | **89.61** | **908.72** | 🔴 **10.14×** |
-| Llama-3.2-3B-Instruct Q4_K_M | pp512 | **31.54** | **316.49** | 🔴 **10.04×** |
-| Meta-Llama-3.1-8B-Instruct Q4_K_M | pp512 | **13.29** | **132.01** | 🔴 **9.93×** |
-| Gemma-2-2B-IT Q4_K_M | pp512 | **42.72** | **420.94** | 🔴 **9.85×** |
-| Llama-3.2-1B-Instruct Q6_K | pp512 | **64.50** | **513.30** | 🔴 **7.96×** |
-| Qwen3-0.6B Q8_0 | pp512 | **204.07** | **1413.34** | 🔴 **6.93×** |
-| Qwen2.5-0.5B-Instruct Q8_0 | pp512 | **272.33** | **1860.01** | 🔴 **6.83×** |
-| SmolLM2-135M-Instruct Q8_0 | pp512 | **574.98** | **3891.58** | 🔴 **6.77×** |
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | pp512 | **112.39** | **734.28** | 🔴 **6.53×** |
-| Gemma-3-1B-IT Q8_0 | pp512 | **146.65** | **917.50** | 🔴 **6.26×** |
-| SmolLM2-135M-Instruct Q8_0 | tg128 | **206.83** | **397.71** | 🔴 **1.92×** |
-| Llama-3.2-1B-Instruct Q6_K | tg128 | **37.28** | **53.84** | 🔴 **1.44×** |
-| Llama-3.2-1B-Instruct Q4_K_M | tg128 | **46.53** | **67.10** | 🔴 **1.44×** |
-| Llama-3.2-3B-Instruct Q4_K_M | tg128 | **18.91** | **27.02** | 🔴 **1.43×** |
-| Meta-Llama-3.1-8B-Instruct Q4_K_M | tg128 | **9.06** | **12.07** | 🔴 **1.33×** |
-| Gemma-2-2B-IT Q4_K_M | tg128 | **22.23** | **29.47** | 🔴 **1.33×** |
-| Qwen3-0.6B Q8_0 | tg128 | **63.64** | **82.39** | 🔴 **1.29×** |
-| Qwen2.5-0.5B-Instruct Q8_0 | tg128 | **85.86** | **99.03** | 🔴 **1.15×** |
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | tg128 | **43.56** | **49.98** | 🔴 **1.15×** |
-| Gemma-3-1B-IT Q8_0 | tg128 | **46.47** | **49.46** | 🔴 **1.06×** |
+| Model | Prefill | Decode | ferrox pp512 | llama.cpp pp512 | ferrox tg128 | llama.cpp tg128 |
+|---|---|---|---:|---:|---:|---:|
+| Gemma-2-2B-IT Q4_K_M | 🔴 **9.85×** | 🔴 **1.33×** | 42.7 | 421 | 22.2 | 29.5 |
+| Gemma-3-1B-IT Q8_0 | 🔴 **6.26×** | 🔴 **1.06×** | 147 | 918 | 46.5 | 49.5 |
+| Llama-3.2-1B-Instruct Q4_K_M | 🔴 **10.14×** | 🔴 **1.44×** | 89.6 | 909 | 46.5 | 67.1 |
+| Llama-3.2-1B-Instruct Q6_K | 🔴 **7.96×** | 🔴 **1.44×** | 64.5 | 513 | 37.3 | 53.8 |
+| Llama-3.2-3B-Instruct Q4_K_M | 🔴 **10.04×** | 🔴 **1.43×** | 31.5 | 316 | 18.9 | 27.0 |
+| Meta-Llama-3.1-8B-Instruct Q4_K_M | 🔴 **9.93×** | 🔴 **1.33×** | 13.3 | 132 | 9.1 | 12.1 |
+| Qwen2.5-0.5B-Instruct Q8_0 | 🔴 **6.83×** | 🔴 **1.15×** | 272 | 1860 | 85.9 | 99.0 |
+| Qwen3-0.6B Q8_0 | 🔴 **6.93×** | 🔴 **1.29×** | 204 | 1413 | 63.6 | 82.4 |
+| SmolLM2-135M-Instruct Q8_0 | 🔴 **6.77×** | 🔴 **1.92×** | 575 | 3892 | 207 | 398 |
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | 🔴 **6.53×** | 🔴 **1.15×** | 112 | 734 | 43.6 | 50.0 |
 
-### Apple M2 Pro (10c/6p) macOS 26.6.1
+### Apple M2 Pro (10c/6p) macOS 26.6.2 + Apple M2 Pro
 
 #### Metal
 
-| Model | Test | ferrox tok/s | llama.cpp tok/s | Gap |
-|---|---|---|---|---|
-| Qwen2.5-0.5B-Instruct Q8_0 | pp512 | **4469.08** | **4909.41** | 🔴 **1.10×** |
-| OLMoE-1B-7B-0924 Q4_0 | pp512 | **1411.98** | **1550.30** | 🔴 **1.10×** |
-| Llama-3.2-1B-Instruct Q6_K | pp512 | **1699.31** | **1841.96** | 🔴 **1.08×** |
-| Qwen3-0.6B Q8_0 | pp512 | **3312.80** | **3509.22** | 🔴 **1.06×** |
-| Gemma-2-2B-IT Q4_K_M | pp512 | **864.51** | **914.85** | 🔴 **1.06×** |
-| Llama-3.2-1B-Instruct Q4_K_M | pp512 | **1801.36** | **1884.33** | ⚪ **1.05×** |
-| Gemma-3-1B-IT Q8_0 | pp512 | **2655.14** | **2776.49** | ⚪ **1.05×** |
-| Llama-3.2-1B-Instruct IQ4_XS | pp512 | **1833.72** | **1903.21** | ⚪ **1.04×** |
-| Llama-3.2-1B-Instruct Q5_K_M | pp512 | **1644.07** | **1696.82** | ⚪ **1.03×** |
-| Llama-3.2-3B-Instruct Q4_K_M | pp512 | **641.64** | **660.11** | ⚪ **1.03×** |
-| Phi-4-mini-Instruct Q4_K_M | pp512 | **549.10** | **561.12** | ⚪ **1.02×** |
-| Meta-Llama-3.1-8B-Instruct Q4_K_M | pp512 | **266.49** | **271.79** | ⚪ **1.02×** |
-| Mistral-7B-Instruct-v0.2 Q4_K_M | pp512 | **271.28** | **275.03** | ⚪ **1.01×** |
-| SmolLM2-135M-Instruct Q8_0 | pp512 | **12086.82** | **12101.23** | ⚪ **1.00×** |
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | pp512 | **2026.76** | **2024.56** | ⚪ **1.00×** |
-| Gemma-4-E2B-IT Q4_K_M | pp512 | **14.27** | — | — |
-| Gemma-2-2B-IT Q4_K_M | tg128 | **55.25** | **67.82** | 🔴 **1.23×** |
-| OLMoE-1B-7B-0924 Q4_0 | tg128 | **156.02** | **167.82** | 🔴 **1.08×** |
-| Llama-3.2-3B-Instruct Q4_K_M | tg128 | **62.41** | **64.13** | ⚪ **1.03×** |
-| Mistral-7B-Instruct-v0.2 Q4_K_M | tg128 | **32.29** | **32.11** | ⚪ **0.99×** |
-| Llama-3.2-1B-Instruct Q4_K_M | tg128 | **148.63** | **147.72** | ⚪ **0.99×** |
-| Meta-Llama-3.1-8B-Instruct Q4_K_M | tg128 | **30.34** | **30.05** | ⚪ **0.99×** |
-| Llama-3.2-1B-Instruct Q6_K | tg128 | **132.19** | **130.02** | ⚪ **0.98×** |
-| Phi-4-mini-Instruct Q4_K_M | tg128 | **51.14** | **49.94** | ⚪ **0.98×** |
-| Llama-3.2-1B-Instruct IQ4_XS | tg128 | **155.53** | **147.00** | 🟢 **0.95×** |
-| Llama-3.2-1B-Instruct Q5_K_M | tg128 | **128.60** | **116.45** | 🟢 **0.91×** |
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | tg128 | **125.23** | **109.44** | 🟢 **0.87×** |
-| Gemma-3-1B-IT Q8_0 | tg128 | **94.81** | **82.68** | 🟢 **0.87×** |
-| Qwen3-0.6B Q8_0 | tg128 | **159.58** | **114.57** | 🟢 **0.72×** |
-| SmolLM2-135M-Instruct Q8_0 | tg128 | **315.42** | **217.11** | 🟢 **0.69×** |
-| Qwen2.5-0.5B-Instruct Q8_0 | tg128 | **201.64** | **129.19** | 🟢 **0.64×** |
-| Gemma-4-E2B-IT Q4_K_M | tg128 | **15.91** | — | — |
+| Model | Prefill | Decode | ferrox pp512 | llama.cpp pp512 | ferrox tg128 | llama.cpp tg128 |
+|---|---|---|---:|---:|---:|---:|
+| Gemma-2-2B-IT Q4_K_M | ⚪ **1.02×** | 🟢 **0.94×** | 882 | 897 | 71.6 | 67.0 |
+| Gemma-3-1B-IT Q8_0 | ⚪ **1.03×** | 🟢 **0.68×** | 2691 | 2779 | 122 | 83.2 |
+| Gemma-4-E2B-IT Q4_K_M | — | — | 14.6 | — | 16.3 | — |
+| Llama-3.2-1B-Instruct IQ4_XS | ⚪ **1.03×** | 🟢 **0.90×** | 1847 | 1906 | 163 | 147 |
+| Llama-3.2-1B-Instruct Q4_K_M | ⚪ **1.04×** | 🟢 **0.95×** | 1814 | 1888 | 158 | 149 |
+| Llama-3.2-1B-Instruct Q5_K_M | ⚪ **1.02×** | 🟢 **0.86×** | 1654 | 1691 | 136 | 117 |
+| Llama-3.2-1B-Instruct Q6_K | 🔴 **1.08×** | 🟢 **0.94×** | 1709 | 1848 | 140 | 131 |
+| Llama-3.2-3B-Instruct Q4_K_M | ⚪ **1.03×** | 🟢 **0.94×** | 646 | 662 | 68.5 | 64.5 |
+| Meta-Llama-3.1-8B-Instruct Q4_K_M | ⚪ **1.03×** | 🟢 **0.95×** | 271 | 279 | 32.0 | 30.4 |
+| Mistral-7B-Instruct-v0.2 Q4_K_M | ⚪ **1.03×** | 🟢 **0.95×** | 273 | 280 | 34.3 | 32.4 |
+| OLMoE-1B-7B-0924 Q4_0 | 🔴 **1.08×** | ⚪ **0.96×** | 1441 | 1556 | 174 | 168 |
+| Phi-4-mini-Instruct Q4_K_M | ⚪ **1.02×** | 🟢 **0.88×** | 543 | 556 | 53.9 | 47.6 |
+| Qwen2.5-0.5B-Instruct Q8_0 | 🔴 **1.09×** | 🟢 **0.60×** | 4511 | 4935 | 218 | 131 |
+| Qwen3-0.6B Q8_0 | ⚪ **0.99×** | 🟢 **0.61×** | 3535 | 3500 | 191 | 116 |
+| SmolLM2-135M-Instruct Q8_0 | ⚪ **1.02×** | 🟢 **0.60×** | 11878 | 12161 | 363 | 217 |
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | ⚪ **1.00×** | 🟢 **0.83×** | 2032 | 2034 | 132 | 110 |
 
 ### Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-186-generic + NVIDIA GeForce RTX 3060
 
 #### CUDA
 
-| Model | Test | ferrox tok/s | llama.cpp tok/s | Gap |
-|---|---|---|---|---|
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | pp512 | **302.19** | **10212.32** | 🔴 **33.79×** |
-| Qwen3-0.6B Q8_0 | pp512 | **438.82** | **14049.28** | 🔴 **32.02×** |
-| Qwen2.5-0.5B-Instruct Q8_0 | pp512 | **651.16** | **20442.80** | 🔴 **31.39×** |
-| SmolLM2-135M-Instruct Q8_0 | pp512 | **995.37** | **28311.27** | 🔴 **28.44×** |
-| Llama-3.2-1B-Instruct Q5_K_M | pp512 | **376.64** | **10203.41** | 🔴 **27.09×** |
-| Llama-3.2-1B-Instruct Q4_K_M | pp512 | **416.29** | **10571.65** | 🔴 **25.39×** |
-| Llama-3.2-3B-Instruct Q4_K_M | pp512 | **161.53** | **4060.99** | 🔴 **25.14×** |
-| Gemma-2-2B-IT Q4_K_M | pp512 | **205.72** | **5140.69** | 🔴 **24.99×** |
-| Gemma-3-1B-IT Q8_0 | pp512 | **451.52** | **10803.23** | 🔴 **23.93×** |
-| Llama-3.2-1B-Instruct Q6_K | pp512 | **425.71** | **9598.55** | 🔴 **22.55×** |
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | tg128 | **47.87** | **241.17** | 🔴 **5.04×** |
-| Qwen3-0.6B Q8_0 | tg128 | **64.56** | **310.11** | 🔴 **4.80×** |
-| SmolLM2-135M-Instruct Q8_0 | tg128 | **141.55** | **670.59** | 🔴 **4.74×** |
-| Qwen2.5-0.5B-Instruct Q8_0 | tg128 | **89.38** | **387.65** | 🔴 **4.34×** |
-| Gemma-3-1B-IT Q8_0 | tg128 | **51.98** | **176.24** | 🔴 **3.39×** |
-| Llama-3.2-1B-Instruct Q5_K_M | tg128 | **88.43** | **257.49** | 🔴 **2.91×** |
-| Gemma-2-2B-IT Q4_K_M | tg128 | **43.19** | **124.58** | 🔴 **2.88×** |
-| Llama-3.2-3B-Instruct Q4_K_M | tg128 | **42.72** | **120.12** | 🔴 **2.81×** |
-| Llama-3.2-1B-Instruct Q4_K_M | tg128 | **100.78** | **278.65** | 🔴 **2.76×** |
-| Llama-3.2-1B-Instruct Q6_K | tg128 | **100.16** | **217.90** | 🔴 **2.18×** |
+| Model | Prefill | Decode | ferrox pp512 | llama.cpp pp512 | ferrox tg128 | llama.cpp tg128 |
+|---|---|---|---:|---:|---:|---:|
+| Gemma-2-2B-IT Q4_K_M | 🔴 **24.99×** | 🔴 **2.88×** | 206 | 5141 | 43.2 | 125 |
+| Gemma-3-1B-IT Q8_0 | 🔴 **23.93×** | 🔴 **3.39×** | 452 | 10803 | 52.0 | 176 |
+| Llama-3.2-1B-Instruct Q4_K_M | 🔴 **25.39×** | 🔴 **2.76×** | 416 | 10572 | 101 | 279 |
+| Llama-3.2-1B-Instruct Q5_K_M | 🔴 **27.09×** | 🔴 **2.91×** | 377 | 10203 | 88.4 | 257 |
+| Llama-3.2-1B-Instruct Q6_K | 🔴 **22.55×** | 🔴 **2.18×** | 426 | 9599 | 100 | 218 |
+| Llama-3.2-3B-Instruct Q4_K_M | 🔴 **25.14×** | 🔴 **2.81×** | 162 | 4061 | 42.7 | 120 |
+| Qwen2.5-0.5B-Instruct Q8_0 | 🔴 **31.39×** | 🔴 **4.34×** | 651 | 20443 | 89.4 | 388 |
+| Qwen3-0.6B Q8_0 | 🔴 **32.02×** | 🔴 **4.80×** | 439 | 14049 | 64.6 | 310 |
+| SmolLM2-135M-Instruct Q8_0 | 🔴 **28.44×** | 🔴 **4.74×** | 995 | 28311 | 142 | 671 |
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | 🔴 **33.79×** | 🔴 **5.04×** | 302 | 10212 | 47.9 | 241 |
+
+---
+
+Generated by `ferrox bench --render` from [`receipts/engine/`](receipts/engine/). Do not hand-edit: the next render overwrites it.
+How the numbers are taken, and the traps they have fallen into: [`README.md`](README.md). Older measurements and before/after studies: [`HISTORY.md`](HISTORY.md).
 
 <!-- END ENGINE TABLE -->
-
-## Notes
-
-- **Gemma-4-E2B** uses `Gemma4Engine`, whose `pp*` is a sequential
-  `forward_token` until batched prefill lands. Homebrew `llama-bench`
-  has no `gemma4` arch, so its column is blank.
-- **Mixtral** is skipped by `--fit-host` on the Apple host.
-- **Metal regressions to keep off:** legacy GQA NSG=4, sequential
-  GREEDY argmax, float4 elem, early Multi-CB. `FERROX_METAL_FA_VEC=0`
-  costs ~25.5 pred.
-- Run-to-run spread is ~20% on the Apple host; a claim tighter than
-  that needs interleaved A/B.

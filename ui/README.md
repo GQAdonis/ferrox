@@ -8,6 +8,34 @@ same way an editor would. That rule earns its keep. Every screen here
 goes through the public API, so the API cannot rot without a screen
 breaking first and showing you.
 
+## Screens
+
+Captured in the dark theme at 2160 by 1350 from a real `ferrox-server` on Apple Metal,
+serving Llama-3.2-3B-Instruct Q4_K_M. Nothing is mocked; the timings
+under each answer are the server's own usage numbers.
+
+**Chat.** One model selector, conversations addressed by URL, and the
+server's timings under every answer.
+
+<img src="../docs/assets/studio-chat.webp" alt="Chat" width="100%" />
+
+**Models.** The inventory the server can see, with the loaded checkpoint
+marked. Picking a model happens in the chat header; this screen
+installs, removes and reports.
+
+<img src="../docs/assets/studio-models.webp" alt="Models" width="100%" />
+
+**Activity.** Every request this process served, keyed by the request
+id the response carried, with the counters and sparklines above it.
+
+<img src="../docs/assets/studio-activity.webp" alt="Activity" width="100%" />
+
+**Connect.** The base URL and key this app uses, and snippets for curl
+and the OpenAI SDK filled in from the model the server reports right
+now.
+
+<img src="../docs/assets/studio-connect.webp" alt="Connect" width="100%" />
+
 ## Working on it
 
 ```bash
@@ -38,13 +66,31 @@ npm run check       # typecheck + lint + test
 
 `npm test` runs `node --test` over `src/lib/*.test.ts`, node strips the
 types itself, so there is no test framework in the dependency tree and
-nothing for the licence check to weigh. It covers the stream recovery
-paths in `lib/api.ts`, which are the half of SSE hardening that cannot
-be proven from the server: that a reconnect resumes from the last `id:`
-without repeating a token, that a lost replay window surfaces as a
-truncation error instead of a partial answer shown as a whole one, and
-that a non-resumable stream never tries to reconnect into a buffer that
-does not exist.
+nothing for the licence check to weigh. It covers four things a browser
+cannot show you:
+
+- the stream recovery paths in `lib/api.ts`, the half of SSE hardening
+  that cannot be proven from the server: that a reconnect resumes from
+  the last `id:` without repeating a token, that a lost replay window
+  surfaces as a truncation error instead of a partial answer shown as a
+  whole one, and that a non-resumable stream never tries to reconnect
+  into a buffer that does not exist;
+- the transcript sync's pure half in `lib/conversations.ts`, where
+  getting "which nodes are new" wrong duplicates or drops a message;
+- the entry rule in `lib/entry-state.ts` (below), where being too eager
+  throws away the conversation you were in and being too lazy resurrects
+  one for ever. Both failures are silent;
+- the thought clock in `lib/thought.ts`: the words a duration turns
+  into ("Thought for 15 seconds", "1 min 20 s"), that a running clock
+  ticks from its stamp rather than freezing at the last delta, and
+  that the duration is stored ONCE, as `reasoning_ms` beside
+  `reasoning_content`, rather than twice -- once as that column and
+  once inside the opaque `metadata` blob the server hands back
+  byte-identical. This is the one client-side stopwatch in the app:
+  every speed under an answer is the server's `usage`, but how long
+  the model THOUGHT is the gap between the first reasoning delta and
+  the first content delta, which `usage` does not measure and only the
+  stream's consumer can.
 
 CI runs `npm run licenses`, `npm run typecheck`, `npm run lint` and
 `npm run build`. It does not run `npm test`, so run `npm run check`
@@ -94,11 +140,92 @@ src/
                         one prefers-color-scheme block, nothing else)
   lib/api.ts            the ONLY place that talks HTTP
   lib/api.test.ts       stream recovery, against a stubbed fetch
+  lib/entry-state.ts    what Chat opens with, and why
+  lib/use-tab-activity  the heartbeat that measures "away"
   lib/format.ts         "unknown" is an em dash, never a zero
-  components/           app shell, health pill, shadcn-style primitives
+  components/           app shell, server status, shadcn-style primitives
   screens/chat/         assistant-ui runtime, markdown, thread
   screens/{models,activity,connect}.tsx
 ```
+
+## The look, in four rules
+
+They are written at the top of `src/index.css`, because a rule nobody can
+quote is a rule that drifts. Three of them are asserted by
+`lib/theme.test.ts` rather than promised.
+
+- **Colour.** There is **no brand hue**. The neutral ramp is zero-chroma
+  and the only chromatic tokens in the app are `ok`, `warn` and `err`, so
+  chroma means exactly one thing: a state. The test fails if any other
+  token grows chroma, or if a semantic one loses it.
+- **Emphasis**, since no hue carries it. Four levers, loudest first: a
+  solid **ink** fill (`--ink`, near-black in light and near-white in
+  dark) for the one primary action in a view; **weight** for a selected
+  row or a label; **surface** behind a hairline for grouping; and the
+  **contrast** ramp `fg` / `muted` / `faint` for rank inside a block.
+- **Type.** One six-step scale — `2xs` 11, `xs` 12, `sm` 14, `base` 15,
+  `lg` 17, `xl` 20, plus `code` 13 — and no arbitrary sizes in
+  components.
+- **Elevation.** Borders separate; shadows only float. One shadow token,
+  `--shadow-pop`, for popovers and the mobile drawer.
+
+The mark is a body-centred cubic cell, which is the structure of α-iron.
+Its geometry lives in `lib/logo-geometry.ts` and is drawn twice — by
+`components/logo.tsx` in `currentColor`, and by `public/favicon.svg`,
+which needs a colour of its own because a favicon cannot inherit one.
+`lib/logo-geometry.test.ts` reads the favicon off disk and holds the two
+to the same path strings.
+
+## Where you land, and what it opens
+
+**The URL says which conversation you are in.** `/ui/chat` is a new
+chat, `/ui/chat/<id>` is that conversation, and `/` and `/ui` redirect to
+the first of those. That is what every chat UI of this shape does, and it
+is what makes the base URL a predictable entry point instead of "whatever
+was open last" — which is what this app used to do, from any path, after
+any amount of time, by opening the newest conversation it could find.
+
+The id is stamped into the URL by the first message, with `replace`, so
+Back leaves Chat rather than walking into the empty version of the
+conversation you are looking at. Opening one from the picker and starting
+a new chat are pushes, so Back undoes them.
+
+**A tab that has been away comes back to a new chat.** The window is
+`RESUME_WINDOW_MS` in `lib/entry-state.ts`, thirty minutes, and it is
+measured rather than assumed: a heartbeat stamps `sessionStorage` only
+while the document is visible, so a hidden tab, a closed lid and a
+sleeping machine accumulate away-time and a tab you are sitting in front
+of never does. `sessionStorage`, not `localStorage`, is the whole trick —
+it is per tab and dies with the tab, so a reload of a tab that was away
+all night still reads as away, while a fresh tab opened on a deep link
+has no record at all and the link is simply honoured.
+
+Two things keep this from being a rule that loses work. It never fires
+over a running generation or a half-typed message. And when it does fire
+it says so, in the number, and offers the conversation back in one click.
+No other chat UI does this at all — the research behind it found not one
+product with a staleness rule — so it is deliberately narrow, announced
+and undoable rather than silent.
+
+Local mode (a server with no `/v1/conversations`) has no ids to put in a
+URL, so it asks the same function with the one slot it has and its own
+saved-at stamp. One rule, two callers.
+
+## One model selector
+
+Choosing which model answers happens in **one** place: the menu in the
+Chat header. **Models** is the library — what is on disk, downloads, and
+`Unload`, which is the one verb the menu cannot express. It used to carry
+a second selector (a `Load` button per row, the same `POST
+/admin/models/load` for the same server-wide effect), a second `Unload`,
+and an `active:` badge restating the row's own `state` column.
+
+The sidebar's bottom control is **server status**, not a model picker. It
+used to render the loaded model id under a chevron, in the slot an
+account or settings control normally occupies, which made it read as a
+third selector; the model id belongs where the model is chosen. It never
+names a backend, either: `/health` says which backends are *available*,
+never which one is running, so "on Metal" there would be invented.
 
 ## Streams that survive a proxy
 
@@ -126,6 +253,26 @@ consequences, all deliberate:
 Nothing here ever presents a partial answer as a finished one: if the
 reconnect and the poll both fail, or the replay window has moved past
 where the client stopped, it surfaces as a truncation error.
+
+## A cut-off answer says so, and can be continued
+
+`max_tokens` defaults to **no cap**: the request carries none, and the
+server bounds the answer by the context window alone, which is
+llama.cpp's `n_predict: -1` and its own web UI's default. It used to be
+512, and a reasoning model spends more than that thinking on an ordinary
+question, so the budget ran out inside the thought, the server correctly
+answered `finish_reason: "length"` with no content, and the transcript
+showed a Thinking block and then nothing. A saved 512 from that default
+is dropped on load; any other saved value is kept as the choice it was.
+
+A `length` finish now renders as a cut-off under the message, with the
+token count, and a **Continue** button. Continue is assistant-ui's own
+regenerate carrying the partial parts in its run config: the adapter
+sends the cut-off turn back as the trailing assistant message with
+`continue_final_message: true` (llama.cpp's field), seeds the new message
+with what was already there, and the server renders the turn as one
+still being written, thought re-opened, so the model carries on rather
+than starting over. The cut-off version stays as the previous branch.
 
 ## Three things not to undo
 

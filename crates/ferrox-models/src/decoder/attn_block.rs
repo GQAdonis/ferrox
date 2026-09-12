@@ -15,11 +15,12 @@
 //! the same one llama.cpp reached by overloading `build_attn` on its
 //! memory-input type.
 
-use ferrox_core::attention::{causal_gqa_attention_softcap, causal_gqa_attention_windowed_softcap};
+use ferrox_core::attention::causal_gqa_attention_row;
 use ferrox_core::cache::{KvCache, PagedKvCache, SharedPagedKv};
 use ferrox_core::matmul::rms_norm;
 
-use super::{Decoder, GptOssLayer, LayerWeights};
+use super::{Decoder, LayerWeights};
+use crate::layer_shapes::AttnShape;
 
 /// Where one row's K/V is written, and what that implies for the kernel
 /// that reads it back.
@@ -53,7 +54,8 @@ pub(crate) enum KvStep<'a> {
 impl Decoder {
     /// One layer's attention block for ONE row: QKV projection, the
     /// three QKV biases, the two QK norms, RoPE's `mscale`, per-head
-    /// RoPE, `attention_scale`, the KV push and attend, `o_proj`,
+    /// RoPE, `attention_scale`, the KV push and attend (with the
+    /// layer's sinks, if it has any), the output gate, `o_proj`,
     /// gpt-oss's `o_bias`, and `post_attn_norm`.
     ///
     /// Takes `normed` rather than computing it: `forward_token`'s Metal
@@ -61,7 +63,15 @@ impl Decoder {
     /// will run on the host at all.
     ///
     /// Returns the attention branch's contribution to the residual --
-    /// the caller adds it.
+    /// the caller adds it -- or `None` for a layer that HAS no
+    /// attention branch (`AttnShape::Absent`, deci.cpp:107-109), where
+    /// the residual passes straight through. `Option` rather than an
+    /// all-zero vector so a caller cannot add a branch that does not
+    /// exist without saying so.
+    ///
+    /// The head counts are THIS layer's (`ModelConfig::layer_shape`),
+    /// which is what makes deci's and openelm's per-layer widths one
+    /// body with everyone else's.
     pub(crate) fn attn_block(
         &self,
         layer_idx: usize,
@@ -69,10 +79,17 @@ impl Decoder {
         normed: &[f32],
         pos: usize,
         kv: KvStep<'_>,
-    ) -> Vec<f32> {
+    ) -> Option<Vec<f32>> {
         let head_dim = self.config.head_dim;
-        let n_heads = self.config.n_heads;
-        let n_kv_heads = self.config.n_kv_heads;
+        let (n_heads, n_kv_heads) = match self.config.layer_shape(layer_idx).attention {
+            AttnShape::Gqa {
+                n_heads,
+                n_kv_heads,
+            } => (n_heads, n_kv_heads),
+            // deci.cpp:115-118: `attn_norm` then `wo`, nothing else.
+            AttnShape::Linear => return Some(layer.attn.o_proj.apply(normed)),
+            AttnShape::Absent => return None,
+        };
 
         let (mut q, mut k, mut v) = {
             #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -105,27 +122,12 @@ impl Decoder {
             }
         };
 
-        if let Some(bias) = &layer.attn.q_bias {
-            for (x, b) in q.iter_mut().zip(bias.iter()) {
-                *x += b;
-            }
-        }
-        if let Some(bias) = &layer.attn.k_bias {
-            for (x, b) in k.iter_mut().zip(bias.iter()) {
-                *x += b;
-            }
-        }
-        if let Some(bias) = &layer.attn.v_bias {
-            for (x, b) in v.iter_mut().zip(bias.iter()) {
-                *x += b;
-            }
-        }
-
         // Whole rows here: one token's Q and K. See
         // `Decoder::qk_norm_after_rope` for why the norm has two homes.
-        let (q_width, kv_width) = (q.len(), k.len());
+        let (q_width, kv_width, v_width) = (q.len(), k.len(), v.len());
+        self.apply_qkv_bias_and_clamp(layer, &mut q, &mut k, &mut v, q_width, kv_width, v_width);
         self.apply_qk_norms_pre_rope(layer, &mut q, &mut k, q_width, kv_width);
-        self.apply_rope_attn_factor(&mut q, &mut k);
+        self.apply_rope_attn_factor(&mut q, &mut k, layer_idx);
 
         for h in 0..n_heads {
             self.apply_rope_head_layer(&mut q[h * head_dim..(h + 1) * head_dim], pos, layer_idx);
@@ -135,18 +137,85 @@ impl Decoder {
         }
         self.apply_qk_norms_post_rope(layer, &mut q, &mut k, q_width, kv_width);
         self.apply_attention_scale(&mut q);
+        self.apply_attn_temperature(&mut q, q_width, |_| pos);
 
-        let oai = self.gpt_oss.as_ref().map(|g| &g.layers[layer_idx]);
-        let attn_out = self.push_and_attend_row(kv, layer_idx, &k, &v, &q, oai);
+        let mut attn_out = self.push_and_attend_row(kv, layer_idx, layer, &k, &v, &q);
+        Some(self.attn_out_to_residual_rows(layer, normed, &mut attn_out, 1))
+    }
 
-        let mut projected = layer.attn.o_proj.apply(&attn_out);
-        if let Some(oai) = oai {
-            for (x, b) in projected.iter_mut().zip(oai.o_bias.iter()) {
-                *x += b;
+    /// Everything between the softmax-weighted V sum and the residual
+    /// add, for `rows` rows at once: the output gate, `o_proj`, its
+    /// scale and bias, and `post_attn_norm`.
+    ///
+    /// ONE body for the row path (`rows == 1`) and the two batched
+    /// host bodies. Before the gate existed each of the three spelled
+    /// the `o_proj` / `o_bias` / `post_attn_norm` tail itself, and the
+    /// gate would have been a fourth decoration to add to three
+    /// places; it is added to one. `normed` is the SAME vector the
+    /// Q/K/V projections read, which is what every gating graph
+    /// projects the gate from (`crate::attn_gate`).
+    pub(crate) fn attn_out_to_residual_rows(
+        &self,
+        layer: &LayerWeights,
+        normed: &[f32],
+        attn_out: &mut [f32],
+        rows: usize,
+    ) -> Vec<f32> {
+        if let Some(gate) = &layer.attn.output_gate {
+            gate.apply_rows(normed, attn_out, rows, self.config.head_dim);
+        }
+        // bitnet.cpp:101-106: RMS over the concatenated heads, BEFORE
+        // `wo`. After the gate only by convention -- no graph has both
+        // (`crate::sub_norms`, `crate::attn_gate`) -- and per row,
+        // because the norm is over one token's heads.
+        let sub_normed;
+        let attn_out: &[f32] = match &layer.attn.attn_sub_norm {
+            None => attn_out,
+            Some(w) => {
+                let width = w.len();
+                sub_normed = attn_out
+                    .chunks(width)
+                    .flat_map(|row| rms_norm(row, w, self.config.rms_norm_eps))
+                    .collect::<Vec<f32>>();
+                &sub_normed
+            }
+        };
+        let mut projected = if rows == 1 {
+            layer.attn.o_proj.apply(attn_out)
+        } else {
+            layer.attn.o_proj.apply_batch(attn_out, rows)
+        };
+        // `build_lora_mm(wo, cur, wo_s)`: the `{1}` companion multiplied
+        // onto the projection's output (`crate::weight_scales`)...
+        if let Some(scale) = layer.attn.o_scale {
+            for x in projected.iter_mut() {
+                *x *= scale;
+            }
+        }
+        // ...and THEN `wo_b`, the order `build_attn` has
+        // (`crate::proj_bias`; gpt-oss's, starcoder2's, every graph
+        // that creates the tensor).
+        if let Some(b) = &layer.attn.o_bias {
+            let hidden = b.len();
+            for row in projected.chunks_mut(hidden) {
+                for (x, b) in row.iter_mut().zip(b.iter()) {
+                    *x += b;
+                }
+            }
+        }
+        // mimo2.cpp:180-183: the branch scaled AFTER `wo`, before the
+        // residual (`crate::attn_value_scale`).
+        if let Some(scale) = self.config.attn_value_scale {
+            for x in projected.iter_mut() {
+                *x *= scale;
             }
         }
         if let Some(post) = &layer.attn.post_attn_norm {
-            projected = rms_norm(&projected, post, self.config.rms_norm_eps);
+            let hidden = post.len();
+            projected = projected
+                .chunks(hidden)
+                .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                .collect();
         }
         projected
     }
@@ -165,28 +234,51 @@ impl Decoder {
         &self,
         kv: KvStep<'_>,
         layer_idx: usize,
+        layer: &LayerWeights,
         k: &[f32],
         v: &[f32],
         q: &[f32],
-        oai: Option<&GptOssLayer>,
     ) -> Vec<f32> {
-        let n_heads = self.config.n_heads;
-        let n_kv_heads = self.config.n_kv_heads;
+        // The tensor decides, not the architecture: see
+        // `AttnWeights::sinks`.
+        let sinks = layer.attn.sinks.as_deref();
+        // Only a GQA layer pushes; the other two shapes returned before
+        // projecting anything. `n_heads()` is zero for them, and zero
+        // heads is not a kernel argument this body may be handed.
+        let shape = self.config.layer_shape(layer_idx).attention;
+        let (n_heads, n_kv_heads) = (shape.n_heads(), shape.n_kv_heads());
+        assert!(
+            matches!(shape, AttnShape::Gqa { .. }),
+            "layer {layer_idx} has no KV to push ({shape:?})"
+        );
         let head_dim = self.config.head_dim;
+        let v_head_dim = self.config.v_head_dim();
         let window = self.config.layer_sliding_window(layer_idx);
+        // The sink arm carries no softcap, matching llama.cpp's.
+        let softcap = if sinks.is_some() {
+            None
+        } else {
+            self.config.attn_logit_softcap
+        };
         // Derived from the variant rather than passed as a flag; see
-        // `KvStep::Batched`.
+        // `KvStep::Batched`. The CUDA resident hook serves the plain
+        // full-attention arm only, at one head width: a windowed layer,
+        // a layer with sinks, or a model whose V width differs
+        // (`crate::kv_head_dims`) takes the host kernel.
         let cuda_resident_layer = match &kv {
-            KvStep::Decode(_) => Some(layer_idx),
-            KvStep::Batched(_) | KvStep::Paged { .. } => None,
+            KvStep::Decode(_) if window.is_none() && sinks.is_none() && v_head_dim == head_dim => {
+                Some(layer_idx)
+            }
+            KvStep::Decode(_) | KvStep::Batched(_) | KvStep::Paged { .. } => None,
         };
         match kv {
             KvStep::Decode(cache) | KvStep::Batched(cache) => {
                 cache
                     .push(k, v)
                     .expect("unbounded/planned KvCache growth is infallible");
-                let out = if let Some(oai) = oai {
-                    ferrox_core::causal_gqa_attention_sinks(
+                let out = match cuda_resident_layer {
+                    Some(l) => self.gqa_attention(
+                        l,
                         q,
                         &cache.k,
                         &cache.v,
@@ -194,43 +286,22 @@ impl Decoder {
                         n_kv_heads,
                         head_dim,
                         cache.rows(),
+                    ),
+                    // ONE kernel for plain, windowed, softcapped and
+                    // sink-bearing layers, at the cache's own two widths.
+                    None => causal_gqa_attention_row(
+                        q,
+                        &cache.k,
+                        &cache.v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        v_head_dim,
+                        cache.rows(),
                         window,
-                        &oai.attn_sinks,
-                    )
-                } else {
-                    match (window, cuda_resident_layer) {
-                        (Some(window), _) => causal_gqa_attention_windowed_softcap(
-                            q,
-                            &cache.k,
-                            &cache.v,
-                            n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            cache.rows(),
-                            window,
-                            self.config.attn_logit_softcap,
-                        ),
-                        (None, Some(l)) => self.gqa_attention(
-                            l,
-                            q,
-                            &cache.k,
-                            &cache.v,
-                            n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            cache.rows(),
-                        ),
-                        (None, None) => causal_gqa_attention_softcap(
-                            q,
-                            &cache.k,
-                            &cache.v,
-                            n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            cache.rows(),
-                            self.config.attn_logit_softcap,
-                        ),
-                    }
+                        sinks,
+                        softcap,
+                    ),
                 };
                 // AFTER the read, never inside `push`: the rows this
                 // drops are rows every kernel above has finished with
@@ -264,14 +335,8 @@ impl Decoder {
                     head_dim,
                     cache.seq_len(),
                     window,
-                    oai.map(|o| o.attn_sinks.as_slice()),
-                    // The sink arm carries no softcap, matching the
-                    // contiguous dispatch above.
-                    if oai.is_some() {
-                        None
-                    } else {
-                        self.config.attn_logit_softcap
-                    },
+                    sinks,
+                    softcap,
                 )
             }
         }

@@ -9,6 +9,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use clap::{Args, ValueEnum};
 use ferrox_core::cache::KvCache;
 use ferrox_gguf::ShardedGguf;
+use ferrox_models::tokenizer::SpecialTokens;
 use ferrox_models::{
     ensure_generic_decoder, load_gemma4_engine_from_path, load_glm52_engine_from_path,
     load_mla_engine_from_path, select_engine_kind, Decoder, Engine, GgufBpeTokenizer,
@@ -142,6 +143,71 @@ pub struct InferArgs {
     #[arg(long = "repeat-penalty", default_value_t = 1.1)]
     pub repeat_penalty: f32,
 
+    /// Locally typical sampling, llama.cpp's `--typical` (`1.0` = off).
+    ///
+    /// Keeps the candidates whose surprisal is closest to the
+    /// distribution's entropy, from the middle outward, rather than the
+    /// most likely ones -- so it can drop the most likely token.
+    #[arg(long = "typical", visible_alias = "typical-p", default_value_t = 1.0)]
+    pub typical_p: f32,
+
+    /// Truncate at `n` standard deviations of the logits below the
+    /// maximum, llama.cpp's `--top-nsigma` (`-1.0` = off).
+    #[arg(
+        long = "top-nsigma",
+        visible_alias = "top-n-sigma",
+        default_value_t = -1.0
+    )]
+    pub top_n_sigma: f32,
+
+    /// The probability that XTC removes the top candidates on any one
+    /// token, llama.cpp's `--xtc-probability` (`0.0` = off).
+    #[arg(long = "xtc-probability", default_value_t = 0.0)]
+    pub xtc_probability: f32,
+
+    /// The probability a candidate must reach before XTC may remove it,
+    /// llama.cpp's `--xtc-threshold`. **Above 0.5 disables XTC**, which
+    /// is upstream's guard: above a half at most one candidate can clear
+    /// it and XTC never removes the last one.
+    #[arg(long = "xtc-threshold", default_value_t = 0.1)]
+    pub xtc_threshold: f32,
+
+    /// DRY sequence-repetition penalty multiplier, llama.cpp's
+    /// `--dry-multiplier` (`0.0` = off).
+    ///
+    /// Unlike `--repeat-penalty`, which looks at single tokens, DRY
+    /// penalises the token that would EXTEND a repeated sequence, by
+    /// `multiplier * base ^ (length - allowed-length)`.
+    #[arg(long = "dry-multiplier", default_value_t = 0.0)]
+    pub dry_multiplier: f32,
+
+    /// The base of DRY's exponential, llama.cpp's `--dry-base`. Below
+    /// 1.0 disables DRY.
+    #[arg(long = "dry-base", default_value_t = 1.75)]
+    pub dry_base: f32,
+
+    /// Repetitions this long or shorter are free, llama.cpp's
+    /// `--dry-allowed-length`.
+    #[arg(long = "dry-allowed-length", default_value_t = 2)]
+    pub dry_allowed_length: i32,
+
+    /// How many recent tokens DRY scans for repetitions, llama.cpp's
+    /// `--dry-penalty-last-n` (`0` = off, `-1` = the context size).
+    #[arg(long = "dry-penalty-last-n", default_value_t = -1)]
+    pub dry_penalty_last_n: i32,
+
+    /// A string DRY refuses to look past, llama.cpp's
+    /// `--dry-sequence-breaker`. Repeatable.
+    ///
+    /// Giving any breaker CLEARS llama.cpp's defaults (`\n`, `:`, `"`,
+    /// `*`), exactly as upstream's flag does (`common/arg.cpp:2119`),
+    /// and the literal `none` clears them without adding one. The
+    /// strings are tokenised against the loaded model's own vocabulary,
+    /// so a checkpoint with no real vocabulary refuses DRY rather than
+    /// running it with no breakers.
+    #[arg(long = "dry-sequence-breaker", value_name = "STRING")]
+    pub dry_sequence_breaker: Vec<String>,
+
     /// The order the sampler chain runs in, `;`-separated, llama.cpp's
     /// `--samplers`.
     ///
@@ -205,6 +271,23 @@ pub struct InferArgs {
     /// The output is exactly what the target would have written alone.
     #[arg(long = "model-draft", short = 'd', value_name = "FILE")]
     pub model_draft: Option<String>,
+
+    /// LoRA adapter GGUF (llama.cpp's `--lora`), applied at scale 1.
+    /// Repeatable, and comma-separated values are accepted as upstream
+    /// accepts them. The file is what `convert_lora_to_gguf.py` writes.
+    ///
+    /// Every adapter is applied inside the projections it names
+    /// (`W x + scale * alpha / rank * B (A x)`); the fused Metal stacks
+    /// cannot see it and are refused for the whole model, so an adapted
+    /// model runs on the per-matrix path on every backend.
+    #[arg(long = "lora", value_name = "FILE", action = clap::ArgAction::Append)]
+    pub lora: Vec<String>,
+
+    /// LoRA adapter with a scale, `FILE:SCALE` (llama.cpp's
+    /// `--lora-scaled`). Repeatable; adapters are numbered in the order
+    /// given, every `--lora` before every `--lora-scaled`.
+    #[arg(long = "lora-scaled", value_name = "FILE:SCALE", action = clap::ArgAction::Append)]
+    pub lora_scaled: Vec<String>,
 
     /// Tokens the drafter proposes per verification step (llama.cpp's
     /// `--draft-max`, also spelled `--draft`).
@@ -338,12 +421,28 @@ impl TokenStep {
     /// when nothing needs to look at the vocabulary first, and a grammar
     /// does. Read by the Metal greedy guard, which used to test the
     /// temperature alone.
+    ///
+    /// `sampling` is taken because the CHAIN can need the vocabulary
+    /// too: `xtc` and `typ_p` remove candidates the argmax may be one
+    /// of, and `dry` and the repetition / presence / frequency
+    /// penalties move logits, so at `temperature <= 0` the answer is not
+    /// the argmax of what the device would fold.
+    /// `SamplingParams::greedy_equals_raw_argmax` is the one predicate
+    /// that decides it, shared with `ferrox_server::generate`'s copy of
+    /// this gate.
+    ///
+    /// RAW argmax, not `chain_keeps_the_argmax`: the fold argmaxes the
+    /// logits before anything on the host touches them, so the
+    /// penalties are skipped too. Reading the sampler's own
+    /// already-penalised predicate here was GitHub issue #170, and with
+    /// `--repeat-penalty` defaulting to 1.1 it was live on every plain
+    /// `--ngl 99 --temp 0` run.
     // Read only by the Metal greedy guard, so a CPU-only build has no
     // fold to refuse and this is genuinely dead there. Same shape and
     // same reason as `ferrox-models`'s `FoldedLmHead`.
     #[cfg_attr(not(feature = "metal"), allow(dead_code))]
-    pub fn needs_vocab_logits(&self) -> bool {
-        self.grammar.is_some()
+    pub fn needs_vocab_logits(&self, sampling: &ferrox_models::sampling::SamplingParams) -> bool {
+        self.grammar.is_some() || !sampling.greedy_equals_raw_argmax()
     }
 
     /// `Ok(None)` means the grammar is SATISFIED and has no legal
@@ -427,6 +526,34 @@ impl InferArgs {
         Ok(None)
     }
 
+    /// The DRY configuration these flags spell, before its sequence
+    /// breakers are tokenised.
+    ///
+    /// llama.cpp's `--dry-sequence-breaker` CLEARS the defaults the
+    /// first time it is given (`common/arg.cpp:2119-2126`) and reads
+    /// the literal `none` as "no breakers at all". Both are reproduced
+    /// here, and `none` anywhere in the list clears it, because a caller
+    /// who wrote it meant it.
+    pub fn dry_request(&self) -> ferrox_models::dry::DryRequest {
+        let sequence_breakers = if self.dry_sequence_breaker.is_empty() {
+            ferrox_models::dry::DEFAULT_SEQUENCE_BREAKERS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else if self.dry_sequence_breaker.iter().any(|s| s == "none") {
+            Vec::new()
+        } else {
+            self.dry_sequence_breaker.clone()
+        };
+        ferrox_models::dry::DryRequest {
+            multiplier: self.dry_multiplier,
+            base: self.dry_base,
+            allowed_length: self.dry_allowed_length,
+            penalty_last_n: self.dry_penalty_last_n,
+            sequence_breakers,
+        }
+    }
+
     /// The sampler these flags describe.
     ///
     /// One function rather than one copy per generation path. There were
@@ -435,18 +562,34 @@ impl InferArgs {
     /// repo's most expensive failure: adding `--min-p` meant editing
     /// four places, and a sampler added to three of them would be
     /// silently absent from the fourth with every test still green.
-    pub fn sampling(&self) -> SamplingParams {
-        SamplingParams {
+    ///
+    /// Fallible, and taking the vocabulary, because of DRY: its sequence
+    /// breakers are STRINGS that only mean something against a
+    /// particular tokenizer, so a checkpoint with no real vocabulary
+    /// must refuse `--dry-multiplier` rather than run DRY with no
+    /// breakers. `vocab` is `None` for exactly those checkpoints, and
+    /// `ctx_size` is what `--dry-penalty-last-n -1` resolves to.
+    pub fn sampling(
+        &self,
+        vocab: Option<&dyn ferrox_models::dry::DryVocab>,
+        ctx_size: usize,
+    ) -> anyhow::Result<SamplingParams> {
+        Ok(SamplingParams {
             temperature: self.temperature,
             top_p: self.top_p,
             min_p: self.min_p,
             top_k: self.top_k,
+            typical_p: self.typical_p,
+            top_n_sigma: self.top_n_sigma,
+            xtc_probability: self.xtc_probability,
+            xtc_threshold: self.xtc_threshold,
+            dry: self.dry_request().resolve(vocab, ctx_size)?,
             repetition_penalty: self.repeat_penalty,
             penalty_last_n: self.repeat_last_n,
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             sampler_order: self.samplers,
-        }
+        })
     }
 }
 
@@ -807,11 +950,27 @@ enum CliTokenizer {
 }
 
 impl CliTokenizer {
-    fn encode(&self, text: &str) -> Vec<usize> {
+    /// `specials` is llama.cpp's `parse_special`. The prompt sites pass
+    /// `Parse`, as `llama-completion` does for its prompt
+    /// (`tools/completion/completion.cpp`: `common_tokenize(ctx, prompt,
+    /// true, true)`); the DRY breakers below pass `AsText`.
+    fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<usize> {
         match self {
-            CliTokenizer::Bpe(t) => t.encode(text).into_iter().map(|id| id as usize).collect(),
-            CliTokenizer::Spm(t) => t.encode(text).into_iter().map(|id| id as usize).collect(),
-            CliTokenizer::Unigram(t) => t.encode(text).into_iter().map(|id| id as usize).collect(),
+            CliTokenizer::Bpe(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
+            CliTokenizer::Spm(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
+            CliTokenizer::Unigram(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
         }
     }
 
@@ -830,6 +989,35 @@ impl CliTokenizer {
             CliTokenizer::Spm(_) => "gguf-spm",
             CliTokenizer::Unigram(_) => "gguf-unigram",
         }
+    }
+
+    fn vocab_size(&self) -> usize {
+        match self {
+            CliTokenizer::Bpe(t) => t.vocab_size(),
+            CliTokenizer::Spm(t) => t.vocab_size(),
+            CliTokenizer::Unigram(t) => t.vocab_size(),
+        }
+    }
+}
+
+/// What the DRY sampler needs to tokenise its sequence breakers.
+///
+/// `ferrox-server` implements the same trait for its own tokenizer enum.
+/// Two implementations rather than one shared type because the two
+/// enums genuinely differ (the server carries a byte-level fallback the
+/// CLI does not), but they are held to ONE trait so the flag and the
+/// request field cannot mean different things.
+impl ferrox_models::dry::DryVocab for CliTokenizer {
+    fn n_tokens(&self) -> usize {
+        self.vocab_size()
+    }
+
+    fn detokenize(&self, token: usize) -> String {
+        self.decode(&[token])
+    }
+
+    fn tokenize(&self, text: &str) -> Vec<usize> {
+        self.encode(text, SpecialTokens::AsText)
     }
 }
 
@@ -1073,7 +1261,7 @@ pub(crate) fn load_decoder_streaming_if_needed(
         match ferrox_core::host_memory::plan_for(
             weights,
             available,
-            /* headroom = */ 4 * 1024 * 1024 * 1024,
+            ferrox_core::host_memory::FIT_HEADROOM_BYTES,
             /* floor = */ 2 * 1024 * 1024 * 1024,
         ) {
             ferrox_core::host_memory::FitPlan::Resident => None,
@@ -1142,6 +1330,22 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         .unwrap_or("unknown")
         .to_string();
     ferrox_models::mmproj::eprint_mmproj_if_present(path, Some(arch_early.as_str()));
+    let lora_specs =
+        ferrox_models::lora_attach::LoraSpec::from_flags(&args.lora, &args.lora_scaled)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !lora_specs.is_empty()
+        && (matches!(
+            select_engine_kind(&arch_early),
+            Ok(SelectedEngineKind::Mla | SelectedEngineKind::Gemma4)
+        ) || arch_early == "glm-dsa")
+    {
+        // The dedicated engines do not go through `Decoder`, and a
+        // flag that is accepted must reach the thing it names.
+        anyhow::bail!(
+            "--lora is not implemented for the {arch_early} engine (only the generic decoder \
+             attaches adapters); refusing rather than running the base weights"
+        );
+    }
     if matches!(select_engine_kind(&arch_early), Ok(SelectedEngineKind::Mla)) {
         return run_mla_infer(args, path, &file);
     }
@@ -1157,10 +1361,11 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     // builds plain Q/K/V. Sending them here made a real GLM-4.5-Air
     // download fail with "missing hparam glm4moe.attention.q_lora_rank",
     // a true statement about a key the architecture is not supposed to
-    // have. It now reaches the generic path and refuses there, naming
-    // the one thing that is actually missing -- the norm slot.
-    // See `crates/ferrox-models/tests/glm4moe_refusal.rs`.
-    if matches!(arch_early.as_str(), "glm-dsa" | "glm4") {
+    // have. It runs on the generic path now, audited against libllama
+    // (`crates/ferrox-models/tests/glm4moe_graphs.rs`), and so does
+    // `glm4` (GLM-4-0414, `tests/glm4_graphs.rs`), which had been sent
+    // here for the same four keys.
+    if arch_early == "glm-dsa" {
         return run_glm52_infer(args, path, &file);
     }
 
@@ -1223,10 +1428,14 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     // request, from `cparams.n_ctx_seq`).
     let mut config = config;
     config.apply_runtime_context(ctx_size);
-    let decoder = load_decoder_streaming_if_needed(path, config)?;
+    let mut decoder = load_decoder_streaming_if_needed(path, config)?;
+    decoder
+        .attach_lora_specs(&file, &lora_specs)
+        .map_err(|e| anyhow::anyhow!("lora: {e}"))?;
+    let decoder = decoder;
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
-    let mut tokens = tokenizer.encode(&prompt);
+    let mut tokens = tokenizer.encode(&prompt, SpecialTokens::Parse);
     // Match llama.cpp vocab add_bos (qwen2/BPE default false). Blindly
     // prepending bos_token_id poisons Qwen2-MoE (`<|endoftext|>`).
     ferrox_models::tokenizer::prepend_bos(
@@ -1251,7 +1460,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         (args.n_predict as usize).min(room)
     };
 
-    let sampling = args.sampling();
+    let sampling = args.sampling(Some(&tokenizer), ctx_size)?;
     let seed = seed_from_args(args.seed);
     let sampler = Sampler::new(seed);
     let mut step = token_step(
@@ -1280,7 +1489,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         // for `json_object`, and the third instance of it. The rule is
         // the server's: the fold is sound only when NOTHING needs to
         // inspect the vocabulary before a token is chosen.
-        if sampling.temperature <= 0.0 && !step.needs_vocab_logits() {
+        if sampling.temperature <= 0.0 && !step.needs_vocab_logits(&sampling) {
             ferrox_models::set_metal_greedy_argmax(true);
             Some(Guard)
         } else {
@@ -1288,11 +1497,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         }
     };
 
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
     // Speculative decoding with a real draft model, when `-d` names
     // one. The verification rule lives in `ferrox_models::speculative`
@@ -1406,7 +1611,7 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
     };
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
-    let mut tokens = tokenizer.encode(&prompt);
+    let mut tokens = tokenizer.encode(&prompt, SpecialTokens::Parse);
     ferrox_models::tokenizer::prepend_bos(
         &mut tokens,
         bos_id.filter(|_| ferrox_models::tokenizer::should_add_bos_token(file)),
@@ -1429,7 +1634,7 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
         (args.n_predict as usize).min(room)
     };
 
-    let sampling = args.sampling();
+    let sampling = args.sampling(Some(&tokenizer), ctx_size)?;
     let sampler = Sampler::new(seed_from_args(args.seed));
     let mut step = token_step(
         &args,
@@ -1537,7 +1742,7 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
     let engine = *engine;
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
-    let mut tokens = tokenizer.encode(&prompt);
+    let mut tokens = tokenizer.encode(&prompt, SpecialTokens::Parse);
     ferrox_models::tokenizer::prepend_bos(
         &mut tokens,
         bos_id.filter(|_| ferrox_models::tokenizer::should_add_bos_token(file)),
@@ -1560,7 +1765,7 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
         (args.n_predict as usize).min(room)
     };
 
-    let sampling = args.sampling();
+    let sampling = args.sampling(Some(&tokenizer), ctx_size)?;
     let sampler = Sampler::new(seed_from_args(args.seed));
     let mut step = token_step(
         &args,
@@ -1667,7 +1872,7 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
     };
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
-    let mut tokens = tokenizer.encode(&prompt);
+    let mut tokens = tokenizer.encode(&prompt, SpecialTokens::Parse);
     ferrox_models::tokenizer::prepend_bos(
         &mut tokens,
         bos_id.filter(|_| ferrox_models::tokenizer::should_add_bos_token(file)),
@@ -1690,7 +1895,7 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
         (args.n_predict as usize).min(room)
     };
 
-    let sampling = args.sampling();
+    let sampling = args.sampling(Some(&tokenizer), ctx_size)?;
     let sampler = Sampler::new(seed_from_args(args.seed));
     let mut step = token_step(
         &args,
@@ -1933,6 +2138,57 @@ mod tests {
         Cli::parse_from(full).infer
     }
 
+    /// GitHub issue #170, at the flag rather than at the predicate: the
+    /// DEFAULT `ferrox run -m … --temp 0 --ngl 99` must not let Metal
+    /// fold `lm_head + argmax` onto the device.
+    ///
+    /// `--repeat-penalty` defaults to **1.1** here, deliberately unlike
+    /// llama.cpp's 1.0 (`docs/FEATURES.md` records the difference), and
+    /// a device argmax over raw logits never applies it. The fold gate
+    /// read a predicate that tested XTC, typical-p and DRY and not the
+    /// penalties, so a plain greedy Metal run returned a token the host
+    /// sampler would not have chosen -- and agreed instead, byte for
+    /// byte, with the same run at `--repeat-penalty 1.0`.
+    ///
+    /// This test is here and not only in `ferrox-models` because the
+    /// DEFAULT is the thing that made it live: the predicate and the
+    /// flag are two structures that have to agree, and `ferrox-models`
+    /// cannot see this crate's `default_value_t`.
+    ///
+    /// Sabotage: set `default_value_t = 1.0` on `--repeat-penalty`; the
+    /// first assertion goes red.
+    #[test]
+    fn the_default_flags_forbid_the_metal_greedy_argmax_fold() {
+        let step = super::TokenStep::new(ferrox_models::sampling::Sampler::new(1), None);
+        let sampling = |argv: &[&str]| {
+            args(argv)
+                .sampling(None, 4096)
+                .expect("no --dry-multiplier, so no vocabulary is needed")
+        };
+
+        let defaults = sampling(&["-m", "m.gguf", "--temp", "0"]);
+        assert_eq!(defaults.repetition_penalty, 1.1, "llama.cpp's is 1.0");
+        assert!(
+            step.needs_vocab_logits(&defaults),
+            "the default repetition penalty is applied on the host, so the \
+             device must hand back a vocabulary and not one token id"
+        );
+
+        // Both of llama.cpp's off switches restore the fold, which is
+        // what makes the assertion above about the penalty and not about
+        // `--top-k 40` or `--min-p 0.05`, which default on too.
+        for off in [
+            ["-m", "m.gguf", "--temp", "0", "--repeat-penalty", "1.0"],
+            ["-m", "m.gguf", "--temp", "0", "--repeat-last-n", "0"],
+        ] {
+            let s = sampling(&off);
+            assert!(
+                !step.needs_vocab_logits(&s),
+                "{off:?} switches the penalties off, so the fold is exact again"
+            );
+        }
+    }
+
     /// The banner may not promise a KV dtype the run will not use.
     ///
     /// `ferrox -m m.gguf -dev cpu -ngl all` printed `ctk=f16` because
@@ -2053,11 +2309,14 @@ mod tests {
     /// same chain, so the two cannot drift apart.
     #[test]
     fn samplers_defaults_to_the_chain_ferrox_already_ran() {
-        let default = args(&["-m", "x.gguf"]).sampling().sampler_order;
+        let default = args(&["-m", "x.gguf"])
+            .sampling(None, 4096)
+            .expect("no dry, so no vocabulary is needed")
+            .sampler_order;
         assert_eq!(default, ferrox_models::SamplerOrder::default());
         assert_eq!(
             default.to_string(),
-            "penalties;top_k;top_p;min_p;temperature"
+            "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature"
         );
     }
 
@@ -2065,13 +2324,15 @@ mod tests {
     #[test]
     fn a_caller_supplied_order_reaches_the_sampler() {
         let order = args(&["-m", "x.gguf", "--samplers", "penalties;temperature;top_k"])
-            .sampling()
+            .sampling(None, 4096)
+            .expect("no dry")
             .sampler_order;
         assert_eq!(order.to_string(), "penalties;temperature;top_k");
         // llama.cpp's own aliases, so an upstream command line works.
         assert_eq!(
             args(&["-m", "x.gguf", "--samplers", "top-k;min-p;temp"])
-                .sampling()
+                .sampling(None, 4096)
+                .expect("no dry")
                 .sampler_order
                 .to_string(),
             "top_k;min_p;temperature"
@@ -2092,12 +2353,23 @@ mod tests {
             "-m",
             "x.gguf",
             "--samplers",
-            "dry;top_k;typ_p;top_p;min_p;xtc;temperature",
+            "penalties;mirostat;temperature",
         ])
-        .expect_err("upstream's default names samplers ferrox lacks")
+        .expect_err("mirostat is not a chain member here")
         .to_string();
-        assert!(err.contains("dry"), "{err}");
+        assert!(err.contains("mirostat"), "{err}");
         assert!(err.contains("not implemented"), "{err}");
+
+        // And llama.cpp's OWN default string now parses, which is the
+        // point of this change: pasting an upstream command line works.
+        Cli::try_parse_from([
+            "ferrox",
+            "-m",
+            "x.gguf",
+            "--samplers",
+            "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature",
+        ])
+        .expect("llama.cpp's default chain is ferrox's default chain");
 
         let unknown = Cli::try_parse_from(["ferrox", "-m", "x.gguf", "--samplers", "top_kk"])
             .expect_err("no such sampler")

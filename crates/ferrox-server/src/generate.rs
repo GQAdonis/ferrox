@@ -17,7 +17,7 @@ use ferrox_core::cache::{
     PagedStoreExhausted, SharedPagedKv,
 };
 use ferrox_models::sampling::SamplingParams;
-use ferrox_models::tokenizer::{prepend_bos, StopTokens};
+use ferrox_models::tokenizer::{prepend_bos, SpecialTokens, StopTokens};
 use ferrox_models::{Ceiling, Decoder, Engine, KvElem, KvShape, PrefixCache, TextTokenizer};
 
 use crate::budget::ContextCeiling;
@@ -77,6 +77,16 @@ pub enum DecodeError {
     /// is carried in `detail`.
     #[error("grammar-constrained decoding stopped: {detail}")]
     GrammarConstraint { detail: String },
+    /// A reasoning budget reached the sampler that it could not
+    /// enforce: unresolved (a path skipped the tokenizer seam that
+    /// turns the caller's number into token sequences) or asked of a
+    /// family whose closer cannot be forced. Either way the only
+    /// alternative is an unbounded thought served as a bounded one, so
+    /// this stops instead. Both causes are meant to be caught earlier
+    /// -- the route refuses the family with a 501 -- which is why this
+    /// is an error and not a fallback.
+    #[error("reasoning budget could not be enforced: {detail}")]
+    ReasoningBudget { detail: String },
 }
 
 impl DecodeError {
@@ -88,6 +98,7 @@ impl DecodeError {
             // The same grammar against the same vocabulary fails the
             // same way on every retry.
             DecodeError::GrammarConstraint { .. } => None,
+            DecodeError::ReasoningBudget { .. } => None,
             // Retrying an over-budget request changes nothing: the
             // ceiling it hit is the whole server, not the current load.
             DecodeError::KvBudgetExceeded { .. } => None,
@@ -909,17 +920,8 @@ fn acquire_pooled_caches(
     let deadline = Instant::now() + config.queue_wait;
     loop {
         let attempt: Result<Vec<KvCache>, CacheKvPoolExhausted> = decoder
-            .layers
-            .iter()
-            .map(|_| {
-                KvCache::with_pool(
-                    decoder.config.n_kv_heads,
-                    decoder.config.head_dim,
-                    Arc::clone(&config.pool),
-                    max_seq_len,
-                )
-            })
-            .collect();
+            .config
+            .new_kv_caches_with_pool(&config.pool, max_seq_len);
         let now = Instant::now();
         if attempt.is_ok() || now >= deadline {
             return attempt;
@@ -1112,6 +1114,20 @@ pub struct GenerationParams {
     /// ignore the model's opinion about length is not the caller
     /// withdrawing their own fence.
     pub ignore_eos: bool,
+    /// llama.cpp's `reasoning_budget_tokens`: a token budget for the
+    /// chain of thought, enforced in the sampler by forcing the closer
+    /// once it is spent. `Unrestricted` (llama.cpp's `-1`) is no
+    /// machine at all. A `Requested` number becomes an `Armed` plan at
+    /// the same seam that resolves `stop_token_ids`, because both need
+    /// the tokenizer -- and the sampler refuses a `Requested` budget
+    /// rather than run without it. See [`crate::reasoning_budget`].
+    pub reasoning_budget: crate::reasoning_budget::ReasoningBudget,
+    /// A per-request override of every LoRA adapter's scale, by id --
+    /// the request's `lora: [{id, scale}]` field resolved against the
+    /// loaded adapters (`crate::lora::resolve_request`). `None` runs
+    /// with the scales `POST /lora-adapters` (or the command line) set;
+    /// `Some` makes the generation exclusive for its duration.
+    pub lora: Option<Vec<f32>>,
 }
 
 impl GenerationParams {
@@ -1155,8 +1171,31 @@ impl GenerationParams {
     /// reason its output parses, so a folded argmax under a grammar is
     /// unconstrained text served against a `response_format` the caller
     /// was told was honoured.
+    ///
+    /// The sampler arm is the third such thing, and it arrived with
+    /// llama.cpp's `xtc` and `typ_p`. Both of those can remove the
+    /// MAXIMUM from the candidate list, and `dry` can move which logit
+    /// the maximum is, so at `temperature <= 0` the answer is no longer
+    /// the argmax of the raw logits. A device that folded the argmax
+    /// away would hand the sampler one precomputed id with no
+    /// vocabulary left for XTC to remove anything from, and XTC would
+    /// silently not run. `SamplingParams::greedy_equals_raw_argmax` is
+    /// the single predicate deciding that, shared with
+    /// `ferrox_cli::run`'s copy of this gate.
+    ///
+    /// The repetition / presence / frequency penalties are the FOURTH,
+    /// and they were missing from that predicate until GitHub issue
+    /// #170. They move logits over the whole vocabulary before the
+    /// candidate list exists, so a device argmax over raw logits skips
+    /// them entirely -- a wrong token, not a wrong distribution. A
+    /// request carrying any of `repeat_penalty`, `presence_penalty` or
+    /// `frequency_penalty` therefore needs the vocabulary even at
+    /// `temperature: 0`.
     pub(crate) fn needs_vocab_logits(&self) -> bool {
-        self.json_object || self.grammar.is_some()
+        self.json_object
+            || self.grammar.is_some()
+            || self.reasoning_budget.needs_vocab_logits()
+            || !self.sampling.greedy_equals_raw_argmax()
     }
 }
 
@@ -1180,10 +1219,12 @@ pub(crate) fn greedy_gpu_fold_allowed(params: &GenerationParams) -> bool {
 }
 
 fn chunked_prefill_tokens() -> Option<usize> {
-    std::env::var("FERROX_CHUNKED_PREFILL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n > 0)
+    std::env::var(
+        crate::prefill_batch::PREFILL_CHUNK_ENV_KEYS[crate::prefill_batch::PRIVATE_PATH_KEY],
+    )
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .filter(|&n| n > 0)
 }
 
 #[cfg(feature = "metal")]
@@ -1205,7 +1246,7 @@ fn cpu_kv_offload_enabled() -> bool {
 /// request restoring it answered fluent nonsense. Paid for only when a
 /// prefix cache is configured, because it costs one KV download per
 /// layer and nothing else in this path reads the rows back.
-fn forward_prompt_batch(
+pub(crate) fn forward_prompt_batch(
     decoder: &Decoder,
     tokens: &[usize],
     start_pos: usize,
@@ -1291,7 +1332,10 @@ pub fn generate(
         }
     };
 
-    let mut tokens = tokenizer.encode(prompt);
+    // `Parse`: the prompt is what a chat template rendered, or a raw
+    // completion, and llama.cpp's server tokenizes both with
+    // `parse_special = true`. See `Model::encode`.
+    let mut tokens = tokenizer.encode(prompt, SpecialTokens::Parse);
     prepend_bos(&mut tokens, bos_id);
     let prompt_tokens = tokens.len();
     if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab_size) {
@@ -1479,13 +1523,7 @@ pub fn generate(
                 acquire_pooled_caches(decoder, config, max_seq_len)
                     .map_err(|_| DecodeError::KvPoolExhausted)?,
             ),
-            (None, None) => Kv::Contiguous(
-                decoder
-                    .layers
-                    .iter()
-                    .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-                    .collect(),
-            ),
+            (None, None) => Kv::Contiguous(decoder.config.new_kv_caches()),
         };
         // Process the prompt once, capturing the *last* call's logits
         // (which already predict the first generated token) instead of
@@ -1820,7 +1858,8 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
     mut emit: impl FnMut(&str),
 ) -> Result<(FinishReason, Usage), DecodeError> {
     let vocab_size = engine.vocab_size();
-    let mut tokens = tokenizer.encode(prompt);
+    // `Parse`, as the GGUF path above. See `Model::encode`.
+    let mut tokens = tokenizer.encode(prompt, SpecialTokens::Parse);
     prepend_bos(&mut tokens, bos_id);
     let prompt_tokens = tokens.len();
     if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab_size) {
@@ -1956,6 +1995,8 @@ mod tests {
             grammar: None,
             cancel: None,
             ignore_eos: false,
+            reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+            lora: None,
         }
     }
 
@@ -1979,21 +2020,13 @@ mod tests {
         let decoder = small_decoder();
         let tokens = vec![1usize, 2, 3, 4];
 
-        let mut fresh_caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut fresh_caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let batch_logits = decoder.forward_batch(&tokens, 0, &mut fresh_caches);
         let ground_truth_next_logits = batch_logits.last().unwrap().clone();
 
         // The exact pattern `generate` now uses: one forward_token call
         // per prompt token, keeping the last call's logits.
-        let mut caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let mut logits = Vec::new();
         for (pos, &tok) in tokens.iter().enumerate() {
             logits = decoder.forward_token(tok, pos, &mut caches);
@@ -2046,11 +2079,7 @@ mod tests {
         // is lossy per non-ASCII byte, so decoding token-by-token vs.
         // decoding the whole sequence at once are not equivalent; this
         // must replicate the real call pattern, not just the ids).
-        let mut caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let mut logits = decoder
             .forward_batch(&prompt_ids, 0, &mut caches)
             .pop()
@@ -2216,11 +2245,7 @@ mod tests {
     /// `s.bytes().next()` off that recovers 0xEF (239), not the
     /// original token id.
     fn greedy_next_token_after(decoder: &Decoder, prompt_ids: &[usize]) -> usize {
-        let mut caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let logits = decoder
             .forward_batch(prompt_ids, 0, &mut caches)
             .pop()
@@ -2350,6 +2375,8 @@ mod tests {
                 grammar: None,
                 cancel: None,
                 ignore_eos: false,
+                reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+                lora: None,
             },
             None,
             None,
@@ -2512,6 +2539,8 @@ mod tests {
             grammar: None,
             cancel: None,
             ignore_eos: false,
+            reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+            lora: None,
         }
     }
 
@@ -2807,6 +2836,8 @@ mod tests {
                 grammar: None,
                 cancel: None,
                 ignore_eos: false,
+                reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+                lora: None,
             },
             None,
             None,
@@ -3159,13 +3190,7 @@ mod tests {
         share_prefixes: bool,
     ) -> PagedKvConfig {
         PagedKvConfig {
-            store: Arc::new(SharedPagedKv::new(
-                decoder.layers.len(),
-                block_size,
-                blocks,
-                decoder.config.n_kv_heads,
-                decoder.config.head_dim,
-            )),
+            store: Arc::new(decoder.config.new_paged_kv(block_size, blocks)),
             queue_wait: Duration::ZERO,
             radix: share_prefixes.then(|| {
                 Arc::new(Mutex::new(crate::policy::radix::RadixCache::new(
@@ -3284,7 +3309,7 @@ mod tests {
     fn windowed_decoder(window: usize) -> Decoder {
         let mut cfg = test_dense_fixture();
         cfg.sliding_window = Some(window);
-        cfg.swa_pattern = None;
+        cfg.swa_layers = ferrox_models::swa_layers::SwaLayers::All;
         Decoder::new_random_small(cfg, 2, 256)
     }
 
@@ -3392,7 +3417,7 @@ mod tests {
         // rather than a refusal.
         let mut alternating_cfg = test_dense_fixture();
         alternating_cfg.sliding_window = Some(window);
-        alternating_cfg.swa_pattern = Some(2);
+        alternating_cfg.swa_layers = ferrox_models::swa_layers::SwaLayers::period(2, false);
         let alternating = Decoder::new_random_small(alternating_cfg, 2, 256);
         assert_eq!(alternating.config.kv_block_window(), Some(window));
         assert_eq!(alternating.config.uniform_sliding_window(), None);
@@ -4145,7 +4170,7 @@ mod tests {
         let full = small_decoder();
         let mut alternating_cfg = test_dense_fixture();
         alternating_cfg.sliding_window = Some(4);
-        alternating_cfg.swa_pattern = Some(2);
+        alternating_cfg.swa_layers = ferrox_models::swa_layers::SwaLayers::period(2, false);
         let alternating = Decoder::new_random_small(alternating_cfg, 2, 256);
         assert_eq!(
             alternating.config.uniform_sliding_window(),

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `deepseek2` GGUF used by ferrox's MLA
-hparam-contract test.
+"""Generate the tiny synthetic `deepseek2` GGUFs used by ferrox's MLA
+hparam-contract test and the MLA engine's libllama-golden test.
 
 `deepseek2` is what DeepSeek-V2, V2.5, V3 and R1 all tag, so it is the
 architecture behind the largest open models people run. ferrox routes it
@@ -31,21 +31,58 @@ llama.cpp's own converter emits, transcribed from
     **split** `blk.N.attn_k_b` / `blk.N.attn_v_b` (deepseek2.cpp:120-122),
     not the legacy combined `attn_kv_b`. The converter splits them at
     conversion time (deepseek.py:426-427).
+  * `attention.head_count_kv` is **1**: `deepseek.py:307-308` sets
+    `num_key_value_heads = 1` for every MLA export ("deepseek2 using MLA
+    converts into MQA"), because the cache holds ONE latent per position.
+    This script wrote `N_HEAD` until 2026-09-12, and that -- not a
+    llama.cpp defect -- was the `ggml.c:3942` shape abort that kept the
+    file from ever producing a golden.
 
-No RoPE scaling is declared, which keeps llama.cpp's YaRN `mscale`
-correction at 1.0 (`attn_factor_org * ...` with `freq_scale = 1` makes
-every `logf(1/freq_scale)` term vanish, deepseek2.cpp:444-448). A fixture
-that exercises `rope_yarn_log_mul` is a separate, larger job.
+`--legacy-kv-b` writes the OTHER form llama.cpp reads (`deepseek2.cpp:
+118-123`, `is_mla()` false): no `_mla` keys, `attention.key_length` =
+qk_nope + qk_rope and `attention.value_length` = v_head_dim as per-head
+widths, `head_count_kv = N_HEAD`, and ONE combined `attn_kv_b` per layer
+`{kv_lora_rank, n_head * (qk_nope + v)}` -- the pre-2025-03 converter's
+output, and `plm`'s shape. The split `attn_k_b` / `attn_v_b` of the
+default file are DERIVED from that same combined matrix exactly as
+`deepseek.py:420-427` derives them (the k half transposed), so the two
+files hold the same model and llama.cpp's absorbed and naive branches
+should agree on them to float noise; that agreement is one of the things
+the golden test measures.
+
+No RoPE scaling is declared by default, which keeps llama.cpp's YaRN
+`mscale` correction at 1.0 (`attn_factor_org * ...` with `freq_scale =
+1` makes every `logf(1/freq_scale)` term vanish, deepseek2.cpp:444-448).
+
+`--yarn MSCALE_ALL_DIM` writes what `conversion/base.py:1231-1235` and
+`conversion/deepseek.py:363-368` write for a real DeepSeek: `rope.
+scaling.type = yarn`, `factor = 4`, `original_context_length = 16` (the
+served context is 64), and `yarn_log_multiplier = 0.1 * MSCALE_ALL_DIM`
+-- `0.707` is DeepSeek-V2 / V2-Lite (`config.json`: `mscale ==
+mscale_all_dim == 0.707`), `1.0` is DeepSeek-V3 / R1. No beta keys, as
+the converters write none for these configs. What llama.cpp does with
+them is `crates/ferrox-models/src/mla_yarn.rs`; this fixture is how it
+is checked, because `deepseek2.cpp:34-37` divide the key by 0.1 and
+`llama-context.cpp:202-215` special-case `LLM_ARCH_DEEPSEEK2`, and a
+reading of either can be wrong in a way only libllama's logits show.
+
+`--temperature` writes the same file with `attention.temperature_scale
+= 0.5` and `attention.temperature_length = 2`, the two keys
+`deepseek2.cpp:46-47` read for Mistral-Large-3's per-position attention
+temperature (`conversion/mistral.py:110,177`). llama.cpp's loader
+accepts it and reads both keys (measured, `llama_model_loader: - kv
+27/28`) and runs the graph; ferrox's MLA engine has no per-position Q
+scale and REFUSES the file by name (`crate::attn_temperature`), where it
+used to load and drop the key, so no golden is checked in for it.
 
 Usage:
     PYTHONPATH=/path/to/llama.cpp/gguf-py \\
-        python3 scripts/make_deepseek2_fixture.py OUT.gguf
+        python3 scripts/make_deepseek2_fixture.py OUT.gguf [--temperature] [--legacy-kv-b] [--yarn MSCALE_ALL_DIM]
 
-That the file is a *valid* deepseek2 checkpoint was checked by running
-llama.cpp's own loader over it (`scripts/gptoss_reference_logits.cpp`
-against a real `libllama`). No golden logits are checked in: ferrox's
-MLA loader refuses this file before any graph runs — see
-`crates/ferrox-models/tests/deepseek2_mla_hparams.rs`.
+The golden values that go with the default and `--legacy-kv-b` files
+are produced by llama.cpp itself (`scripts/gptoss_reference_logits.cpp`
+against a real `libllama`), not by this script; see
+`crates/ferrox-models/tests/deepseek2_graphs.rs`.
 """
 
 import sys
@@ -80,7 +117,20 @@ EXPERT_WEIGHTS_SCALE = 2.5
 K_MLA = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
 
 
-def main(out_path: str) -> None:
+# The Mistral-Large-3 keys, for the `--temperature` variant. A floor
+# of 2 steps twice inside llama.cpp's six-token reference prompt.
+TEMP_SCALE = 0.5
+TEMP_LENGTH = 2
+YARN_FACTOR = 4.0
+YARN_ORIG_CTX = 16
+
+
+def main(
+    out_path: str,
+    temperature: bool = False,
+    legacy_kv_b: bool = False,
+    yarn_mscale_all_dim: float | None = None,
+) -> None:
     rng = np.random.default_rng(0xD5002)
 
     def rnd(*shape: int) -> np.ndarray:
@@ -93,21 +143,35 @@ def main(out_path: str) -> None:
     w.add_embedding_length(N_EMBD)
     w.add_feed_forward_length(N_FF)
     w.add_head_count(N_HEAD)
-    w.add_head_count_kv(N_HEAD)
+    # deepseek.py:307-308 for an MLA export; the pre-MLA converter wrote
+    # num_key_value_heads, which DeepSeek's configs set equal to n_head.
+    w.add_head_count_kv(N_HEAD if legacy_kv_b else 1)
     w.add_layer_norm_rms_eps(RMS_EPS)
     w.add_rope_freq_base(ROPE_BASE)
+    if yarn_mscale_all_dim is not None:
+        # conversion/base.py:1231-1235 and deepseek.py:363-368.
+        w.add_rope_scaling_type(gguf.RopeScalingType.YARN)
+        w.add_rope_scaling_factor(YARN_FACTOR)
+        w.add_rope_scaling_orig_ctx_len(YARN_ORIG_CTX)
+        w.add_rope_scaling_yarn_log_mul(0.1 * yarn_mscale_all_dim)
     # deepseek.py:356 -- the ROPE half of the head, not the whole head.
     w.add_rope_dimension_count(QK_ROPE_HEAD_DIM)
     w.add_vocab_size(N_VOCAB)
     w.add_leading_dense_block_count(N_DENSE_LEAD)
     w.add_q_lora_rank(Q_LORA_RANK)
     w.add_kv_lora_rank(KV_LORA_RANK)
-    # deepseek.py:333-334: the COMPRESSED widths.
-    w.add_key_length(KV_LORA_RANK + QK_ROPE_HEAD_DIM)
-    w.add_value_length(KV_LORA_RANK)
-    # deepseek.py:334-335: the per-head widths.
-    w.add_key_length_mla(K_MLA)
-    w.add_value_length_mla(V_HEAD_DIM)
+    if legacy_kv_b:
+        # The pre-MLA converter: per-head widths under the plain keys,
+        # no `_mla` keys, so `is_mla()` is false (llama-hparams.cpp:244).
+        w.add_key_length(K_MLA)
+        w.add_value_length(V_HEAD_DIM)
+    else:
+        # deepseek.py:333-334: the COMPRESSED widths.
+        w.add_key_length(KV_LORA_RANK + QK_ROPE_HEAD_DIM)
+        w.add_value_length(KV_LORA_RANK)
+        # deepseek.py:334-335: the per-head widths.
+        w.add_key_length_mla(K_MLA)
+        w.add_value_length_mla(V_HEAD_DIM)
     w.add_expert_feed_forward_length(N_FF_EXP)
     w.add_expert_count(N_EXPERT)
     w.add_expert_used_count(N_EXPERT_USED)
@@ -116,6 +180,10 @@ def main(out_path: str) -> None:
     w.add_expert_weights_norm(True)
     w.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
     w.add_file_type(gguf.LlamaFileType.ALL_F32)
+    if temperature:
+        # conversion/mistral.py:110 and :177, verbatim.
+        w.add_attn_temperature_scale(TEMP_SCALE)
+        w.add_attn_temperature_length(TEMP_LENGTH)
 
     tokens = ["<unk>", "<s>", "</s>"] + [f"tok{i}" for i in range(3, N_VOCAB)]
     w.add_tokenizer_model("llama")
@@ -147,12 +215,22 @@ def main(out_path: str) -> None:
         )
         w.add_tensor(p + "attn_kv_a_norm.weight", rnd(KV_LORA_RANK))
 
-        # Split decompression, per head. ne = [qk_nope, kv_lora, n_head]
-        # and [kv_lora, v_head_dim, n_head] -> reversed for numpy.
-        w.add_tensor(
-            p + "attn_k_b.weight", rnd(N_HEAD, KV_LORA_RANK, QK_NOPE_HEAD_DIM)
-        )
-        w.add_tensor(p + "attn_v_b.weight", rnd(N_HEAD, V_HEAD_DIM, KV_LORA_RANK))
+        # ONE combined decompression, drawn once so both file forms hold
+        # the same model: ne = [kv_lora, n_head * (qk_nope + v)] ->
+        # numpy (n_head * (qk_nope + v), kv_lora), head-major.
+        kv_b = rnd(N_HEAD * (QK_NOPE_HEAD_DIM + V_HEAD_DIM), KV_LORA_RANK)
+        if legacy_kv_b:
+            w.add_tensor(p + "attn_kv_b.weight", kv_b)
+        else:
+            # deepseek.py:420-427: per head, the k half TRANSPOSED
+            # (`ne = [qk_nope, kv_lora, n_head]`, numpy (n_head, kv_lora,
+            # qk_nope)) and the v half as is (`ne = [kv_lora, v_head,
+            # n_head]`, numpy (n_head, v_head, kv_lora)).
+            per_head = kv_b.reshape(N_HEAD, QK_NOPE_HEAD_DIM + V_HEAD_DIM, KV_LORA_RANK)
+            k_b = np.ascontiguousarray(per_head[:, :QK_NOPE_HEAD_DIM, :].transpose(0, 2, 1))
+            v_b = np.ascontiguousarray(per_head[:, QK_NOPE_HEAD_DIM:, :])
+            w.add_tensor(p + "attn_k_b.weight", k_b)
+            w.add_tensor(p + "attn_v_b.weight", v_b)
 
         w.add_tensor(p + "attn_output.weight", rnd(N_EMBD, N_HEAD * V_HEAD_DIM))
         w.add_tensor(p + "ffn_norm.weight", rnd(N_EMBD))
@@ -188,4 +266,13 @@ def main(out_path: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "deepseek2-fixture.gguf")
+    args = sys.argv[1:]
+    yarn = None
+    if "--yarn" in args:
+        yarn = float(args[args.index("--yarn") + 1])
+    main(
+        args[0] if args and not args[0].startswith("--") else "deepseek2-fixture.gguf",
+        temperature="--temperature" in args,
+        legacy_kv_b="--legacy-kv-b" in args,
+        yarn_mscale_all_dim=yarn,
+    )

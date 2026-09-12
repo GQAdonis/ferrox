@@ -1,12 +1,11 @@
-//! The five ONE-MATCH-ARM architectures, checked against llama.cpp
-//! itself.
+//! The ONE-MATCH-ARM architectures, checked against llama.cpp itself.
 //!
 //! `capability.rs` triaged 46 unaudited architectures into four classes.
-//! Seven were ONE MATCH ARM: one small, nameable piece missing -- an
-//! activation, a norm slot, a routing flag, an ordering. Five of those
-//! seven are closed here. Each needed a different arm, and each fixture
-//! is built so that getting THAT arm wrong is a large, obvious
-//! divergence rather than a rounding difference:
+//! ONE MATCH ARM means one small, nameable piece missing -- an
+//! activation, a norm slot, a routing flag, an ordering. Seven are
+//! closed here. Each needed a different arm, and each fixture is built
+//! so that getting THAT arm wrong is a large, obvious divergence rather
+//! than a rounding difference:
 //!
 //! | arch | the arm | what would break |
 //! |---|---|---|
@@ -15,6 +14,18 @@
 //! | `seed_oss` | pre-FFN norm lives in `post_attention_norm` | a whole RMSNorm on the wrong side of a residual |
 //! | `maincoder` | QK norm AFTER RoPE | every layer's attention scores |
 //! | `hunyuan-moe` | QK norm AFTER RoPE | every layer's attention scores |
+//! | `hunyuan-dense` | NTK-alpha RoPE base rescale (and the same QK-norm order) | every position, on every layer |
+//! | `ernie4_5-moe` | `interleave_moe_layer_step`, landed as a REFUSAL | see below |
+//!
+//! **One of the seven arms could not be implemented, and that is the
+//! finding rather than a shortfall.** `ernie4_5-moe`'s interleave step
+//! is real in llama.cpp's GRAPH (`ernie4-5-moe.cpp:64`) and absent from
+//! llama.cpp's own TENSOR LOADER (`ernie4-5.cpp:49`), so the two agree
+//! only where the step changes nothing and a genuinely interleaved
+//! checkpoint cannot be loaded by llama.cpp at all -- measured, on the
+//! two-step fixture this suite ships. The step every real checkpoint
+//! carries is audited here; anything else is refused by name and the
+//! refusal says why.
 //!
 //! **Where the numbers come from.** Each `GOLDEN` array below was
 //! produced by running **llama.cpp's own graph** for that architecture
@@ -47,6 +58,7 @@ use common::{
     assert_all_three_paths_match, graph_caches as caches, graph_fixture_path as fixture,
     load_graph_fixture as load, worst_vs, GRAPH_PROMPT as PROMPT,
 };
+use ferrox_gguf::TensorSource;
 use ferrox_models::capability::QkNormStyle;
 use ferrox_models::{Decoder, ModelConfig};
 
@@ -332,7 +344,11 @@ fn seed_oss_takes_the_norm_slot_without_taking_gpt_osss_other_tensors() {
             "blk.{il}: post_attention_norm must be the pre-FFN norm here"
         );
         assert!(
-            layer.moe.norm_weight.iter().any(|w| *w != 0.0),
+            layer
+                .moe
+                .norm_weight
+                .rms_weights()
+                .is_some_and(|w| w.iter().any(|x| *x != 0.0)),
             "blk.{il}: the pre-FFN norm must have been loaded from somewhere"
         );
     }
@@ -513,4 +529,773 @@ fn norming_before_rope_instead_of_after_diverges_from_llama_cpp() {
              the fixture cannot see this arm"
         );
     }
+}
+
+// --- hunyuan-dense: the NTK-alpha RoPE base rescale -----------------
+//
+// `hunyuan-dense` has no graph of its own: `src/models/models.h:1830-1834`
+// derives `llama_model_hunyuan_dense` from `llama_model_hunyuan_vl` and
+// reuses its hparams, its tensors and its graph, so the file to read is
+// `src/models/hunyuan-vl.cpp`. It had two blockers and both are closed
+// here.
+//
+// The arm: `:8-12` rescales the trained RoPE base by
+// `alpha^(head_dim / (head_dim - 2))` when `{arch}.rope.scaling.alpha`
+// is positive. That key is read for EVERY architecture at
+// `llama-model.cpp:1186` and applied by exactly two graphs, which is why
+// ferrox's `rope_ntk_alpha` is a named list and not a generic rule.
+//
+// The second half, per-head QK norm applied AFTER RoPE (`:56-66` rope,
+// then `:73-81` norm), was already implemented as
+// `Decoder::qk_norm_after_rope` for `maincoder` and `hunyuan-moe`; this
+// row only had to be added to the list.
+//
+// WHAT THE VERDICT GOT WRONG, and the fixture is what found it: the
+// triage cited `conversion/hunyuan.py:356` as the converter line that
+// writes `{arch}.rope.scaling.alpha` for this architecture. That line is
+// in `HunyuanVLTextModel`, whose `model_arch` is `HUNYUAN_VL` -- a
+// different GGUF architecture string and a different, still-refusing
+// row. The `HUNYUAN_DENSE` converter is `HunYuanModel` at :254-281, and
+// it does the same arithmetic in PYTHON (`scaled_base = base * (alpha **
+// (dim / (dim - 2)))`, :270) and writes the already-scaled value through
+// `add_rope_freq_base`, with no alpha key at all. So on a converted file
+// llama.cpp's :8-12 is a no-op. The fixture writes the key explicitly so
+// that the arm ferrox implements is the arm the reference runs, and
+// libllama prints `freq_base_train = 92100.8` for a file whose
+// `rope.freq_base` is 500.
+
+const HUNYUAN_DENSE_GOLDEN: [f32; 48] = [
+    0.22020058,
+    0.63418895,
+    0.20907053,
+    0.3790403,
+    -0.11444236,
+    0.057364255,
+    -0.34231323,
+    -0.072572984,
+    -0.5012044,
+    0.17969774,
+    -0.45948866,
+    0.09718554,
+    0.3629007,
+    -0.20113428,
+    0.27587852,
+    -0.35394314,
+    0.1426361,
+    -0.12607718,
+    0.058810126,
+    -0.47764817,
+    0.17408267,
+    0.19744661,
+    0.21505915,
+    0.19182259,
+    -0.09484324,
+    0.012222506,
+    0.12370877,
+    0.061753318,
+    0.2311838,
+    -0.23603764,
+    -0.29653496,
+    -0.43558064,
+    0.8097959,
+    -0.19447437,
+    0.30741596,
+    0.0015857695,
+    -0.18803233,
+    0.09101723,
+    0.59113497,
+    -0.22490542,
+    -0.2511651,
+    -0.1257552,
+    -0.12590414,
+    -0.119154006,
+    -0.033712514,
+    0.104955494,
+    0.08142837,
+    0.37710968,
+];
+
+#[test]
+fn hunyuan_dense_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match("hunyuan_dense", &HUNYUAN_DENSE_GOLDEN);
+}
+
+/// The rescale really ran, and it produced llama.cpp's own number.
+///
+/// `92100.8` is what libllama prints as `freq_base_train` for this
+/// fixture, whose file says `rope.freq_base = 500` and
+/// `rope.scaling.alpha = 50`. Asserting the resolved base rather than
+/// only the logits means a regression names itself instead of arriving
+/// as forty-eight wrong floats.
+#[test]
+fn hunyuan_dense_rotates_at_the_ntk_alpha_rescaled_base() {
+    let path = fixture("hunyuan_dense");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    assert_eq!(
+        file.metadata_f32("hunyuan-dense.rope.freq_base"),
+        Some(500.0),
+        "the fixture must carry the UNSCALED base, or it pins nothing about the rescale"
+    );
+    assert_eq!(
+        file.metadata_f32("hunyuan-dense.rope.scaling.alpha"),
+        Some(50.0),
+        "and it must carry the alpha, which no converter writes for this architecture"
+    );
+    let d = load("hunyuan_dense");
+    let want = 500.0f32 * 50.0f32.powf(8.0 / 6.0);
+    assert!(
+        (d.config.rope_theta - want).abs() < 1e-1,
+        "rope_theta resolved to {}, want {want} (libllama prints freq_base_train = 92100.8)",
+        d.config.rope_theta
+    );
+    // The other half of the row, and the reason it was one arm rather
+    // than two.
+    assert!(d.qk_norm_after_rope, "hunyuan-vl.cpp:56-66 then :73-81");
+    assert_eq!(d.config.qk_norm_style, QkNormStyle::PerHead);
+    assert_eq!(d.config.rope_layout, ferrox_models::RopeLayout::Neox);
+    assert!(
+        d.config.attention_scale.is_none(),
+        "hunyuan-vl.cpp:22 passes a literal 1/sqrt(n_embd_head), which the kernels apply"
+    );
+}
+
+/// Skipping the rescale is a large divergence.
+///
+/// Without this the golden comparison would hold just as well against a
+/// decoder that ignored the key, because RoPE at 500 and RoPE at 92100
+/// differ only where the positions matter. It is why the fixture's
+/// unscaled base is small and its Q/K are drawn wide.
+#[test]
+fn rotating_hunyuan_dense_at_the_unscaled_base_diverges_from_llama_cpp() {
+    let path = fixture("hunyuan_dense");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    config.rope_theta = 500.0;
+    let d = Decoder::from_gguf(&path, config).expect("loads");
+    let mut kv = caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&PROMPT, 0, &mut kv),
+        &HUNYUAN_DENSE_GOLDEN,
+    );
+    assert!(
+        worst > 1e-2,
+        "ignoring the NTK-alpha rescale moved the logits by only {worst}; the fixture \
+         cannot see hunyuan-vl.cpp:8-12"
+    );
+}
+
+/// And the ordering half is visible on this row too, not only on the
+/// other two.
+#[test]
+fn norming_hunyuan_dense_before_rope_instead_of_after_diverges_from_llama_cpp() {
+    let mut d = load("hunyuan_dense");
+    assert!(d.qk_norm_after_rope);
+    d.qk_norm_after_rope = false;
+    let mut kv = caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&PROMPT, 0, &mut kv),
+        &HUNYUAN_DENSE_GOLDEN,
+    );
+    assert!(
+        worst > 1e-2,
+        "swapping the QK-norm order moved the logits by only {worst}"
+    );
+}
+
+// --- ernie4_5-moe: the interleave step, and why it is a refusal -----
+//
+// The arm was meant to be `{arch}.interleave_moe_layer_step`, so that
+// `ModelConfig::layer_is_dense` matched `src/models/ernie4-5-moe.cpp:64`:
+//
+//     il >= n_layer_dense_lead && (il + 1) % n_moe_layer_step == 0
+//
+// Building the fixture is what changed the answer. llama.cpp's TENSOR
+// LOADER has no step in it: `src/models/ernie4-5.cpp:49` creates
+// `ffn_gate_inp`, `ffn_down_exps` and `ffn_up_exps` as REQUIRED for
+// every layer at or past `n_layer_dense_lead`, and creates the dense
+// `ffn_gate`/`ffn_up`/`ffn_down` for none of them. The loader and the
+// graph therefore agree only where the modulo changes nothing, and a
+// checkpoint whose interleave really interleaves cannot be loaded by
+// llama.cpp at all. Measured, not reasoned: the two-step fixture beside
+// this one makes libllama print
+//
+//     check_tensor_dims: tensor 'blk.2.ffn_gate_inp.weight' not found
+//
+// Both published ERNIE-4.5 MoE checkpoints (21B-A3B, 300B-A47B) carry a
+// step of 1 -- `conversion/ernie.py:88` writes `moe_layer_interval`
+// straight from the HF config -- at which point the rule collapses to
+// the leading-dense prefix ferrox already implements. That is the file
+// the golden values below come from; anything else is refused by name
+// in `moe_interleave`.
+//
+// The rest of the row was read too: SOFTMAX routing, HARDCODED at :90 --
+// this architecture is NOT sigmoid-routed, whatever the gap inventory
+// said -- with `norm_w = true` (:88) and an optional `exp_probs_b`
+// selection bias (ernie4-5.cpp:53). The fixture carries neither
+// `expert_gating_func` nor `expert_weights_norm`, so both have to come
+// out of ferrox's architecture-name defaults.
+
+const ERNIE4_5_MOE_GOLDEN: [f32; 48] = [
+    -0.08447625,
+    -0.12077317,
+    0.34613043,
+    0.03877828,
+    0.037789084,
+    -0.18150453,
+    -0.016461063,
+    0.123786785,
+    0.018926805,
+    0.010408605,
+    -5.1606377e-4,
+    0.20932025,
+    -0.09644128,
+    -0.09167313,
+    -0.047137674,
+    0.32158756,
+    0.42049405,
+    -0.10163629,
+    0.24967228,
+    -0.17491005,
+    -0.23651567,
+    0.061103027,
+    -0.025830623,
+    0.30918807,
+    -0.18258056,
+    -0.32253858,
+    -0.04022187,
+    -0.07561384,
+    -0.22288801,
+    0.2532389,
+    0.3253422,
+    0.1982599,
+    0.1800408,
+    -0.0014230456,
+    -0.13664317,
+    -0.09072188,
+    -0.19590256,
+    -0.22582309,
+    -0.062144432,
+    -0.087381646,
+    -0.33621082,
+    0.20399752,
+    0.18209141,
+    -0.08127112,
+    0.20059398,
+    -0.23522364,
+    -1.6790349e-5,
+    0.016684819,
+];
+
+#[test]
+fn ernie4_5_moe_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match("ernie4_5_moe", &ERNIE4_5_MOE_GOLDEN);
+}
+
+/// What the loader decided about the row's own facts.
+///
+/// The interleave step is in the file at 1, the leading-dense prefix is
+/// honoured (unlike `bailingmoe`, which reads the same kind of key and
+/// ignores it), and the routing resolved to llama.cpp's hardcoded pair.
+#[test]
+fn the_loader_reads_ernie_moes_step_its_dense_prefix_and_its_routing() {
+    let path = fixture("ernie4_5_moe");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    assert_eq!(
+        file.metadata_u64("ernie4_5-moe.interleave_moe_layer_step"),
+        Some(1),
+        "the fixture must carry the REQUIRED key (ernie4-5.cpp:11)"
+    );
+    // Neither routing key is in the file, so both of these come from
+    // ferrox's architecture-name defaults and this is what pins them.
+    assert!(file
+        .metadata_u64("ernie4_5-moe.expert_gating_func")
+        .is_none());
+    assert!(file
+        .metadata_bool("ernie4_5-moe.expert_weights_norm")
+        .is_none());
+
+    let d = load("ernie4_5_moe");
+    assert!(d.config.layer_is_dense(0), "leading_dense_block_count = 1");
+    assert!(!d.config.layer_is_dense(1));
+    assert!(!d.config.layer_is_dense(2));
+    assert_eq!(
+        d.config.moe.gating,
+        ferrox_moe::GatingFunction::Softmax,
+        "ernie4-5-moe.cpp:90 hardcodes LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX"
+    );
+    assert!(
+        d.config.moe.norm_topk_prob,
+        "ernie4-5-moe.cpp:88 passes norm_w = true"
+    );
+    assert_eq!(d.config.moe.n_experts, 4);
+    assert_eq!(d.config.moe.n_experts_active, 2);
+    assert_eq!(d.config.moe.n_shared_experts, 1);
+    assert_eq!(d.config.rope_layout, ferrox_models::RopeLayout::Norm);
+    // head_dim comes from `attention.key_length`; n_embd/n_head is 6.
+    assert_eq!(d.config.head_dim, 8);
+}
+
+/// Routing this row through sigmoid instead of softmax is a large
+/// divergence.
+///
+/// The gap inventory listed `ernie4_5-moe` beside `bailingmoe2` as
+/// "sigmoid-routed MoE with `ffn_exp_probs_b` router bias", and only the
+/// second half is true. Without this test the golden comparison would
+/// rest on a default nothing had checked.
+#[test]
+fn routing_ernie_moe_through_sigmoid_instead_of_softmax_diverges_from_llama_cpp() {
+    let path = fixture("ernie4_5_moe");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    config.moe.gating = ferrox_moe::GatingFunction::Sigmoid;
+    let d = Decoder::from_gguf(&path, config).expect("loads");
+    let mut kv = caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&PROMPT, 0, &mut kv),
+        &ERNIE4_5_MOE_GOLDEN,
+    );
+    assert!(
+        worst > 1e-2,
+        "sigmoid routing moved the logits by only {worst}; the fixture cannot see the \
+         gating function"
+    );
+}
+
+/// The refusal fires, on a file that exists.
+///
+/// This is the half that stops `moe_interleave` from being a gate that
+/// cannot fire. The second fixture is written exactly the way
+/// `conversion/ernie.py` would write a two-step checkpoint -- dense
+/// `blk.2.ffn_gate.weight`, no expert tensors on that layer -- and
+/// libllama refuses it with `check_tensor_dims: tensor
+/// 'blk.2.ffn_gate_inp.weight' not found`, because its loader creates
+/// the expert tensors for every layer past the dense prefix regardless
+/// of the step. ferrox refuses it earlier and says why.
+#[test]
+fn a_two_step_ernie_moe_checkpoint_is_refused_by_name() {
+    let path = fixture("ernie4_5_moe_step2");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    assert_eq!(
+        file.metadata_u64("ernie4_5-moe.interleave_moe_layer_step"),
+        Some(2),
+        "the refusal fixture must actually declare the step it is refused for"
+    );
+    // And it really is shaped like a converted two-step checkpoint: the
+    // interleaved dense layer stores dense FFN tensors.
+    assert!(file.find_tensor("blk.2.ffn_gate.weight").is_some());
+    assert!(file.find_tensor("blk.2.ffn_gate_inp.weight").is_none());
+
+    let err = ModelConfig::from_gguf(&file).expect_err("must refuse");
+    let msg = err.to_string();
+    assert!(msg.contains("interleave_moe_layer_step"), "{msg}");
+    assert!(msg.contains("ernie4-5.cpp:49"), "{msg}");
+    assert!(msg.contains("cannot be loaded by llama.cpp"), "{msg}");
+}
+
+// --- chatglm: the FUSED attn_qkv.bias -------------------------------
+//
+// The arm: `src/models/chatglm.cpp:42` calls `create_tensor_qkv`, which
+// prefers a fused `attn_qkv.weight` and, when it finds one, creates
+// `attn_qkv.bias` beside it (llama-model.cpp:2890-2892); `build_qkv`
+// then adds that bias to the fused projection BEFORE splitting it into
+// Q, K and V (llama-graph.cpp:1605-1609). ferrox split the fused WEIGHT
+// and read bias only under the split `attn_q.bias` / `attn_k.bias` /
+// `attn_v.bias` names, so on a real ChatGLM2/3 checkpoint -- which sets
+// `add_qkv_bias: true` -- all three projections ran unbiased. It
+// loaded, and it answered fluently.
+//
+// This row was triaged FIXTURE-AWAY once and was WRONG; the correction
+// came from somebody trying to build the fixture and reading the
+// converter. Two more facts came with it, and the fixture pins both
+// rather than assuming them:
+//
+//   * PARTIAL RoPE. `chatglm.cpp:59-61` asserts only that the K and V
+//     head widths agree -- NOT that `n_embd_head == n_rot` -- and
+//     `conversion/chatglm.py:151` writes `rope_dimension_count` as
+//     `head_dim * partial_rotary_factor`, the factor defaulting to 0.5.
+//     The fixture rotates 4 of 8 dimensions.
+//   * A FUSED gate+up SwiGLU (`chatglm.cpp:48`, `LLM_FFN_SWIGLU,
+//     LLM_FFN_SEQ` at :128-133), which is phi3's call shape: gate is
+//     the first half, up the second (`ggml_swiglu` non-swapped,
+//     ggml/src/ggml-cpu/ops.cpp:3225-3229).
+//
+// It is also the row that closed the ONE-MATCH-ARM class. It did NOT
+// bring `qwen` with it, which its verdict predicted it would -- see
+// `capability.rs`, and `qwen_needs_a_second_arm_the_verdict_did_not_name`
+// in `tests/unaudited_triage.rs`.
+
+const CHATGLM_GOLDEN: [f32; 48] = [
+    0.090820685,
+    -0.31404012,
+    0.21123026,
+    0.23916319,
+    -0.6373304,
+    -0.39961597,
+    0.5329689,
+    0.3621327,
+    -0.6562774,
+    -0.11621146,
+    -0.048490256,
+    0.2070108,
+    0.26785624,
+    -0.10927561,
+    0.32192656,
+    0.17374313,
+    0.05616858,
+    -0.46383783,
+    0.3049827,
+    0.24621421,
+    -0.12226179,
+    -0.264751,
+    -0.00436645,
+    -0.057764113,
+    -0.1796914,
+    0.48244458,
+    0.7144444,
+    -0.16199715,
+    -0.10188244,
+    -0.41203445,
+    -0.064961255,
+    -0.06848544,
+    -0.046823338,
+    0.09520461,
+    0.1785332,
+    -0.38709432,
+    -0.3965909,
+    -0.10580985,
+    0.11000312,
+    -0.4606859,
+    0.0026797354,
+    -0.31953984,
+    0.013507392,
+    0.08005661,
+    0.30723116,
+    0.09110375,
+    -0.18175212,
+    0.058441103,
+];
+
+#[test]
+fn chatglm_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match("chatglm", &CHATGLM_GOLDEN);
+}
+
+/// Reads an F32 tensor straight out of the fixture, so the assertion
+/// below compares the loader's answer against the FILE rather than
+/// against another call into the loader.
+fn f32_tensor(file: &ferrox_gguf::GgufFile, name: &str) -> Vec<f32> {
+    file.tensor_bytes(name)
+        .expect("tensor is in the fixture")
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect()
+}
+
+/// What the loader decided, so a regression in a piece the logits alone
+/// would not name still names itself.
+#[test]
+fn the_loader_splits_chatglms_fused_qkv_bias_and_reads_its_partial_rope() {
+    let path = fixture("chatglm");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    // The file really is shaped like a converted ChatGLM: fused weight,
+    // fused bias, no split spelling anywhere, and no `ffn_gate`.
+    assert!(file.find_tensor("blk.0.attn_qkv.weight").is_some());
+    assert!(file.find_tensor("blk.0.attn_qkv.bias").is_some());
+    assert!(file.find_tensor("blk.0.attn_q.weight").is_none());
+    assert!(file.find_tensor("blk.0.attn_q.bias").is_none());
+    assert!(file.find_tensor("blk.0.ffn_gate.weight").is_none());
+
+    let d = load("chatglm");
+    let attn = &d.layers[0].attn;
+    // THE ARM. Three biases, sliced out of one fused vector by the same
+    // spans that split the weight, and equal to that vector's three
+    // ranges in file order.
+    let q_bias = attn.q_bias.as_ref().expect("Q bias from the fused vector");
+    let k_bias = attn.k_bias.as_ref().expect("K bias from the fused vector");
+    let v_bias = attn.v_bias.as_ref().expect("V bias from the fused vector");
+    assert_eq!(q_bias.len(), d.config.n_heads * d.config.head_dim);
+    assert_eq!(k_bias.len(), d.config.n_kv_heads * d.config.head_dim);
+    assert_eq!(v_bias.len(), d.config.n_kv_heads * d.config.head_dim);
+    let fused = f32_tensor(&file, "blk.0.attn_qkv.bias");
+    assert_eq!(fused.len(), q_bias.len() + k_bias.len() + v_bias.len());
+    assert_eq!(&fused[..q_bias.len()], &q_bias[..]);
+    assert_eq!(
+        &fused[q_bias.len()..q_bias.len() + k_bias.len()],
+        &k_bias[..]
+    );
+    assert_eq!(&fused[q_bias.len() + k_bias.len()..], &v_bias[..]);
+
+    // PARTIAL RoPE: half a head, which is what the converter writes.
+    assert_eq!(d.config.head_dim, 8);
+    assert_eq!(
+        d.config.rope_dim,
+        Some(4),
+        "conversion/chatglm.py:151 writes head_dim * partial_rotary_factor"
+    );
+    // NORM RoPE (LLM_ARCH_CHATGLM sits in llama_model_rope_type's NORM
+    // group, llama-model.cpp:2593), not NEOX.
+    assert_eq!(d.config.rope_layout, ferrox_models::RopeLayout::Norm);
+    // No QK-norm, no post-norms, no attention-scale override.
+    assert!(attn.q_norm.is_none());
+    assert!(attn.post_attn_norm.is_none());
+    assert!(attn.post_ffn_norm.is_none());
+    assert!(d.config.attention_scale.is_none());
+}
+
+/// Dropping the fused QKV bias is a large, obvious divergence.
+///
+/// This is what makes the fixture worth its runtime: before the arm
+/// landed, ferrox computed EXACTLY this -- three unbiased projections --
+/// and produced a fluent wrong answer rather than an error.
+#[test]
+fn running_chatglm_without_its_fused_qkv_bias_diverges_from_llama_cpp() {
+    let path = fixture("chatglm");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let config = ModelConfig::from_gguf(&file).expect("parses");
+    let mut d = Decoder::from_gguf(&path, config).expect("loads");
+    for layer in d.layers.iter_mut() {
+        layer.attn.q_bias = None;
+        layer.attn.k_bias = None;
+        layer.attn.v_bias = None;
+    }
+    let mut kv = caches(&d);
+    let worst = worst_vs(&d.forward_batch_last(&PROMPT, 0, &mut kv), &CHATGLM_GOLDEN);
+    assert!(
+        worst > 1e-2,
+        "dropping the fused QKV bias moved the logits by only {worst}; the fixture \
+         cannot see the arm it exists for"
+    );
+}
+
+/// Rotating a WHOLE head instead of half of one is a large divergence.
+///
+/// chatglm is the first audited row whose rotary width is narrower than
+/// its head, and `rope_dim` comes from a key a file could simply omit.
+/// Without this the value could be ignored and the comparison would
+/// still pass.
+#[test]
+fn rotating_chatglms_whole_head_instead_of_half_diverges_from_llama_cpp() {
+    let path = fixture("chatglm");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    assert_eq!(
+        config.rope_dim,
+        Some(4),
+        "the sabotage target must be there"
+    );
+    config.rope_dim = None;
+    let d = Decoder::from_gguf(&path, config).expect("loads");
+    let mut kv = caches(&d);
+    let worst = worst_vs(&d.forward_batch_last(&PROMPT, 0, &mut kv), &CHATGLM_GOLDEN);
+    assert!(
+        worst > 1e-2,
+        "rotating the whole head moved the logits by only {worst}; the fixture cannot \
+         see chatglm's partial rotary width"
+    );
+}
+
+// --- qwen: the same bias, plus an arm nobody had named --------------
+//
+// `chatglm`'s verdict predicted that splitting the fused
+// `attn_qkv.bias` "closes chatglm and qwen together". It was half
+// right. The bias really is the same arm -- `qwen.cpp:28` creates
+// `attn_qkv.bias` as REQUIRED (flag `0`, not `TENSOR_NOT_REQUIRED`,
+// which is stronger than chatglm's optional one) -- but there is a
+// SECOND fact the verdict did not name, found by building this fixture:
+//
+//     `qwen.cpp:33-35` sizes `ffn_gate`, `ffn_up` and `ffn_down` at
+//     `n_ff / 2`.
+//
+// Qwen-1's `config.intermediate_size` counts gate and up together (HF's
+// `QWenMLP`: `ff_dim_in = intermediate_size // 2`), and
+// `conversion/qwen.py`'s `QwenModel` writes it through unchanged. It
+// costs no logits -- ferrox loads the dense FFN by tensor name and uses
+// each matrix's own shape -- but it made `expert_ffn_dim` twice the
+// real width, which is what every memory estimate prices the FFN from.
+// `FFN_LENGTH_COUNTS_GATE_AND_UP` in `loader.rs` is that arm, and the
+// second test below is what compares the two numbers.
+//
+// Everything else was read against the C: NEOX RoPE over a WHOLE head
+// (no converter writes `qwen.rope.dimension_count`, so
+// llama-model.cpp:1200-1202 defaults `n_rot` to `n_embd_head_k`), MHA
+// (the fused QKV is `{n_embd, n_embd * 3}`), `1/sqrt(n_embd_head)`
+// (:92), ordinary `LLM_FFN_SILU, LLM_FFN_PAR` SwiGLU with a separate
+// gate (:113), no QK-norm, no post-norms, no window, and a REQUIRED
+// `output` with no tied fallback (:20).
+
+const QWEN_GOLDEN: [f32; 48] = [
+    -0.47474518,
+    -0.0022933632,
+    -0.49924076,
+    0.5075288,
+    -0.20525283,
+    -0.07901704,
+    -0.38353547,
+    -0.35964543,
+    0.26076084,
+    0.07281858,
+    -0.36406296,
+    0.39138433,
+    0.2218306,
+    0.04339356,
+    0.34961206,
+    0.18980482,
+    -0.3555299,
+    0.35724136,
+    -0.09971591,
+    -0.17549433,
+    -0.36425614,
+    0.018335074,
+    0.36422035,
+    0.2226639,
+    0.4684592,
+    -0.49377662,
+    -0.608807,
+    -0.32455373,
+    -0.40832955,
+    0.5053332,
+    0.7394527,
+    0.101069614,
+    0.4507292,
+    -0.15326086,
+    0.0057264715,
+    0.9483001,
+    0.45975572,
+    -0.37870315,
+    -0.07432632,
+    -0.16117015,
+    -0.35780537,
+    0.019639567,
+    0.30630204,
+    -0.53656626,
+    -0.5741146,
+    0.11313294,
+    -0.061947256,
+    -0.45649463,
+];
+
+#[test]
+fn qwen_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match("qwen", &QWEN_GOLDEN);
+}
+
+/// The declared FFN width and the matrices that actually load must
+/// agree.
+///
+/// `qwen.cpp:33-35` halves `n_ff`, so before
+/// `FFN_LENGTH_COUNTS_GATE_AND_UP` these two numbers differed by a
+/// factor of two on every Qwen-1 checkpoint, with nothing comparing
+/// them: the forward pass reads the matrix, the memory estimate reads
+/// the config. This is the comparison, run over EVERY graph fixture
+/// with a dense layer rather than over `qwen` alone, so the next
+/// architecture that redefines the key cannot land unnoticed.
+#[test]
+fn the_declared_ffn_width_matches_the_matrices_that_load() {
+    // Dense-FFN rows only. A routed-MoE row prices its experts from
+    // `expert_feed_forward_length`, a different key with a different
+    // meaning, and its dense leading layers may be a third width again.
+    for name in [
+        "qwen",
+        "chatglm",
+        "internlm2",
+        "xverse",
+        "gemma",
+        "ernie4_5",
+        "baichuan",
+        "exaone",
+        "plamo3",
+        "hunyuan-dense",
+        "maincoder",
+    ] {
+        let file_stem = name.replace('-', "_");
+        let d = load(&file_stem);
+        let ferrox_models::decoder::ExpertBacking::Resident(experts) = &d.layers[0].moe.experts
+        else {
+            panic!("{name}: expected a resident dense expert on layer 0");
+        };
+        assert_eq!(experts.len(), 1, "{name}: layer 0 must be dense");
+        assert_eq!(
+            experts[0].gate.rows(),
+            d.config.moe.expert_ffn_dim,
+            "{name}: config says the FFN is {} wide, the loaded gate matrix is {}",
+            d.config.moe.expert_ffn_dim,
+            experts[0].gate.rows()
+        );
+        assert_eq!(
+            experts[0].up.rows(),
+            d.config.moe.expert_ffn_dim,
+            "{name}: the up projection disagrees with the config too"
+        );
+    }
+}
+
+/// What the loader decided about qwen's own facts.
+#[test]
+fn the_loader_splits_qwens_fused_qkv_bias_and_halves_its_declared_ffn() {
+    let path = fixture("qwen");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    // Shaped like a converted Qwen-1: fused weight and fused bias, no
+    // split spelling, and NO `qwen.rope.dimension_count` -- llama.cpp
+    // defaults n_rot to the head width for it.
+    assert!(file.find_tensor("blk.0.attn_qkv.weight").is_some());
+    assert!(file.find_tensor("blk.0.attn_qkv.bias").is_some());
+    assert!(file.find_tensor("blk.0.attn_q.bias").is_none());
+    assert!(file.metadata_u64("qwen.rope.dimension_count").is_none());
+    // The declared width is TWICE the matrices'.
+    let declared = file
+        .metadata_u64("qwen.feed_forward_length")
+        .expect("the fixture declares it");
+
+    let d = load("qwen");
+    let attn = &d.layers[0].attn;
+    let fused = f32_tensor(&file, "blk.0.attn_qkv.bias");
+    let q_bias = attn.q_bias.as_ref().expect("Q bias from the fused vector");
+    let k_bias = attn.k_bias.as_ref().expect("K bias from the fused vector");
+    let v_bias = attn.v_bias.as_ref().expect("V bias from the fused vector");
+    assert_eq!(&fused[..q_bias.len()], &q_bias[..]);
+    assert_eq!(
+        &fused[q_bias.len()..q_bias.len() + k_bias.len()],
+        &k_bias[..]
+    );
+    assert_eq!(&fused[q_bias.len() + k_bias.len()..], &v_bias[..]);
+
+    // THE SECOND ARM.
+    assert_eq!(
+        d.config.moe.expert_ffn_dim as u64 * 2,
+        declared,
+        "qwen.cpp:33-35 halves the declared feed_forward_length"
+    );
+    // MHA, whole-head NEOX RoPE, no QK-norm, no post-norms.
+    assert_eq!(d.config.n_kv_heads, d.config.n_heads);
+    assert_eq!(d.config.rope_dim, None, "qwen rotates a whole head");
+    assert_eq!(d.config.rope_layout, ferrox_models::RopeLayout::Neox);
+    assert!(attn.q_norm.is_none());
+    assert!(attn.post_attn_norm.is_none());
+    assert!(attn.post_ffn_norm.is_none());
+}
+
+/// Dropping qwen's fused QKV bias is a large, obvious divergence.
+///
+/// Same sabotage as `chatglm`'s, on the row llama.cpp marks the bias
+/// REQUIRED for rather than optional.
+#[test]
+fn running_qwen_without_its_fused_qkv_bias_diverges_from_llama_cpp() {
+    let path = fixture("qwen");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let config = ModelConfig::from_gguf(&file).expect("parses");
+    let mut d = Decoder::from_gguf(&path, config).expect("loads");
+    for layer in d.layers.iter_mut() {
+        layer.attn.q_bias = None;
+        layer.attn.k_bias = None;
+        layer.attn.v_bias = None;
+    }
+    let mut kv = caches(&d);
+    let worst = worst_vs(&d.forward_batch_last(&PROMPT, 0, &mut kv), &QWEN_GOLDEN);
+    assert!(
+        worst > 1e-2,
+        "dropping the fused QKV bias moved the logits by only {worst}; the fixture \
+         cannot see the arm it exists for"
+    );
 }

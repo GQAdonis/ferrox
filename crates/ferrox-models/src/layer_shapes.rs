@@ -147,8 +147,13 @@ pub const PER_LAYER_SHAPE_ARCHS: &[(&str, &str)] = &[
         "hybrid: n_head_kv(i) == 0 marks a recurrent layer (plamo2.cpp:19,82-84,218-219)",
     ),
     (
+        "granitehybrid",
+        "generic. granite-hybrid.cpp:17-19 (hparams), :58-77 (loader) and :137-140 (graph): \
+         n_head_kv(i) == 0 marks a Mamba-2 layer (`crate::mamba2`), served since 2026-09-14",
+    ),
+    (
         "granite-hybrid",
-        "hybrid: n_head_kv(i) == 0 marks a recurrent layer (granite-hybrid.cpp:23,93-95,207)",
+        "generic. the ferrox alias of `granitehybrid` (granite-hybrid.cpp:17-19), the same rule",
     ),
     (
         "kimi-linear",
@@ -186,6 +191,12 @@ pub enum AttnShape {
     /// the residual add; the layer's cache holds its conv inputs
     /// ([`Self::cache_geometry`]).
     ShortConv,
+    /// A Mamba-2 block (`build_mamba2_layer`, `mamba-base.cpp:149-288`;
+    /// `granite-hybrid.cpp:163`): the same two counts again, decided
+    /// by architecture ([`ZeroKvLayer`]). `attn_norm`, then
+    /// `crate::mamba2`, then the residual add; the layer's cache holds
+    /// no rows and carries a `RecurrentState` instead.
+    Mamba2,
 }
 
 /// What `head_count_kv == 0` with `head_count > 0` MEANS for an
@@ -197,6 +208,8 @@ pub enum ZeroKvLayer {
     Linear,
     /// `lfm2.cpp:197`: the short convolution (`crate::shortconv`).
     ShortConv,
+    /// `granite-hybrid.cpp:163`: the Mamba-2 block (`crate::mamba2`).
+    Mamba2,
     /// A recurrent block ferrox has no body for; the reason names it.
     Unserved(&'static str),
 }
@@ -212,16 +225,34 @@ impl ZeroKvLayer {
             return ZeroKvLayer::ShortConv;
         }
         match arch {
-            "jamba" | "granite-hybrid" | "granitehybrid" | "falcon-h1" => ZeroKvLayer::Unserved(
-                "a Mamba-2 block (`build_mamba2_layer`, mamba-base.cpp), which ferrox has no \
-                 body for",
+            // `granite-hybrid.cpp:17-19,163`: Mamba-2 where the KV count
+            // is zero, attention elsewhere, an FFN on every layer.
+            "granitehybrid" | "granite-hybrid" => ZeroKvLayer::Mamba2,
+            // `jamba.cpp:128` is `build_mamba_layer`, Mamba-1: a
+            // `{d_state, n_head}` A and the selective-scan projections
+            // (`ssm_x`, `ssm_dt.weight`) `crate::mamba2` does not have.
+            "jamba" => ZeroKvLayer::Unserved(
+                "a Mamba-1 block (`build_mamba_layer`, jamba.cpp:128), which ferrox has no body \
+                 for; the Mamba-2 body (`crate::mamba2`) reads a per-head A",
             ),
+            // `falcon-h1.cpp:161` runs the Mamba-2 block IN PARALLEL with
+            // attention on every layer, so its KV count is never zero;
+            // a zero here is not that graph.
+            "falcon-h1" => ZeroKvLayer::Unserved(
+                "no falcon-h1 layer has a zero KV count: falcon-h1.cpp:149-166 runs attention \
+                 AND the Mamba-2 block on every layer, a parallel topology the generic layer \
+                 does not have",
+            ),
+            // `nemotron-h.cpp:9-11,143-152`: a layer is ONE of Mamba-2,
+            // attention, or FFN, with one residual add; the generic
+            // layer runs a block AND an FFN.
             "nemotron-h" | "nemotron_h" | "nemotron_h_moe" => ZeroKvLayer::Unserved(
-                "a Mamba-2 block or an FFN-only layer (nemotron-h.cpp:82-114), which ferrox \
-                 has no body for",
+                "a Mamba-2 block on a layer with NO FFN (nemotron-h.cpp:9-11: recurrent iff \
+                 head_count_kv == 0 && feed_forward_length == 0), a one-block-per-layer \
+                 topology the generic layer does not have",
             ),
             "plamo2" => ZeroKvLayer::Unserved(
-                "a Mamba block (plamo2.cpp:218-219), which ferrox has no body for",
+                "a Mamba-1 block (plamo2.cpp:218-219), which ferrox has no body for",
             ),
             "kimi-linear" => ZeroKvLayer::Unserved(
                 "a KDA block (kimi-linear.cpp:18), served by `crate::kimi_decoder` and not \
@@ -253,6 +284,7 @@ impl AttnShape {
             (_, 0) => match zero_kv {
                 ZeroKvLayer::Linear => Ok(AttnShape::Linear),
                 ZeroKvLayer::ShortConv => Ok(AttnShape::ShortConv),
+                ZeroKvLayer::Mamba2 => Ok(AttnShape::Mamba2),
                 ZeroKvLayer::Unserved(what) => Err(format!(
                     "head_count_kv 0 marks {what}; `layer_shapes::ZeroKvLayer` is the table"
                 )),
@@ -272,7 +304,7 @@ impl AttnShape {
     pub fn n_kv_heads(self) -> usize {
         match self {
             AttnShape::Gqa { n_kv_heads, .. } => n_kv_heads,
-            AttnShape::Linear | AttnShape::Absent | AttnShape::ShortConv => 0,
+            AttnShape::Linear | AttnShape::Absent | AttnShape::ShortConv | AttnShape::Mamba2 => 0,
         }
     }
 
@@ -280,15 +312,23 @@ impl AttnShape {
     pub fn n_heads(self) -> usize {
         match self {
             AttnShape::Gqa { n_heads, .. } => n_heads,
-            AttnShape::Linear | AttnShape::Absent | AttnShape::ShortConv => 0,
+            AttnShape::Linear | AttnShape::Absent | AttnShape::ShortConv | AttnShape::Mamba2 => 0,
         }
+    }
+
+    /// True for a block whose state between tokens is a
+    /// `RecurrentState` rather than rows (`crate::mamba2`).
+    pub fn is_recurrent(self) -> bool {
+        matches!(self, AttnShape::Mamba2)
     }
 
     /// The layer's cache as `(n_kv_heads, k_head_dim, v_head_dim)`, the
     /// three numbers every `KvCache` / `PagedKvStore` constructor takes.
     ///
     /// A GQA layer's is its head geometry; the two attention-less
-    /// shapes write no history and get an empty cache; a short-conv
+    /// shapes and the Mamba-2 block write no history and get an empty
+    /// cache (the Mamba-2 block keeps its state beside it and pushes
+    /// EMPTY rows so the cache still counts positions); a short-conv
     /// layer keeps its conv inputs as ONE row of `hidden_dim` per token
     /// with no V (`crate::shortconv`). ONE function, because
     /// `ModelConfig::new_kv_caches` and its three siblings each build
@@ -302,7 +342,7 @@ impl AttnShape {
     ) -> (usize, usize, usize) {
         match self {
             AttnShape::Gqa { n_kv_heads, .. } => (n_kv_heads, head_dim, v_head_dim),
-            AttnShape::Linear | AttnShape::Absent => (0, head_dim, v_head_dim),
+            AttnShape::Linear | AttnShape::Absent | AttnShape::Mamba2 => (0, head_dim, v_head_dim),
             AttnShape::ShortConv => (1, hidden_dim, 0),
         }
     }
@@ -525,6 +565,7 @@ pub(crate) fn load_non_gqa_attention(
     hidden_dim: usize,
 ) -> Result<AttnWeights, LoadError> {
     let mut shortconv = None;
+    let mut mamba2 = None;
     let (norm_weight, o_proj) = match shape {
         AttnShape::Linear => (
             norm_sites.load_pre_norm(norm_sites.attn, file, Some(layer))?,
@@ -535,6 +576,13 @@ pub(crate) fn load_non_gqa_attention(
             shortconv = Some(crate::shortconv::ShortConv::load(
                 file, arch, layer, hidden_dim,
             )?);
+            (
+                norm_sites.load_pre_norm(norm_sites.attn, file, Some(layer))?,
+                no_rows(0),
+            )
+        }
+        AttnShape::Mamba2 => {
+            mamba2 = Some(crate::mamba2::Mamba2::load(file, arch, layer, hidden_dim)?);
             (
                 norm_sites.load_pre_norm(norm_sites.attn, file, Some(layer))?,
                 no_rows(0),
@@ -578,6 +626,7 @@ pub(crate) fn load_non_gqa_attention(
         o_scale: None,
         o_bias: None,
         shortconv,
+        mamba2,
     })
 }
 
@@ -649,6 +698,15 @@ pub(crate) fn check_gqa_projection_widths(
 }
 
 impl ModelConfig {
+    /// True when any layer carries a `RecurrentState` between tokens
+    /// (`AttnShape::is_recurrent`): the fact every caller that rolls a
+    /// cache back to a middle position -- speculative verification, the
+    /// draft model, the prefix cache -- is fenced on
+    /// (`ferrox_core::recurrent_state`).
+    pub fn has_recurrent_layers(&self) -> bool {
+        (0..self.n_layers).any(|il| self.layer_shape(il).attention.is_recurrent())
+    }
+
     /// Layer `il`'s cache geometry (`AttnShape::cache_geometry` at this
     /// model's widths).
     pub fn layer_cache_geometry(&self, il: usize) -> (usize, usize, usize) {
@@ -809,13 +867,20 @@ mod tests {
             Ok(AttnShape::Gqa { .. })
         ));
         let err = AttnShape::from_counts(4, 0, ZeroKvLayer::for_arch("jamba")).unwrap_err();
-        assert!(err.contains("Mamba-2"), "{err}");
+        assert!(err.contains("Mamba-1"), "{err}");
         // The cache: one row of n_embd per token, no V.
         assert_eq!(AttnShape::ShortConv.cache_geometry(6, 6, 24), (1, 24, 0));
+        // Mamba-2: no rows at all, the state rides beside the cache.
+        assert_eq!(
+            AttnShape::from_counts(4, 0, ZeroKvLayer::for_arch("granitehybrid")),
+            Ok(AttnShape::Mamba2)
+        );
+        assert_eq!(AttnShape::Mamba2.cache_geometry(6, 6, 24), (0, 6, 6));
+        assert!(AttnShape::Mamba2.is_recurrent() && !AttnShape::ShortConv.is_recurrent());
         assert_eq!(AttnShape::Linear.cache_geometry(6, 6, 24), (0, 6, 6));
         assert_eq!(AttnShape::ShortConv.n_kv_heads(), 0);
         let err = LayerShapes::resolve("jamba", &[4, 4], &[2, 0], None, 16).unwrap_err();
-        assert!(err.to_string().contains("Mamba-2"), "{err}");
+        assert!(err.to_string().contains("Mamba-1"), "{err}");
         let s = LayerShapes::resolve("lfm2", &[4, 4], &[0, 2], None, 16).unwrap();
         let LayerShapes::PerLayer(v) = s else {
             panic!("per layer");
@@ -928,6 +993,7 @@ mod tests {
             o_scale: None,
             o_bias: None,
             shortconv: None,
+            mamba2: None,
         };
         assert!(
             check_gqa_projection_widths(0, shape, head_dim, head_dim, hidden, &build(24, 12))
@@ -957,7 +1023,18 @@ mod tests {
             .filter(|(_, n)| n.starts_with("generic"))
             .map(|(a, _)| *a)
             .collect();
-        assert_eq!(generic, ["deci", "openelm", "plamo3", "laguna", "step35"]);
+        assert_eq!(
+            generic,
+            [
+                "deci",
+                "openelm",
+                "plamo3",
+                "laguna",
+                "step35",
+                "granitehybrid",
+                "granite-hybrid"
+            ]
+        );
         assert!(per_layer_shapes_read_by_llama_cpp("deci"));
         assert!(!per_layer_shapes_read_by_llama_cpp("granite"));
     }

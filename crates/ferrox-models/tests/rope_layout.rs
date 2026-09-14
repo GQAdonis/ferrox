@@ -273,7 +273,9 @@ fn a_ferrox_only_name_on_the_generic_path_is_declared() {
     //    (`ferrox_models::mrope`), because for this one the converter
     //    permuted the weights and the two rotations differ (measured,
     //    `tests/glm4_graphs.rs`).
-    const DECLARED: &[&str] = &["phi4", "granite-moe", "glm4moe", "glm4"];
+    //  * `granite-hybrid` -- the same ferrox-only alias as `granite-moe`,
+    //    of `granitehybrid` (`llama-arch.cpp:102`); NORM like its row.
+    const DECLARED: &[&str] = &["phi4", "granite-moe", "granite-hybrid", "glm4moe", "glm4"];
     let mut undeclared = Vec::new();
     for p in architecture_catalog() {
         let ArchPath::GenericGqa { rope } = p.path else {

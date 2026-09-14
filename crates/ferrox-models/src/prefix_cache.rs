@@ -193,8 +193,18 @@ impl PrefixCache {
     /// truncation names -- so storing one would trade a cheap recompute
     /// for a request that stops. Refusing loses the prefix cache for
     /// the run, which is what the switch's documentation says it costs.
+    ///
+    /// A cache holding a RECURRENT state (`ferrox_core::recurrent_state`,
+    /// a Mamba layer's) is refused for the same reason from the other
+    /// side: the state is a reduction over the whole prefix, and
+    /// `truncate` to the common length of a partial match has no
+    /// answer for it (`KvCache::can_truncate_to`). llama.cpp's server
+    /// re-prefills such models too.
     pub fn store(&mut self, tokens: Vec<usize>, kv_caches: Vec<KvCache>, pending_logits: Vec<f32>) {
-        if kv_caches.iter().any(|c| c.window().is_some()) {
+        if kv_caches
+            .iter()
+            .any(|c| c.window().is_some() || c.recurrent.is_some())
+        {
             return;
         }
         if self.entries.len() >= self.max_entries {

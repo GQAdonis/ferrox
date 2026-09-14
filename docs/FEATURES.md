@@ -73,6 +73,26 @@ is faster.
   graph with `leading_dense_block_count` dense layers and a sigmoid
   MoE with `exp_probs_b` REQUIRED on the rest; the Mamba-2 hybrids
   name their block (`layer_shapes::ZeroKvLayer`) and refuse.
+- **Granite 4.0** (`granitehybrid`: H-Micro 3B, H-Tiny 7B-A1B, H-Small
+  32B-A9B), audited against libllama on 2026-09-14
+  (`tests/granite_hybrid_graphs.rs`, KL 1.9e-13 NoPE dense, 7.9e-13
+  rotated, 1.0e-13 MoE with the shared expert). The first MAMBA-2 row:
+  `granite-hybrid.cpp:17-19` marks a layer recurrent when its
+  `head_count_kv` is 0 and `:128-142` runs Granite's layer with the
+  Mamba-2 block (`mamba-base.cpp:149-288`) where attention would be, so
+  it is a fourth answer to "what is this layer's attention"
+  (`layer_shapes::AttnShape::Mamba2`, `ferrox_models::mamba2`,
+  `ferrox_core::mamba2` for the conv and scan steps as ggml computes
+  them). The state is a `RecurrentState` (`ferrox_core::
+  recurrent_state`) beside the layer's cache on all three backings:
+  cloned and cleared with it, refused a truncate to a middle position
+  (`KvCache::can_truncate_to`), so the prefix cache does not store such
+  caches and speculative decoding refuses such models, as llama.cpp's
+  server re-prefills them. `ssm_conv1d.bias` is REQUIRED because
+  `mamba-base.cpp:222` adds it unconditionally and libllama segfaults
+  without it (measured). `nemotron-h` (one block per layer),
+  `falcon-h1` (attention and Mamba-2 in parallel), `jamba` and `plamo2`
+  (Mamba-1) name what they still need (`layer_shapes::ZeroKvLayer`).
 - **openPangu-Embedded** (`pangu-embedded`: 1B / 7B), audited against
   libllama on 2026-09-14 (`tests/pangu_embedded_graphs.rs`, KL 1.5e-13).
   A decoder LLM ("Embedded" as in edge devices) that had been filed as
@@ -440,9 +460,11 @@ is faster.
   from a list derived from that same table rather than restated beside
   it. A checkpoint that declares one with a value that changes the maths
   stops with an error naming the key. A Granite file declaring
-  `rope.scaling.finetuned = false` stops too, because llama.cpp then
-  runs it with no rotation at all and there is no way to express that
-  here.
+  `rope.scaling.finetuned = false` RUNS unrotated since 2026-09-14, as
+  llama.cpp runs it (`rope_layers::RopeLayers::Never`,
+  `ferrox_models::rope_finetuned`): every Granite-4.0 hybrid export
+  writes the key false, and the fixture that had evidenced the refusal
+  matches its libllama golden.
 - **One parallel-residual architecture still does not load**:
   `cohere2moe`, for its routed experts on the parallel branch's input
   and its MTP block; the residual itself is served

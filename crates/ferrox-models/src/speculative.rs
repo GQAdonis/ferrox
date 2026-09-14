@@ -546,6 +546,15 @@ pub fn speculative_decode_observed<D: Drafter + ?Sized>(
     options: &SpeculativeOptions,
 ) -> SpeculativeDecodeResult {
     assert!(!prompt_tokens.is_empty(), "prompt must not be empty");
+    // A rejected draft rolls every cache back to the last accepted
+    // position, which a Mamba layer's state cannot do
+    // (`ferrox_core::recurrent_state`); the CLI refuses `--model-draft`
+    // on such a model before reaching here, and this is the backstop.
+    assert!(
+        !decoder.config.has_recurrent_layers(),
+        "speculative decoding rolls the KV caches back on a rejected draft, and a recurrent \
+         layer's state cannot be rolled back to a middle position"
+    );
     for cache in kv_caches.iter() {
         assert_eq!(
             cache.positions(),

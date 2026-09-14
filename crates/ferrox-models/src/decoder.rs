@@ -19,8 +19,8 @@ pub mod kv_window;
 mod lm_head;
 mod qk_norm;
 mod qkv_bias;
+mod recurrent_block;
 mod rope;
-mod shortconv_block;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -165,6 +165,10 @@ pub struct AttnWeights {
     /// Metal launches refuse the model (a short-conv model is never
     /// uniform) and the layer (the destructure in `metal_attn_view`).
     pub shortconv: Option<crate::shortconv::ShortConv>,
+    /// The Mamba-2 block, `Some` on exactly the layers whose shape is
+    /// `AttnShape::Mamba2` (`crate::mamba2`); the same rules as
+    /// `shortconv`.
+    pub mamba2: Option<crate::mamba2::Mamba2>,
 }
 
 /// How a layer's routed experts are held. `Resident` is the original
@@ -800,6 +804,7 @@ impl Decoder {
                 o_scale: None,
                 o_bias: None,
                 shortconv: None,
+                mamba2: None,
             };
 
             // Leading dense layers (see ModelConfig::layer_is_dense's
@@ -1250,17 +1255,19 @@ impl Decoder {
             o_scale,
             o_bias,
             shortconv,
+            mamba2,
         } = &layer.attn;
         // No Metal attention kernel gates, sinks, norms between the V
         // sum and `wo`, scales after it, adds a bias to it, or runs a
-        // convolution instead; a layer with any of the six runs on the
-        // host.
+        // convolution or a state space in its place; a layer with any
+        // of the seven runs on the host.
         if output_gate.is_some()
             || sinks.is_some()
             || attn_sub_norm.is_some()
             || o_scale.is_some()
             || o_bias.is_some()
             || shortconv.is_some()
+            || mamba2.is_some()
         {
             return None;
         }
@@ -4143,6 +4150,9 @@ impl Decoder {
                     tokens.len(),
                 )
                 .expect("blocks reserved above are still held by this sequence");
+            // A recurrent layer's state moved in the scratch copy and
+            // is not rows (`ferrox_core::recurrent_state`).
+            cache.recurrent = gathered.recurrent.clone();
         }
         Ok(logits)
     }
@@ -4424,10 +4434,12 @@ impl Decoder {
                         residual_add(&mut hidden_batch, &projected, self.config.residual_scale);
                         break 'attention;
                     }
-                    // lfm2.cpp:197: the rows are consecutive positions of
-                    // one sequence, on this layer's cache.
-                    crate::layer_shapes::AttnShape::ShortConv => {
-                        let out = self.shortconv_block(
+                    // lfm2.cpp:197 / granite-hybrid.cpp:163: the rows are
+                    // consecutive positions of one sequence, on this
+                    // layer's cache.
+                    crate::layer_shapes::AttnShape::ShortConv
+                    | crate::layer_shapes::AttnShape::Mamba2 => {
+                        let out = self.recurrent_block(
                             l,
                             layer,
                             &normed_batch,
@@ -4838,13 +4850,15 @@ impl Decoder {
                         residual_add(&mut hidden_batch, &projected, self.config.residual_scale);
                         break 'attention;
                     }
-                    // lfm2.cpp:197: each row is ONE position of its own
-                    // sequence, so each runs on its own cache.
-                    crate::layer_shapes::AttnShape::ShortConv => {
+                    // lfm2.cpp:197 / granite-hybrid.cpp:163: each row is
+                    // ONE position of its own sequence, so each runs on
+                    // its own cache.
+                    crate::layer_shapes::AttnShape::ShortConv
+                    | crate::layer_shapes::AttnShape::Mamba2 => {
                         let mut out = Vec::with_capacity(batch_size * hidden_dim);
                         for b in 0..batch_size {
                             let step = kv.step(b, l);
-                            out.extend(self.shortconv_block(
+                            out.extend(self.recurrent_block(
                                 l,
                                 layer,
                                 &normed_batch[b * hidden_dim..(b + 1) * hidden_dim],

@@ -17,6 +17,24 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`granitehybrid` runs: Granite 4.0 (H-Micro, H-Tiny, H-Small), the
+  first Mamba-2 row, on the generic path.** `ferrox_core::mamba2` is
+  ggml's `ssm_conv` and `ssm_scan` steps; `ferrox_models::mamba2` is
+  `build_mamba2_layer` once (the `ssm.*` hparams, the eight tensors,
+  the block); `layer_shapes::AttnShape::Mamba2` / `ZeroKvLayer::Mamba2`
+  put it where attention stands; `Decoder::recurrent_block` dispatches
+  the conv and the Mamba-2 block on the three cache backings.
+  `ferrox_core::recurrent_state::RecurrentState` rides on `KvCache` /
+  `PagedKvCache` (`recurrent`), cloned and cleared with the cache;
+  `KvCache::truncate` refuses a middle position on it
+  (`can_truncate_to`), the prefix cache refuses to store such a cache,
+  `--model-draft` refuses such a model. `ssm_conv1d.bias` is required
+  (libllama segfaults without it, measured). Granite's
+  `rope.scaling.finetuned = false` is SERVED as `RopeLayers::Never`
+  (`rope_finetuned::unrotated`), on `granite` / `granitemoe` too; the
+  fixture that evidenced the refusal has its golden. KL 1.9e-13 /
+  7.9e-13 / 1.0e-13 (`tests/granite_hybrid_graphs.rs`,
+  `scripts/make_granite_hybrid_fixture.py`). 81 audited.
 - **`pangu-embedded` runs: openPangu-Embedded-1B / 7B.** A decoder LLM
   (`PanguEmbeddedForCausalLM`) that had been filed as "embedding
   variant; deferred" in the catalog and in `embedding_model::NOT_YET`

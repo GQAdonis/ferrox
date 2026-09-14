@@ -60,16 +60,16 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **79** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **81** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`; `deepseek2` in both tensor forms, `tests/deepseek2_graphs.rs`; the real PLM-1.8B through `ferrox parity`), `Gemma4` has it on the real Gemma-4-E2B (parity MATCH, KL 5.1e-4 on Q4_K_M, against a libllama that has `gemma4.cpp`), `Glm52` and `Kimi` none |
 | Refuses as **unaudited**, now triaged | 2 |
-| Off the generic path: refuses by name, or reaches one of those 4 engines | 66 (35 `dedicated` + 31 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `refact`, `bloom`, `mpt`, `jais`, `minimax-m2`, `lfm2` and `lfm2moe` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
+| Off the generic path: refuses by name, or reaches one of those 4 engines | 64 (33 `dedicated` + 31 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `refact`, `bloom`, `mpt`, `jais`, `minimax-m2`, `lfm2`, `lfm2moe`, `granitehybrid` and `granite-hybrid` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 81 generic-gqa (79 of
-them audited), 35 dedicated, 31 deferred, 3 test fixtures.
+regenerated with `ferrox archs --write`: 150 rows, 83 generic-gqa (81 of
+them audited), 33 dedicated, 31 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
 opt-in: an architecture not on the audited list stops rather than
@@ -276,6 +276,19 @@ of the DEFERRED column, where no row had ever closed from: it had been
 filed as "embedding variant" from its name, and it is a decoder LLM
 whose graph is `llama.cpp`'s with a required `attn_output.bias`, one
 row in `proj_bias` (`tests/pangu_embedded_graphs.rs`, KL 1.5e-13).
+`granitehybrid` (Granite 4.0) closed the same day as the first MAMBA-2
+row, on the second recurrent seam: where LFM2's conv state was a
+window and rode as KV history, a Mamba state is a reduction and rides
+as `ferrox_core::recurrent_state::RecurrentState` beside the layer's
+cache, cloned and cleared with it and REFUSED a truncate to a middle
+position, which is what fences the prefix cache and speculative
+decoding off such models (llama.cpp's server re-prefills them for the
+same reason). `ferrox_core::mamba2` is ggml's conv and scan steps;
+`ferrox_models::mamba2` is `build_mamba2_layer` once, for the four
+graphs that call it. KL 1.9e-13 / 7.9e-13 / 1.0e-13 on the NoPE,
+rotated and MoE fixtures (`tests/granite_hybrid_graphs.rs`); the
+Granite `rope.scaling.finetuned` refusal became `RopeLayers::Never`
+on the way, with its own fixture's golden.
 
 `olmo2` and `exaone4` closed TOGETHER, because they are one residual
 topology and not two. Neither has an `attn_norm` or an `ffn_norm`
@@ -356,9 +369,11 @@ alias for the second. Deriving
 restating it beside it found a live gap on the way past: the Gemma
 family was exempted from all four keys while reading none of them, so a
 hand-written `gemma3.residual_scale` would have loaded and been ignored.
-Half the Granite verdict stayed a refusal: llama.cpp reads
-`{arch}.rope.scaling.finetuned` as a switch for RoPE itself, and a file
-declaring it false runs unrotated, which ferrox cannot express.
+Half the Granite verdict stayed a refusal for four days: llama.cpp
+reads `{arch}.rope.scaling.finetuned` as a switch for RoPE itself, and
+a file declaring it false runs unrotated, which ferrox could not express
+until `RopeLayers::Never` existed; it is served since 2026-09-14, when
+Granite-4.0 (whose every export writes the key false) closed on it.
 
 | | llama.cpp | ferrox |
 |---|---|---|

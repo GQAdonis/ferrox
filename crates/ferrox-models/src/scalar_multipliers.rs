@@ -484,6 +484,10 @@ const MULTIPLIER_ARCHITECTURES: &[(&str, MultiplierSupport)] = &[
     ("granite", MultiplierSupport::GRANITE),
     ("granitemoe", MultiplierSupport::GRANITE),
     ("granite-moe", MultiplierSupport::GRANITE),
+    // `granite-hybrid.cpp:4-7` reads the same four, all optional, and
+    // `:113,145-147,175` apply them at the same four sites.
+    ("granitehybrid", MultiplierSupport::GRANITE),
+    ("granite-hybrid", MultiplierSupport::GRANITE),
     ("minicpm", MultiplierSupport::MINICPM),
     ("grok", MultiplierSupport::GROK),
     ("talkie", MultiplierSupport::TALKIE),

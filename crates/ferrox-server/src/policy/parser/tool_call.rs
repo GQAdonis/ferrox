@@ -454,9 +454,7 @@ impl ToolCallFormat {
     pub(crate) fn markers(self) -> Markers {
         match self {
             ToolCallFormat::Qwen25 => Markers::block("<tool_call>", "</tool_call>"),
-            ToolCallFormat::FunctionCall => {
-                Markers::block("<function_call>", "</function_call>")
-            }
+            ToolCallFormat::FunctionCall => Markers::block("<function_call>", "</function_call>"),
             ToolCallFormat::FencedJson => Markers::block("```", "```"),
             ToolCallFormat::ElementNamedTool => Markers::block("<", ">"),
             ToolCallFormat::Llama3 => Markers::block("<|python_tag|>", ""),
@@ -906,7 +904,7 @@ impl ToolCallParser {
                 continue;
             }
             let schemas: Vec<ToolSchema> = self.tools.values().cloned().collect();
-            let mut probe = ToolCallParser::new(format, schemas);
+            let probe = ToolCallParser::new(format, schemas);
             let (content, calls) = probe.parse_complete(text);
             if !calls.is_empty() {
                 return (content, calls);
@@ -1124,14 +1122,13 @@ impl ToolCallParser {
             // closing fence to be followed by a newline or end of text.
             let fence_closed = {
                 let n = held.matches("```").count();
-                n >= 2 && held.rfind("```").is_some_and(|at| {
-                    let tail = &held[at + 3..];
-                    tail.is_empty() || tail.starts_with('\n') || tail.trim().is_empty()
-                })
+                n >= 2
+                    && held.rfind("```").is_some_and(|at| {
+                        let tail = &held[at + 3..];
+                        tail.is_empty() || tail.starts_with('\n') || tail.trim().is_empty()
+                    })
             };
-            let closed = held
-                .rfind("</")
-                .is_some_and(|at| held[at..].contains('>'))
+            let closed = held.rfind("</").is_some_and(|at| held[at..].contains('>'))
                 || held.contains("/>")
                 || fence_closed;
             if !closed && held.len() < WRAPPER_HOLD_LIMIT {
@@ -1676,7 +1673,8 @@ impl ToolCallParser {
         let body = if body.starts_with('{') {
             body
         } else {
-            body.split_once('\n').map_or(body, |(_tag, rest)| rest.trim())
+            body.split_once('\n')
+                .map_or(body, |(_tag, rest)| rest.trim())
         };
         let value: Value = serde_json::from_str(body).ok()?;
         self.call_from_value(&value, index)
@@ -3521,8 +3519,14 @@ mod element_named_tool_tests {
 
     fn parser() -> ToolCallParser {
         let tools = vec![
-            ToolSchema { name: "current_time".to_string(), parameters: None },
-            ToolSchema { name: "get_weather".to_string(), parameters: None },
+            ToolSchema {
+                name: "current_time".to_string(),
+                parameters: None,
+            },
+            ToolSchema {
+                name: "get_weather".to_string(),
+                parameters: None,
+            },
         ];
         ToolCallParser::new(ToolCallFormat::ElementNamedTool, tools)
     }
@@ -3537,8 +3541,7 @@ mod element_named_tool_tests {
 
     #[test]
     fn paired_tag_with_json_body() {
-        let (_c, calls) =
-            parser().parse_complete(r#"<get_weather>{"city":"Paris"}</get_weather>"#);
+        let (_c, calls) = parser().parse_complete(r#"<get_weather>{"city":"Paris"}</get_weather>"#);
         assert_eq!(calls.len(), 1);
         assert!(calls[0].arguments.contains("Paris"));
     }
@@ -3568,7 +3571,10 @@ mod element_named_tool_tests {
     #[test]
     fn unoffered_tool_name_is_not_a_call() {
         let (_c, calls) = parser().parse_complete(r#"<delete_everything arguments="{}"/>"#);
-        assert!(calls.is_empty(), "a tag that is not an offered tool must stay prose");
+        assert!(
+            calls.is_empty(),
+            "a tag that is not an offered tool must stay prose"
+        );
     }
 
     #[test]
@@ -3584,8 +3590,14 @@ mod streaming_fallback_tests {
 
     fn schemas() -> Vec<ToolSchema> {
         vec![
-            ToolSchema { name: "current_time".to_string(), parameters: None },
-            ToolSchema { name: "time__current_time".to_string(), parameters: None },
+            ToolSchema {
+                name: "current_time".to_string(),
+                parameters: None,
+            },
+            ToolSchema {
+                name: "time__current_time".to_string(),
+                parameters: None,
+            },
         ]
     }
 
@@ -3614,7 +3626,7 @@ mod streaming_fallback_tests {
     /// the first of those attempts, so comparing against it would test
     /// something the server never does.
     fn buffered_calls(text: &str) -> Vec<String> {
-        let mut parser = ToolCallParser::new(ToolCallFormat::Qwen25, schemas());
+        let parser = ToolCallParser::new(ToolCallFormat::Qwen25, schemas());
         let (_text, calls) = parser.parse_complete(text);
         if !calls.is_empty() {
             return calls.into_iter().map(|c| c.name).collect();
@@ -3671,7 +3683,10 @@ mod streaming_fallback_tests {
     #[test]
     fn streamed_unoffered_tool_is_not_a_call() {
         let bad = "<xml>{\"name\": \"rm_rf_everything\", \"arguments\": {}}</xml>";
-        assert!(stream_calls(bad, 6).is_empty(), "unoffered tool must stay prose");
+        assert!(
+            stream_calls(bad, 6).is_empty(),
+            "unoffered tool must stay prose"
+        );
     }
 }
 
@@ -3680,11 +3695,13 @@ mod fenced_streaming_tests {
     use super::*;
 
     fn schemas() -> Vec<ToolSchema> {
-        vec![ToolSchema { name: "time__current_time".to_string(), parameters: None }]
+        vec![ToolSchema {
+            name: "time__current_time".to_string(),
+            parameters: None,
+        }]
     }
 
-    const FENCED: &str =
-        "```json\n{\"name\": \"time__current_time\", \"arguments\": {}}\n```";
+    const FENCED: &str = "```json\n{\"name\": \"time__current_time\", \"arguments\": {}}\n```";
 
     fn stream_calls(text: &str, chunk: usize) -> Vec<String> {
         let mut p = ToolCallParser::new(ToolCallFormat::Qwen25, schemas());

@@ -41,14 +41,17 @@
 //! one to write it, is this repo's dominant bug shape, and it decays into
 //! a 200 whose forced call this server cannot parse.
 //!
-//! Ten of the eleven formats this server parses can be forced: the three
-//! whose payload is a JSON object behind a marker (hermes/qwen2.5,
+//! Ten of the fourteen formats this server parses can be forced: the
+//! three whose payload is a JSON object behind a marker (hermes/qwen2.5,
 //! llama3, mistral), the five element grammars (qwen3_coder, glm47,
 //! minimax, deepseekv32, minimax_m3), gemma4's pair list, and gpt-oss's
-//! harmony channel. The remaining one -- muse_glimmer -- is refused BY
-//! FORMAT NAME with the reason, in [`wire`]'s `shape`. A forced call
-//! served with a 200 that does not parse is worse than the 501, because
-//! the caller stops checking.
+//! harmony channel. The remaining four are refused BY FORMAT NAME with
+//! the reason, in [`wire`]'s `shape`: muse_glimmer, whose call boundary
+//! is not syntactic, and the three recovery framings (fenced_json,
+//! element_named_tool, function_call), which exist to READ a call a
+//! checkpoint wrote instead of its own template's framing and so are
+//! not framings to force. A forced call served with a 200 that does not
+//! parse is worse than the 501, because the caller stops checking.
 //!
 //! # Lazy, and mandatory
 //!

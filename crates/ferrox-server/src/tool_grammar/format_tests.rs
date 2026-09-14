@@ -1,4 +1,4 @@
-//! One table, walked by every test here: for each of the eleven wire
+//! One table, walked by every test here: for each of the fourteen wire
 //! formats this server parses, either a forced call it can WRITE and
 //! read back, or the refusal that names the format.
 //!
@@ -69,9 +69,9 @@ struct Sample {
     near_miss: &'static str,
 }
 
-/// The eleven formats, and what a forced call in each looks like.
+/// The fourteen formats, and what a forced call in each looks like.
 ///
-/// Exhaustive with no `_` arm: a twelfth wire format has to be given a
+/// Exhaustive with no `_` arm: a fifteenth wire format has to be given a
 /// sample here, or declared unforceable, before this compiles.
 fn sample(format: ToolCallFormat) -> Option<Sample> {
     match format {
@@ -185,15 +185,20 @@ fn sample(format: ToolCallFormat) -> Option<Sample> {
             near_miss: "<|tool_call>call:get_weather{days:",
         }),
 
-        // The one that refuses. See `wire::shape` for the reason.
-        ToolCallFormat::MuseGlimmer => None,
+        // The ones that refuse. See `wire::shape` for the reasons: one
+        // format whose call boundary is not syntactic, and three that
+        // are recovery framings no template trains.
+        ToolCallFormat::MuseGlimmer
+        | ToolCallFormat::FencedJson
+        | ToolCallFormat::ElementNamedTool
+        | ToolCallFormat::FunctionCall => None,
     }
 }
 
 /// Every variant of [`ToolCallFormat`], so the tests below walk all of
 /// them. `sample` is the exhaustive match that makes a new one visible;
 /// this list is what makes it TESTED.
-const EVERY_FORMAT: [ToolCallFormat; 11] = [
+const EVERY_FORMAT: [ToolCallFormat; 14] = [
     ToolCallFormat::Qwen25,
     ToolCallFormat::Llama3,
     ToolCallFormat::Mistral,
@@ -205,6 +210,9 @@ const EVERY_FORMAT: [ToolCallFormat; 11] = [
     ToolCallFormat::GptOss,
     ToolCallFormat::Gemma4,
     ToolCallFormat::MuseGlimmer,
+    ToolCallFormat::FencedJson,
+    ToolCallFormat::ElementNamedTool,
+    ToolCallFormat::FunctionCall,
 ];
 
 fn tool_defs() -> Vec<ToolDef> {

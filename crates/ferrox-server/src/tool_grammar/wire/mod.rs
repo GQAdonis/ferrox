@@ -1,7 +1,7 @@
 //! One root rule per wire format, derived from the description the
 //! PARSER reads that format with.
 //!
-//! # Why this is not a table of eleven framings
+//! # Why this is not a table of fourteen framings
 //!
 //! `policy::parser::tool_call` already knows how every family spells a
 //! call, as `Markers`: the block markers, the invoke and parameter
@@ -63,7 +63,7 @@ enum Shape {
 
 /// The shape a format's root rule takes, or the refusal naming it.
 ///
-/// Exhaustive on purpose: a twelfth wire format must decide what a
+/// Exhaustive on purpose: a fifteenth wire format must decide what a
 /// forced call in it looks like, or say why it cannot, before this
 /// compiles.
 fn shape(format: ToolCallFormat) -> Result<Shape, ApiError> {
@@ -85,6 +85,24 @@ fn shape(format: ToolCallFormat) -> Result<Shape, ApiError> {
         | ToolCallFormat::MiniMaxM3 => Ok(Shape::Elements),
         ToolCallFormat::GptOss => Ok(Shape::Harmony),
         ToolCallFormat::Gemma4 => Ok(Shape::Pairs),
+        // The three recovery formats. None is a framing any template
+        // trains, so none is a framing to FORCE: they exist because a
+        // checkpoint that ignored its own template still emitted a real
+        // call, and `output.rs` tries them after the native format to
+        // recover it. Forcing one would make this server demand text no
+        // template taught the model to write -- the 200-that-does-not-
+        // parse this module's header exists to prevent. `tool_choice`
+        // "auto" still works: the recovery parsers read a call back in
+        // any of the three whatever the model reaches for.
+        ToolCallFormat::FencedJson
+        | ToolCallFormat::ElementNamedTool
+        | ToolCallFormat::FunctionCall => Err(refused(
+            format,
+            "it is a recovery format, not a trained one. This server recognizes it so that a \
+             call a checkpoint emitted INSTEAD of its own template's framing is still read back, \
+             and a grammar would invert that: it would force the model to write a framing \
+             nothing taught it, chosen because some other model once got its own framing wrong",
+        )),
         // The one that stays refused, for a reason about the format
         // rather than about effort.
         ToolCallFormat::MuseGlimmer => Err(refused(

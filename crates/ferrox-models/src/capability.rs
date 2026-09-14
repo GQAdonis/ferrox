@@ -978,6 +978,17 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // REQUIRED, added right after the head (`Decoder::output_bias`);
     // `rope.dimension_count = partial_rotary_factor * head_dim`, NEOX.
     "phi2",
+    // tests/cohere2_graphs.rs: `cohere2` (Command-R7B, Command-A).
+    // `command-r.cpp` with a window: `cohere2.cpp:78` the weighted
+    // LayerNorm without a bias, `:120-134` the shared-norm parallel
+    // residual, `:14,153-154` `logit_scale` REQUIRED and multiplied,
+    // `:4-7,13` `swa_type = STANDARD`, period 4 seeded and overridable by
+    // the scalar key, the window REQUIRED (refused when absent,
+    // `swa_geometry::window_required`), `:9-12` the sliding layers' base
+    // following the model's, `:72,91` ONLY the sliding layers rotated
+    // (`rope_layers::SlidingOnly`, the `exaone-moe` rule the first
+    // census missed), a tied lm_head, NORM RoPE, no biases.
+    "cohere2",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1099,8 +1110,10 @@ pub fn uses_non_parametric_rms_norm(arch: &str) -> bool {
 /// `command-r.cpp:68,127` pass `attn_norm` / `output_norm` with a NULL
 /// bias to `LLM_NORM`, over the shared-norm parallel residual
 /// (`crate::parallel_residual`) with a `logit_scale` MULTIPLY
-/// (`crate::scalar_multipliers`); `tests/command_r_graphs.rs`.
-pub const WEIGHTED_LAYER_NORM: &[&str] = &["dbrx", "command-r"];
+/// (`crate::scalar_multipliers`); `tests/command_r_graphs.rs`. The
+/// third is `cohere2` (Command-R7B), the same graph with a window
+/// (`cohere2.cpp:78,147`); `tests/cohere2_graphs.rs`.
+pub const WEIGHTED_LAYER_NORM: &[&str] = &["dbrx", "command-r", "cohere2"];
 
 /// Does this architecture normalise with a weighted LayerNorm?
 /// See [`WEIGHTED_LAYER_NORM`].
@@ -1748,6 +1761,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // the LM head (`proj_bias::OUTPUT_BIAS_CREATORS`); partial NEOX
         // rotary (tests/phi2_graphs.rs). NEOX RoPE: llama-model.cpp:2636.
         v.push(gqa_neox("phi2"));
+        // `cohere2` (Command-R7B, Command-A): `command-r`'s graph with a
+        // REQUIRED window whose sliding layers alone are rotated
+        // (`crate::rope_layers::RopeLayers::SlidingOnly`), the
+        // `logit_scale` REQUIRED (tests/cohere2_graphs.rs). NORM RoPE:
+        // llama-model.cpp:2583.
+        v.push(gqa_norm("cohere2"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -2107,51 +2126,28 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             ));
         }
         // The parallel residual `x + attn(norm(x)) + ffn(norm(x))` is
-        // SERVED (`crate::parallel_residual`; `gptneox` and `plamo`
-        // are audited on it, tests/parallel_residual_graphs.rs). The
-        // rows still here each need something ELSE on top of it, and
-        // the reason names it. `unsupported_scaling_keys` is the
-        // metadata-visible half of the same class.
-        for (n, rope, fam, reason) in [
-            // `command-r` was HERE (a weighted LayerNorm without a bias,
-            // `logit_scale`); audited now (tests/command_r_graphs.rs),
-            // with Command-R+'s per-head LayerNorm QK norm refused by
-            // `crate::qk_layer_norm`.
-            // src/models/cohere2.cpp:120-134 plus a window whose sliding
-            // layers alone are rotated (:72,90-99).
-            (
-                "cohere2",
-                Norm,
-                StandardGqa,
-                "parallel residual over a weighted LayerNorm without a bias \
-                 (src/models/cohere2.cpp:78) with a `logit_scale` multiply (:153-154) and a \
-                 sliding window whose SLIDING layers alone are rotated (:72,90-99), the \
-                 inverse of the per-layer RoPE gate `crate::rope_layers` serves",
-            ),
-            (
-                "cohere2moe",
-                Norm,
-                StandardGqa,
-                "the `cohere2` graph with routed experts whose router reads the parallel \
-                 branch's one normed input (src/models/cohere2moe.cpp:234) and an MTP block \
-                 (:51-53,380-420); nothing here has run it",
-            ),
-            // `falcon` was HERE; audited now on both of its shapes
-            // (tests/falcon_graphs.rs), the 40B's `attn_norm_2` through
-            // `norm_sites::ATTN_NORM_2_FEEDS_ATTENTION`.
-            // `phi2` was HERE (an `output.bias` on the LM head on top of
-            // the parallel residual); audited now (tests/phi2_graphs.rs).
-        ] {
-            v.push(prof(
-                n,
-                TextGeneration,
-                fam,
-                KvGqa,
-                rope,
-                ArchPath::DedicatedOnly { reason },
-                WholeVector,
-            ));
-        }
+        // SERVED (`crate::parallel_residual`), and every row that was
+        // refused for it is audited now: `gptneox`, `plamo`
+        // (tests/parallel_residual_graphs.rs), `command-r`
+        // (tests/command_r_graphs.rs), `falcon` (tests/falcon_graphs.rs),
+        // `phi2` (tests/phi2_graphs.rs), `cohere2`
+        // (tests/cohere2_graphs.rs). The one left needs something ELSE
+        // on top of it, and the reason names it.
+        v.push(prof(
+            "cohere2moe",
+            TextGeneration,
+            StandardGqa,
+            KvGqa,
+            Norm,
+            ArchPath::DedicatedOnly {
+                reason: "the `cohere2` graph with routed experts whose router reads the \
+                         parallel branch's one normed input (src/models/cohere2moe.cpp:234), \
+                         a rotation gate of `is_swa || il < n_layer_dense_lead` (:177-179,192) \
+                         `crate::rope_layers` has no variant for, and an MTP block \
+                         (:51-53,380-420); nothing here has run it",
+            },
+            WholeVector,
+        ));
         // MiniCPM was the case `unsupported_scaling_keys` cannot catch:
         // `src/models/minicpm.cpp:5-7` *hardcodes* an embedding
         // multiplier of 12.0, a residual multiplier of
@@ -3912,20 +3908,19 @@ mod tests {
     /// applies them now and `tests/minicpm_graphs.rs` is the evidence.
     #[test]
     fn architectures_with_a_different_residual_topology_are_refused() {
-        for arch in ["cohere2", "cohere2moe"] {
-            match resolve_architecture(arch) {
-                Some(ArchPath::DedicatedOnly { reason }) => {
-                    assert!(
-                        reason.contains("parallel residual") || reason.contains("cohere2"),
-                        "{arch}: the residual is the shared cause and the reason names it"
-                    );
-                    assert!(
-                        reason.contains("src/models/"),
-                        "{arch}: what else it needs, with the line"
-                    );
-                }
-                other => panic!("{arch} must be refused, got {other:?}"),
+        let arch = "cohere2moe";
+        match resolve_architecture(arch) {
+            Some(ArchPath::DedicatedOnly { reason }) => {
+                assert!(
+                    reason.contains("cohere2"),
+                    "{arch}: the served graph is named, so the reason is what is on top of it"
+                );
+                assert!(
+                    reason.contains("src/models/"),
+                    "{arch}: what else it needs, with the line"
+                );
             }
+            other => panic!("{arch} must be refused, got {other:?}"),
         }
         // The sequential-residual siblings stay on the generic path --
         // this is a named list, not a family-wide ban.
@@ -3953,6 +3948,7 @@ mod tests {
             "command-r",
             "falcon",
             "phi2",
+            "cohere2",
         ] {
             assert!(
                 matches!(

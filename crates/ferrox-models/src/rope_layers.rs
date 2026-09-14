@@ -2,17 +2,25 @@
 //! one rule with a table, rather than one branch per architecture.
 //!
 //! Every architecture ferrox had audited rotates Q and K on every
-//! layer, and that is llama.cpp's default too. Six architectures
+//! layer, and that is llama.cpp's default too. Eight architectures
 //! upstream do not, and until 2026-09-10 ferrox had no way to say so:
 //! three of them were REFUSED for it, one ran WRONG, and two were
-//! latent behind other refusals.
+//! latent behind other refusals. The first census counted SIX, because
+//! it grepped for the word `use_rope`; `cohere2.cpp:91` and
+//! `cohere2moe.cpp:192` spell the same gate as `if (is_swa)` around
+//! `ggml_rope_ext` and were found on 2026-09-14 by grepping for that
+//! (`olmo2` and `mellum` also test `is_swa` there, but rotate BOTH
+//! branches -- the sliding one with the scaling off, `crate::
+//! swa_geometry` -- so they are not gates).
 //!
-//! # The six, transcribed
+//! # The eight, transcribed
 //!
 //! | arch | llama.cpp | line |
 //! |---|---|---|
 //! | `exaone4` | `is_swa(il) \|\| swa_type == NONE` | `exaone4.cpp:116` |
 //! | `exaone-moe` | `is_swa(il)` | `exaone-moe.cpp:136,155` |
+//! | `cohere2` | `is_swa(il)` | `cohere2.cpp:72,91` |
+//! | `cohere2moe` | `is_swa(il) \|\| il < n_layer_dense_lead` | `cohere2moe.cpp:177-179,192` |
 //! | `smollm3` | `(il + 1) % 4 != 0` | `smollm3.cpp:5,69` |
 //! | `smallthinker` | `step == n_layer \|\| il % step != 0` | `smallthinker.cpp:18,108-109` |
 //! | `afmoe` | `step > 0 && (il + 1) % step != 0` | `afmoe.cpp:137-138` |
@@ -183,6 +191,15 @@ pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> Rop
                 RopeLayers::All
             }
         }
+        // `cohere2.cpp:4` pins `swa_type` to STANDARD and `:13` reads the
+        // window as a REQUIRED key (the loader refuses a file without
+        // it, `crate::swa_geometry::window_required`), so this is
+        // `exaone-moe`'s rule spelled `if (is_swa)` at `:91`: Command-R7B
+        // rotates its three sliding layers in four and not the fourth.
+        // `cohere2moe.cpp:192` adds `|| il < n_layer_dense_lead`, a
+        // variant this enum does not have; that row is on no engine and
+        // its arm comes with it.
+        "cohere2" => RopeLayers::SlidingOnly,
         // `smollm3.cpp:5` assigns the step unconditionally, so this is
         // every SmolLM3 file: 9 of a 36-layer SmolLM3-3B's layers get no
         // rotation.
@@ -224,6 +241,7 @@ pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> Rop
 pub const PER_LAYER_ROPE_GATES: &[(&str, &str)] = &[
     ("exaone4", "src/models/exaone4.cpp:116"),
     ("exaone-moe", "src/models/exaone-moe.cpp:136,155"),
+    ("cohere2", "src/models/cohere2.cpp:72,91"),
     ("smollm3", "src/models/smollm3.cpp:5,69"),
     ("smallthinker", "src/models/smallthinker.cpp:18,108-109"),
     ("afmoe", "src/models/afmoe.cpp:137-138"),
@@ -306,7 +324,7 @@ mod tests {
     fn every_gated_architecture_is_in_the_table() {
         for (arch, line) in PER_LAYER_ROPE_GATES {
             // 32 layers and a window is the shape that makes every one
-            // of the six gates fire; the two conditional rows
+            // of the seven gates fire; the two conditional rows
             // (`smallthinker`, `llama4`) need the window and the other
             // four ignore it.
             let rule = rope_layers(arch, 32, true);

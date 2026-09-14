@@ -159,6 +159,18 @@ is faster.
   the required `attn_output` / FFN biases, the ungated GELU, a partial
   NEOX rotary. `tests/phi2_graphs.rs`: KL 2.9e-7 at the f16 GELU-table
   line; dropping the bias moves the logits by more than 1.
+- **Command-R7B (`cohere2`) runs.** `command-r`'s graph with a REQUIRED
+  sliding window (period 4 seeded, the scalar `sliding_window_pattern`
+  honoured, the sliding layers' rope base following the model's) whose
+  SLIDING layers alone are rotated (`cohere2.cpp:72,91`): that is
+  `rope_layers::SlidingOnly`, the `exaone-moe` rule, which the module's
+  first census had missed by grepping for `use_rope` (the census is
+  eight graphs now, `cohere2moe`'s variant recorded). `logit_scale` is
+  REQUIRED and multiplied; a file without the window key is refused as
+  libllama refuses it (`swa_geometry::window_required`, measured).
+  `tests/cohere2_graphs.rs`: KL 1.0e-14 and 8.9e-14 (the key's period
+  2); rotating the full layer, dropping the multiplier, or reading the
+  LayerNorm as RMSNorm each diverge.
 - **The LayerNorm with a bias, and with it Orion-14B (`orion`) and
   Nemotron-4 / Minitron (`nemotron`).** `NormOp::LayerNormBias` is
   `build_norm(x, w, b, LLM_NORM)`, the variant the eight-row
@@ -354,10 +366,10 @@ is faster.
   `rope.scaling.finetuned = false` stops too, because llama.cpp then
   runs it with no rotation at all and there is no way to express that
   here.
-- **Two parallel-residual architectures still do not load**:
-  `cohere2`, `cohere2moe`. The residual itself is served
-  (`ferrox_models::parallel_residual`, below); each names what it needs
-  on top of it.
+- **One parallel-residual architecture still does not load**:
+  `cohere2moe`, for its routed experts on the parallel branch's input
+  and its MTP block; the residual itself is served
+  (`ferrox_models::parallel_residual`, below).
 
 Full matrix: [`MODELS.md`](MODELS.md) ·
 [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) ·

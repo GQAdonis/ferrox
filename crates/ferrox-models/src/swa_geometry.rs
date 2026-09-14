@@ -89,6 +89,23 @@ pub fn full_layers_rotate_half(arch: &str) -> Option<&'static str> {
     }
 }
 
+/// The llama.cpp line where `arch` reads `attention.sliding_window`
+/// as a REQUIRED key (`ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,
+/// hparams.n_swa)` with no `false`), or `None` where the key is
+/// optional. A file without it fails to load upstream; here it would
+/// have loaded as a windowless model that rotates no layer at all
+/// (`crate::rope_layers::RopeLayers::SlidingOnly` with nothing sliding),
+/// which is a different graph from the one llama.cpp refuses to build.
+/// Measured: `grep -n "LLM_KV_ATTENTION_SLIDING_WINDOW," src/models/*.cpp`
+/// without a trailing `false` on the generic path.
+pub fn window_required(arch: &str) -> Option<&'static str> {
+    match arch {
+        "cohere2" => Some("cohere2.cpp:13"),
+        "exaone-moe" => Some("exaone-moe.cpp:13"),
+        _ => None,
+    }
+}
+
 /// The llama.cpp line where `arch` passes NO rope factors to its
 /// sliding layers, or `None` when the sliding layers take the same
 /// factors tensor as the full ones.

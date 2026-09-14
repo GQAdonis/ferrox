@@ -54,11 +54,26 @@ impl Logits {
     /// anyway rather than left to whichever call site runs first,
     /// because "no model does both" is exactly the kind of fact that
     /// stops being true without anybody editing this file.
+    ///
+    /// `bias` is [`crate::decoder::Decoder::output_bias`], `output.bias`
+    /// (`phi2.cpp:136`, `qwen2.cpp:147-148`: `ggml_add(cur, output_b)`
+    /// right after `build_lora_mm`), and it goes before both: it belongs
+    /// to the matmul. `raw` may be `[batch, vocab]`; the bias is added to
+    /// every row.
     pub(crate) fn from_output_head(
         mut raw: Vec<f32>,
+        bias: Option<&[f32]>,
         softcap: Option<f32>,
         multiplier: Option<f32>,
     ) -> Self {
+        if let Some(b) = bias {
+            debug_assert!(!b.is_empty() && raw.len().is_multiple_of(b.len()));
+            for row in raw.chunks_mut(b.len()) {
+                for (v, bv) in row.iter_mut().zip(b) {
+                    *v += bv;
+                }
+            }
+        }
         if let Some(m) = multiplier {
             for v in raw.iter_mut() {
                 *v *= m;
@@ -81,12 +96,15 @@ impl Logits {
     pub(crate) fn project(
         head: &WeightMatrix,
         x: &[f32],
+        bias: Option<&[f32]>,
         softcap: Option<f32>,
         multiplier: Option<f32>,
     ) -> Self {
-        match (softcap, multiplier) {
-            (Some(cap), None) => Logits(head.apply_softcapped(x, cap)),
-            _ => Self::from_output_head(head.apply(x), softcap, multiplier),
+        match (bias, softcap, multiplier) {
+            // The fused cap runs on the raw projection, so a bias, which
+            // goes BEFORE the cap, keeps the head on the plain path.
+            (None, Some(cap), None) => Logits(head.apply_softcapped(x, cap)),
+            _ => Self::from_output_head(head.apply(x), bias, softcap, multiplier),
         }
     }
 
@@ -123,9 +141,12 @@ pub(crate) struct FoldedLmHead<L> {
 impl<L> FoldedLmHead<L> {
     /// `Some` only when the stack is allowed to run lm_head on device:
     /// greedy argmax is active for this thread, the model's FINAL NORM
-    /// is an RMSNorm the stack can bake in, AND the output head has a
-    /// Metal launch. Any other combination keeps lm_head on the host,
-    /// where `Decoder::logits_from_normed` applies the cap.
+    /// is an RMSNorm the stack can bake in, the head has NO bias (no
+    /// stack adds `output.bias`, and unlike the cap and the multiplier
+    /// a bias is not monotone across the vocabulary, so it moves the
+    /// argmax), AND the output head has a Metal launch. Any other
+    /// combination keeps lm_head on the host, where
+    /// `Decoder::logits_from_normed` applies all three.
     ///
     /// The final norm is a condition here rather than at the two call
     /// sites because what folds is `final_norm + lm_head + argmax`, one
@@ -138,9 +159,10 @@ impl<L> FoldedLmHead<L> {
     pub(crate) fn permit(
         greedy_argmax: bool,
         final_norm: &crate::norm::NormOp,
+        output_bias: Option<&[f32]>,
         launch: Option<L>,
     ) -> Option<Self> {
-        if !greedy_argmax || final_norm.rms_weights().is_none() {
+        if !greedy_argmax || final_norm.rms_weights().is_none() || output_bias.is_some() {
             return None;
         }
         launch.map(|launch| FoldedLmHead { launch })
@@ -191,7 +213,8 @@ impl<L> FoldedLmHead<L> {
              argmax id could not be passed through"
         );
         if out.len() == vocab_size {
-            Logits::from_output_head(out, softcap, multiplier).into_vec()
+            // No bias: `permit` refused the fold for a head that has one.
+            Logits::from_output_head(out, None, softcap, multiplier).into_vec()
         } else {
             out
         }
@@ -211,7 +234,8 @@ mod tests {
 
     #[test]
     fn logits_cannot_be_built_without_the_cap_being_applied() {
-        let out = Logits::from_output_head(vec![100.0, -100.0, 0.5], Some(30.0), None).into_vec();
+        let out =
+            Logits::from_output_head(vec![100.0, -100.0, 0.5], None, Some(30.0), None).into_vec();
         for (got, &raw) in out.iter().zip([100.0f32, -100.0, 0.5].iter()) {
             assert!(
                 (got - capped(raw, 30.0)).abs() < 1e-5,
@@ -219,7 +243,7 @@ mod tests {
             );
         }
         assert_eq!(
-            Logits::from_output_head(vec![100.0, -100.0], None, None).into_vec(),
+            Logits::from_output_head(vec![100.0, -100.0], None, None, None).into_vec(),
             vec![100.0, -100.0],
             "no cap configured must leave the head's output exactly alone"
         );
@@ -241,15 +265,15 @@ mod tests {
             .collect();
         let head = WeightMatrix::F32(Tensor::new(data, vec![rows, cols]));
         let x = [1.0f32, -2.0, 0.5, 3.0];
-        let via_project = Logits::project(&head, &x, Some(30.0), None).into_vec();
-        let via_raw = Logits::from_output_head(head.apply(&x), Some(30.0), None).into_vec();
+        let via_project = Logits::project(&head, &x, None, Some(30.0), None).into_vec();
+        let via_raw = Logits::from_output_head(head.apply(&x), None, Some(30.0), None).into_vec();
         assert_eq!(via_project, via_raw);
         for v in &via_project {
             assert!(v.abs() < 30.0, "a capped logit is inside (-cap, cap): {v}");
         }
         // Without a cap there is only the raw route.
         assert_eq!(
-            Logits::project(&head, &x, None, None).into_vec(),
+            Logits::project(&head, &x, None, None, None).into_vec(),
             head.apply(&x)
         );
     }
@@ -266,7 +290,7 @@ mod tests {
     #[test]
     fn the_logit_multiplier_multiplies_and_runs_before_the_cap() {
         assert_eq!(
-            Logits::from_output_head(vec![8.0, -4.0, 1.0], None, Some(0.25)).into_vec(),
+            Logits::from_output_head(vec![8.0, -4.0, 1.0], None, None, Some(0.25)).into_vec(),
             vec![2.0, -1.0, 0.25]
         );
 
@@ -274,7 +298,7 @@ mod tests {
         // cap of 3.0, `cap(0.25 * 100)` is 3.0 * tanh(25/3) and
         // `0.25 * cap(100)` would be 0.75 -- far enough apart that a
         // swapped order cannot pass.
-        let got = Logits::from_output_head(vec![100.0], Some(3.0), Some(0.25)).into_vec();
+        let got = Logits::from_output_head(vec![100.0], None, Some(3.0), Some(0.25)).into_vec();
         assert!(
             (got[0] - capped(25.0, 3.0)).abs() < 1e-5,
             "got {got:?}, want cap applied to the SCALED logit"
@@ -297,11 +321,11 @@ mod tests {
     #[test]
     fn lm_head_folds_into_the_stack_only_under_greedy_argmax() {
         assert!(
-            FoldedLmHead::permit(false, &rms(), Some(())).is_none(),
+            FoldedLmHead::permit(false, &rms(), None, Some(())).is_none(),
             "without greedy argmax the stack would return uncapped logits"
         );
-        assert!(FoldedLmHead::permit(true, &rms(), None::<u32>).is_none());
-        let folded = FoldedLmHead::permit(true, &rms(), Some(7u32))
+        assert!(FoldedLmHead::permit(true, &rms(), None, None::<u32>).is_none());
+        let folded = FoldedLmHead::permit(true, &rms(), None, Some(7u32))
             .expect("greedy + launch permits folding");
         assert_eq!(
             *folded.launch(),
@@ -318,7 +342,7 @@ mod tests {
     /// instead of an id, Gemma-2's 30.0 cap must still apply.
     #[test]
     fn a_folded_stack_returning_logits_gets_them_softcapped() {
-        let folded = FoldedLmHead::permit(true, &rms(), Some(())).unwrap();
+        let folded = FoldedLmHead::permit(true, &rms(), None, Some(())).unwrap();
         let vocab = 4;
         let raw = vec![100.0f32, -100.0, 31.0, 0.25];
         let got = folded.interpret(raw.clone(), vocab, Some(30.0), None);
@@ -342,7 +366,7 @@ mod tests {
     /// would emit token 29.
     #[test]
     fn a_folded_stack_returning_an_argmax_id_is_passed_through_untouched() {
-        let folded = FoldedLmHead::permit(true, &rms(), Some(())).unwrap();
+        let folded = FoldedLmHead::permit(true, &rms(), None, Some(())).unwrap();
         assert_eq!(
             folded.interpret(vec![100.0], 32_000, Some(30.0), None),
             vec![100.0],
@@ -360,6 +384,25 @@ mod tests {
     /// either non-RMS variant here, so both call sites wrote
     /// `Some(&self.final_norm)` and the MoE one hardcoded
     /// `final_norm_done_in_stack = true`.
+    /// `output.bias` keeps lm_head on the host: no stack adds it, and a
+    /// bias is not monotone across the vocabulary, so a folded argmax
+    /// would be a different token.
+    #[test]
+    fn a_head_with_an_output_bias_cannot_fold() {
+        let bias = [0.0f32, 3.0];
+        assert!(FoldedLmHead::permit(true, &rms(), Some(&bias), Some(())).is_none());
+        assert!(FoldedLmHead::permit(true, &rms(), None, Some(())).is_some());
+    }
+
+    /// The bias goes first, before the multiplier and the cap, and is
+    /// added to every row of a batch.
+    #[test]
+    fn the_output_bias_is_added_per_row_before_the_other_transforms() {
+        let bias = [1.0f32, -1.0];
+        let out = Logits::from_output_head(vec![1.0, 1.0, 2.0, 2.0], Some(&bias), None, Some(2.0));
+        assert_eq!(out.as_slice(), &[4.0, 0.0, 6.0, 2.0]);
+    }
+
     #[test]
     fn a_non_rms_final_norm_cannot_fold_however_greedy_the_caller_is() {
         for norm in [
@@ -368,12 +411,12 @@ mod tests {
             crate::norm::NormOp::None,
         ] {
             assert!(
-                FoldedLmHead::permit(true, &norm, Some(())).is_none(),
+                FoldedLmHead::permit(true, &norm, None, Some(())).is_none(),
                 "{norm:?}: the stack has no weights to bake the final norm from"
             );
         }
         assert!(
-            FoldedLmHead::permit(true, &rms(), Some(())).is_some(),
+            FoldedLmHead::permit(true, &rms(), None, Some(())).is_some(),
             "an RMSNorm final norm still folds, or this test proves nothing"
         );
     }

@@ -147,6 +147,18 @@ is faster.
   ATTENTION`, one graph of 140). `tests/falcon_graphs.rs`: KL 3.8e-8
   and 1.9e-7 at the f16 GELU-table line; swapping the two slots back
   diverges by more than 1.
+- **Phi-2 (`phi2`): Phi-2 and Phi-1.5 run, and the LM head has a bias
+  slot.** `output.bias` (`phi2.cpp:22,136`, REQUIRED; `phimoe` the same,
+  `qwen2` optional: `proj_bias::OUTPUT_BIAS_CREATORS`, three graphs of
+  140) is `Decoder::output_bias`, added right after the head in the one
+  place its post-projection transforms run (`decoder::lm_head::Logits`),
+  and a head with one is never folded into a fused Metal argmax stack
+  (a bias moves the argmax where the cap and the multiplier cannot). The
+  rest is the shared-norm parallel residual over the biased LayerNorm,
+  Q/K/V biases split or fused (both matched, libllama byte-identical),
+  the required `attn_output` / FFN biases, the ungated GELU, a partial
+  NEOX rotary. `tests/phi2_graphs.rs`: KL 2.9e-7 at the f16 GELU-table
+  line; dropping the bias moves the logits by more than 1.
 - **The LayerNorm with a bias, and with it Orion-14B (`orion`) and
   Nemotron-4 / Minitron (`nemotron`).** `NormOp::LayerNormBias` is
   `build_norm(x, w, b, LLM_NORM)`, the variant the eight-row
@@ -342,10 +354,10 @@ is faster.
   `rope.scaling.finetuned = false` stops too, because llama.cpp then
   runs it with no rotation at all and there is no way to express that
   here.
-- **Three parallel-residual architectures still do not load**:
-  `cohere2`, `cohere2moe`, `phi2`. The residual itself is served
-  (`ferrox_models::parallel_residual`, below); each of these names what
-  it needs on top of it.
+- **Two parallel-residual architectures still do not load**:
+  `cohere2`, `cohere2moe`. The residual itself is served
+  (`ferrox_models::parallel_residual`, below); each names what it needs
+  on top of it.
 
 Full matrix: [`MODELS.md`](MODELS.md) ·
 [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) ·

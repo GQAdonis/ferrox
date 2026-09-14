@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **66** architectures run with
+Honest position, re-audited 2026-09-14. **67** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -781,8 +781,19 @@ the first table row wrong before any code ran: it had said "parallel
 WHEN `attn_norm_2` is present", and a 7B file refused to load its
 missing `ffn_norm`. KL 3.8e-8 and 1.9e-7 at the f16 GELU-table line
 (`tests/falcon_graphs.rs`); swapping the two slots back diverges by
-more than 1. `cohere2`, `cohere2moe` and `phi2` stay refused with what
-each needs ON TOP of the residual written into the reason.
+more than 1. `phi2` (Phi-2, Phi-1.5) followed on 2026-09-14 on the ONE
+slot its reason had named: `output.bias` on the LM head
+(`phi2.cpp:22,136`, REQUIRED; `proj_bias::OUTPUT_BIAS_CREATORS` is
+three graphs of 140, `phimoe` required and `qwen2` optional). It is
+`Decoder::output_bias`, added in `decoder::lm_head::Logits` -- the one
+place the head's post-projection transforms already ran, before the
+multiplier and the cap because it belongs to the matmul -- and
+`FoldedLmHead::permit` refuses a head that has one, because unlike the
+cap and the multiplier a bias is not monotone across the vocabulary
+and a folded argmax would be a different token. KL 2.9e-7 at the f16
+GELU-table line, the fused and split QKV spellings on one golden
+(`tests/phi2_graphs.rs`). `cohere2` and `cohere2moe` stay refused with
+what each needs ON TOP of the residual written into the reason.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

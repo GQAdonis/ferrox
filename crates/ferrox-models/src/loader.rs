@@ -2996,6 +2996,8 @@ impl Decoder {
             Ok(w) => w,
             Err(_) => load_weight_matrix(&file, "token_embd.weight")?,
         };
+        // `output.bias` for the graphs that create it (`crate::proj_bias`).
+        let output_bias = crate::proj_bias::load_output_bias(&file, &arch, output_head.rows())?;
 
         // Second pass: attach the one shared store to every
         // store-backed layer. Opening the shard files fresh (plain
@@ -3052,6 +3054,7 @@ impl Decoder {
             layers,
             final_norm,
             output_head,
+            output_bias,
             gpu_vram_budget_bytes: None,
             gpt_oss: if is_gpt_oss {
                 Some(crate::decoder::GptOssWeights {

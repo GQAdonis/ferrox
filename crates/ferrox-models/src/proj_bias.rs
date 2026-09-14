@@ -78,6 +78,7 @@ pub const ATTN_OUT_BIAS_CREATORS: &[(&str, Presence)] = &[
     ("gpt-oss", Presence::Required),
     ("gptneox", Presence::Required),
     ("granite", Presence::Optional),
+    ("phi2", Presence::Required),
     ("granitemoe", Presence::Optional),
     ("granite-moe", Presence::Optional),
     ("jais2", Presence::Required),
@@ -104,8 +105,42 @@ pub const FFN_BIAS_CREATORS: &[(&str, Presence, bool)] = &[
     ("minicpm", Presence::Optional, true),
     ("mistral3", Presence::Optional, true),
     ("nemotron", Presence::Optional, false),
+    ("phi2", Presence::Required, false),
     ("starcoder2", Presence::Required, false),
 ];
+
+/// Generic-path graphs that create `output.bias` on the LM head,
+/// `{n_vocab}`, added right after `build_lora_mm(output, cur)`.
+/// Measured: `grep -l 'LLM_TENSOR_OUTPUT, *"bias"'` over all 140 graphs
+/// is `phi2.cpp:22` (REQUIRED, `:136`), `phimoe.cpp:23` (REQUIRED),
+/// `qwen2.cpp:27` (optional, `:147-148`), and `qwen2vl` / `dream` /
+/// `wavtokenizer-dec` on no engine here.
+pub const OUTPUT_BIAS_CREATORS: &[(&str, Presence)] = &[
+    ("phi2", Presence::Required),
+    ("phimoe", Presence::Required),
+    ("qwen2", Presence::Optional),
+];
+
+fn output_presence(arch: &str) -> Option<Presence> {
+    OUTPUT_BIAS_CREATORS
+        .iter()
+        .find(|(n, _)| *n == arch)
+        .map(|(_, p)| *p)
+}
+
+/// `output.bias`: `Some` when the architecture's graph creates it and
+/// the file has it, an error when the graph requires it and the file
+/// lacks it, `None` otherwise.
+pub fn load_output_bias(
+    file: &impl TensorSource,
+    arch: &str,
+    vocab_size: usize,
+) -> Result<Option<Vec<f32>>, LoadError> {
+    let Some(presence) = output_presence(arch) else {
+        return Ok(None);
+    };
+    load_bias(file, arch, "output.bias", presence, vocab_size)
+}
 
 fn attn_out_presence(arch: &str) -> Option<Presence> {
     ATTN_OUT_BIAS_CREATORS

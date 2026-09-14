@@ -38,7 +38,7 @@ impl Decoder {
     ) -> Vec<f32> {
         match self.config.layer_shape(layer_idx).attention {
             AttnShape::ShortConv => self.shortconv_block(layer_idx, layer, normed, rows, kv),
-            AttnShape::Mamba1 | AttnShape::Mamba2 => {
+            AttnShape::Mamba1 | AttnShape::Mamba2 | AttnShape::Gdn => {
                 self.ssm_block(layer_idx, layer, normed, rows, kv)
             }
             other => unreachable!("layer {layer_idx} is {other:?}, not a recurrent block"),

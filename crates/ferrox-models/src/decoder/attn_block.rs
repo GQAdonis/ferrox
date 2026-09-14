@@ -103,7 +103,7 @@ impl Decoder {
             AttnShape::Absent => return None,
             // lfm2.cpp:197 / granite-hybrid.cpp:163: the recurrent block,
             // on this row's cache.
-            AttnShape::ShortConv | AttnShape::Mamba2 | AttnShape::Mamba1 => {
+            AttnShape::ShortConv | AttnShape::Mamba2 | AttnShape::Mamba1 | AttnShape::Gdn => {
                 return Some(self.recurrent_block(layer_idx, layer, normed, 1, kv))
             }
         };
@@ -139,6 +139,13 @@ impl Decoder {
             }
         };
 
+        // qwen35.cpp:191-199: the gate rides in `wq`; split it off
+        // before anything reads a Q width.
+        let q_gate = layer.attn.q_gate_interleaved.then(|| {
+            let (qq, gate) = crate::attn_gate::split_interleaved_q_gate(&q, 1, n_heads, head_dim);
+            q = qq;
+            gate
+        });
         // Whole rows here: one token's Q and K. See
         // `Decoder::qk_norm_after_rope` for why the norm has two homes.
         let (q_width, kv_width, v_width) = (q.len(), k.len(), v.len());
@@ -160,7 +167,8 @@ impl Decoder {
         // normed row, summed into the attention branch.
         let ssm = self.parallel_ssm_rows(layer_idx, layer, normed, 1, kv.recurrent_slot());
         let mut attn_out = self.push_and_attend_row(kv, layer_idx, layer, &k, &v, &q);
-        let mut projected = self.attn_out_to_residual_rows(layer, normed, &mut attn_out, 1);
+        let mut projected =
+            self.attn_out_to_residual_rows(layer, normed, &mut attn_out, 1, q_gate.as_deref());
         Self::add_parallel_ssm(&mut projected, ssm);
         Some(projected)
     }
@@ -176,13 +184,22 @@ impl Decoder {
     /// places; it is added to one. `normed` is the SAME vector the
     /// Q/K/V projections read, which is what every gating graph
     /// projects the gate from (`crate::attn_gate`).
+    ///
+    /// `q_gate` is the gate the three bodies split off a double-width
+    /// `wq` (`AttnWeights::q_gate_interleaved`), `rows * n_heads *
+    /// head_dim` wide, or `None`; `qwen35.cpp:229-230` multiplies its
+    /// sigmoid in here, before `wo`.
     pub(crate) fn attn_out_to_residual_rows(
         &self,
         layer: &LayerWeights,
         normed: &[f32],
         attn_out: &mut [f32],
         rows: usize,
+        q_gate: Option<&[f32]>,
     ) -> Vec<f32> {
+        if let Some(gate) = q_gate {
+            crate::attn_gate::apply_interleaved_gate(attn_out, gate);
+        }
         if let Some(gate) = &layer.attn.output_gate {
             gate.apply_rows(normed, attn_out, rows, self.config.head_dim);
         }

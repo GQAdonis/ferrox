@@ -17,6 +17,22 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`qwen35` runs: Qwen3.5 dense 0.8B to 27B.** `ferrox_core::gdn` is
+  the autoregressive delta rule (`delta_step`, `l2_normalize`,
+  `HeadMap::{Tiled, Grouped}`); `ferrox_models::gdn` the block
+  (`Gdn`, `GdnHparams`, `recurrent_layers` from
+  `attention.recurrent_layers` / `full_attention_interval`);
+  `AttnShape::Gdn`, `SsmBlock::Gdn`; `LayerShapes::resolve` takes the
+  recurrent mask; `AttnWeights::q_gate_interleaved` with
+  `attn_gate::split_interleaved_q_gate` / `apply_interleaved_gate` in
+  the three host bodies; `qwen35` rows in `norm_sites::
+  PRE_FFN_NORM_IS_POST_ATTENTION_NORM` and `mrope::MROPE_READERS`.
+  KL 4.1e-13 (`tests/qwen35_graphs.rs`, `scripts/make_qwen35_fixture.py`).
+  88 audited.
+- **Removed:** `ferrox-models/src/gdn.rs` (the FreeToken GDN port) and
+  `hybrid_gguf_loader.rs`, 1.8k lines that never met libllama;
+  `hybrid_engine.rs` is the refusal for the hybrid rows still off the
+  generic path (`plamo2`, `qwen3next`, `qwen35moe`) and nothing else.
 - **`jamba`, `mamba` and `mamba2` run: Jamba, Mamba / FalconMamba,
   Mamba-Codestral.** `ferrox_models::mamba1` is `build_mamba_layer`
   (`ferrox_core::mamba2::Decay::PerState` is the scan's per-state

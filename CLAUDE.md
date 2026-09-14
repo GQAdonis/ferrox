@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **87** architectures run with
+Honest position, re-audited 2026-09-14. **88** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -1062,6 +1062,37 @@ false`. KL 7.3e-12 / 2.3e-12 / 1.8e-12 / 3.6e-13
 class because `d_inner` one-element heads each take their own `exp`;
 swapping B and C turns five tests red. Every Mamba graph in llama.cpp
 is served but `plamo2`'s own spelling.
+
+`qwen35` (Qwen3.5 dense, 0.8B to 27B) closed next, and it is the row
+the "hybrid engine" had been a scaffold FOR since 2026-09-01: 852
+lines of `gdn.rs` ported from a Python reference, 915 of
+`hybrid_gguf_loader.rs`, a stub that refused everything, and not one
+libllama golden between them. The block went on the seam the Mamba
+rows had just built: `ferrox-core/src/gdn.rs` is the autoregressive
+delta rule as `delta-net-base.cpp:289-365` computes it (decay, the
+state's prediction, the beta-scaled error, the rank-one update, the
+read-out with the scaled query), `ferrox-models/src/gdn.rs` is
+`qwen35.cpp:236-317` around it, `AttnShape::Gdn` is the site, and the
+state rides on the cache as every other recurrent block's. Two things
+the port had wrong that only a golden shows: Qwen3.5's V heads read
+K heads TILED (`h % n_k`, `llama-model.cpp:524-526`; the converter
+reorders V heads for `ggml_repeat`), where the reference and the port
+grouped them (`h / ratio`, Qwen3-Next's order), and the l2 norms take
+the model's RMS epsilon, not a literal. The attention layers gate
+through a double-width `wq` with the gate interleaved per head
+(`:191-199`); it is split AFTER the projection
+(`attn_gate::split_interleaved_q_gate`) so a quantized `wq` stays one
+matrix on its quantized path, and the sigmoid multiplies in the one
+attention tail. Which layers are recurrent comes from two keys, not
+the head counts (`gdn::recurrent_layers`: the array over `n_layer_all`
+when present, else the interval); `LayerShapes::resolve` takes that
+mask. Partial IMROPE over `rope.dimension_sections` is NEOX band for
+band on text positions (`mrope::MROPE_READERS`), pinned by the golden
+with the sections in the file. KL 4.1e-13 on the first run
+(`tests/qwen35_graphs.rs`); grouping the heads or dropping the
+sigmoid each turns five tests red. The scaffold is deleted.
+`qwen35moe` needs its MoE half and `qwen3next` its grouped heads and
+fused projections; both say so.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

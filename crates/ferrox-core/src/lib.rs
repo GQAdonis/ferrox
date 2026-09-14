@@ -39,6 +39,7 @@ pub mod expert_cache;
 pub mod expert_pool;
 pub mod expert_slots;
 pub mod expert_store;
+pub mod gdn;
 pub mod host_memory;
 pub mod instance;
 pub mod kernel_registry;

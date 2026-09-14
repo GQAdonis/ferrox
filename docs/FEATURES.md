@@ -110,6 +110,25 @@ is faster.
   `_scale` read from the file, plus an ungated ReLU-squared shared
   expert (KL 3.6e-13). Its latent variant (`moe_latent_size`,
   Nemotron-3 Super) is refused by name.
+- **Qwen3.5 dense** (`qwen35`: 0.8B / 2B / 4B / 9B / 27B), audited
+  against libllama on 2026-09-14 (`tests/qwen35_graphs.rs`, KL 4.1e-13,
+  4.1e-13 with `attention.recurrent_layers`, 5.7e-13 with a separate
+  `output.weight`). The gated delta net (`ferrox_core::gdn` is the
+  autoregressive delta rule as `delta-net-base.cpp:289-365` computes
+  it, V heads TILED over K heads as `llama-model.cpp:524-526` says;
+  `ferrox_models::gdn` is `qwen35.cpp:236-317` around it: the fused
+  q/k/v projection, the `z` gate, `sigmoid(beta)`, `softplus(alpha +
+  dt) * A`, the causal conv with SiLU, per-head l2 norms with the RMS
+  epsilon, `rms_norm(o) * silu(z)` per head) is a block where
+  attention would be (`AttnShape::Gdn`), on the layers
+  `gdn::recurrent_layers` names from the array or the interval. Its
+  full-attention layers gate through a double-width `wq`
+  (`attn_gate::Q_INTERLEAVED_GATE_ARCHS`: the gate rides interleaved
+  with the query and is split after the projection, so a quantized
+  `wq` stays one matrix), with per-head QK norm and partial IMROPE
+  (NEOX band for band on text positions, `ferrox_models::mrope`); the
+  pre-FFN norm is stored as `post_attention_norm` (`norm_sites`). The
+  1.8k-line GDN scaffold that had never met libllama is deleted.
 - **Mamba-1: Jamba, Mamba, FalconMamba; and pure Mamba-2** (`jamba`,
   `mamba`, `mamba2`), audited against libllama on 2026-09-14
   (`tests/mamba_graphs.rs`, KL 7.3e-12 / 2.3e-12 / 1.8e-12 / 3.6e-13).

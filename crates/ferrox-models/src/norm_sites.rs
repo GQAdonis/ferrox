@@ -69,7 +69,8 @@ use ferrox_gguf::{GgufError, TensorSource};
 /// tensors (sinks, biases, the SwiGLU clamp), and widening it would have
 /// handed `seed_oss` attention sinks it does not have. Two facts, two
 /// predicates.
-pub const PRE_FFN_NORM_IS_POST_ATTENTION_NORM: &[&str] = &["gpt-oss", "seed_oss", "glm4moe"];
+pub const PRE_FFN_NORM_IS_POST_ATTENTION_NORM: &[&str] =
+    &["gpt-oss", "seed_oss", "glm4moe", "qwen35"];
 
 /// Architectures that store their **pre-FFN** norm under
 /// `blk.N.attn_output_norm.weight` (`LLM_TENSOR_ATTN_OUT_NORM`) and carry

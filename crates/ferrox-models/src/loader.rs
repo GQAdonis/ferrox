@@ -648,12 +648,17 @@ impl ModelConfig {
                 );
                 (hidden_dim * 4) as u64
             }) as usize;
+        // Qwen3.5's recurrent layers come from two keys, not from the
+        // head counts (`crate::gdn::recurrent_layers`).
+        let recurrent_layers =
+            crate::gdn::recurrent_layers(file, &arch, trunk.block_count, n_layers)?;
         let layer_shapes = crate::layer_shapes::LayerShapes::resolve(
             &arch,
             &heads_per_layer,
             &kv_heads_per_layer,
             ffn_per_layer.as_deref(),
             expert_ffn_dim,
+            recurrent_layers.as_deref(),
         )?
         .replicated(layer_loops.map_or(1, |l| l.n_loops));
         // The OTHER half of llama.cpp's dense-vs-MoE rule.
@@ -2710,6 +2715,7 @@ impl Decoder {
                         } else {
                             None
                         },
+                        q_gate_interleaved: crate::attn_gate::q_gate_interleaved(&arch),
                     };
                     crate::layer_shapes::check_gqa_projection_widths(
                         l,

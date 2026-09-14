@@ -106,9 +106,9 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `deepseek4` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `kimi-linear` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `kimi_k3` | TextGeneration | Dedicated | KvGqa | dedicated |
+| `qwen35` | TextGeneration | Hybrid | Hybrid | generic-gqa |
 | `plamo2` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `qwen3next` | TextGeneration | Hybrid | Hybrid | dedicated |
-| `qwen35` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `qwen35moe` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `lfm2` | TextGeneration | Hybrid | Hybrid | generic-gqa |
 | `lfm2moe` | TextGeneration | Hybrid | Hybrid | generic-gqa |

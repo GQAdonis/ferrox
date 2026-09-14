@@ -209,6 +209,11 @@ pub enum AttnShape {
     /// `jamba.cpp:128`, `mamba.cpp:106`): as [`AttnShape::Mamba2`] with
     /// `crate::mamba1`'s block.
     Mamba1,
+    /// The gated delta net (`qwen35.cpp:236-317`; `crate::gdn`): as
+    /// [`AttnShape::Mamba2`] with that block. Decided by
+    /// `crate::gdn::recurrent_layers`, not by the head counts, which
+    /// are uniform on such a file.
+    Gdn,
 }
 
 /// Architectures whose graph ADDS a block's output to the residual on a
@@ -362,7 +367,8 @@ impl AttnShape {
             | AttnShape::Absent
             | AttnShape::ShortConv
             | AttnShape::Mamba2
-            | AttnShape::Mamba1 => 0,
+            | AttnShape::Mamba1
+            | AttnShape::Gdn => 0,
         }
     }
 
@@ -374,14 +380,15 @@ impl AttnShape {
             | AttnShape::Absent
             | AttnShape::ShortConv
             | AttnShape::Mamba2
-            | AttnShape::Mamba1 => 0,
+            | AttnShape::Mamba1
+            | AttnShape::Gdn => 0,
         }
     }
 
     /// True for a block whose state between tokens is a
     /// `RecurrentState` rather than rows (`crate::mamba2`).
     pub fn is_recurrent(self) -> bool {
-        matches!(self, AttnShape::Mamba2 | AttnShape::Mamba1)
+        matches!(self, AttnShape::Mamba2 | AttnShape::Mamba1 | AttnShape::Gdn)
     }
 
     /// The layer's cache as `(n_kv_heads, k_head_dim, v_head_dim)`, the
@@ -404,9 +411,11 @@ impl AttnShape {
     ) -> (usize, usize, usize) {
         match self {
             AttnShape::Gqa { n_kv_heads, .. } => (n_kv_heads, head_dim, v_head_dim),
-            AttnShape::Linear | AttnShape::Absent | AttnShape::Mamba2 | AttnShape::Mamba1 => {
-                (0, head_dim, v_head_dim)
-            }
+            AttnShape::Linear
+            | AttnShape::Absent
+            | AttnShape::Mamba2
+            | AttnShape::Mamba1
+            | AttnShape::Gdn => (0, head_dim, v_head_dim),
             AttnShape::ShortConv => (1, hidden_dim, 0),
         }
     }
@@ -461,15 +470,43 @@ impl LayerShapes {
     /// `ffn` may be absent (a MoE file that declares only
     /// `expert_feed_forward_length`); then every layer takes
     /// `expert_ffn_dim`.
+    ///
+    /// `recurrent` is `crate::gdn::recurrent_layers`' answer: the layers
+    /// that run the gated delta net, on an architecture whose head
+    /// counts are uniform and say nothing about it.
     pub fn resolve(
         arch: &str,
         heads: &[u64],
         kv_heads: &[u64],
         ffn: Option<&[u64]>,
         expert_ffn_dim: usize,
+        recurrent: Option<&[bool]>,
     ) -> Result<Self, LoadError> {
         let n = heads.len();
         assert_eq!(kv_heads.len(), n);
+        if let Some(recurrent) = recurrent {
+            assert_eq!(recurrent.len(), n);
+            let zero_kv = ZeroKvLayer::for_arch(arch);
+            let mut shapes = Vec::with_capacity(n);
+            for il in 0..n {
+                let ffn_dim = ffn.map_or(expert_ffn_dim, |f| f[il] as usize);
+                let attention = if recurrent[il] {
+                    AttnShape::Gdn
+                } else {
+                    AttnShape::from_counts(
+                        heads[il] as usize,
+                        kv_heads[il] as usize,
+                        ffn_dim,
+                        zero_kv,
+                    )
+                    .map_err(|why| {
+                        LoadError::UnsupportedFeature(arch.to_string(), format!("blk.{il}: {why}"))
+                    })?
+                };
+                shapes.push(LayerShape { attention, ffn_dim });
+            }
+            return Ok(LayerShapes::PerLayer(shapes));
+        }
         // A pure recurrent model: every layer the one block, no FFN
         // (`PURE_RECURRENT`). Its arrays are uniform zeros, which would
         // otherwise read as a zero-head GQA model.
@@ -693,6 +730,15 @@ pub(crate) fn load_non_gqa_attention(
                 no_rows(0),
             )
         }
+        AttnShape::Gdn => {
+            ssm = Some(crate::ssm_block::SsmBlock::Gdn(crate::gdn::Gdn::load(
+                file, arch, layer, hidden_dim,
+            )?));
+            (
+                norm_sites.load_pre_norm(norm_sites.attn, file, Some(layer))?,
+                no_rows(0),
+            )
+        }
         AttnShape::Gqa { .. } => unreachable!("a GQA layer loads its projections"),
     };
     if let AttnShape::Linear = shape {
@@ -732,6 +778,7 @@ pub(crate) fn load_non_gqa_attention(
         o_bias: None,
         shortconv,
         ssm,
+        q_gate_interleaved: false,
     })
 }
 
@@ -773,8 +820,11 @@ pub(crate) fn check_gqa_projection_widths(
     else {
         unreachable!("only GQA layers have Q/K/V to check")
     };
+    // `qwen35.cpp:59`: the query and its gate share one projection
+    // (`crate::attn_gate::Q_INTERLEAVED_GATE_ARCHS`).
+    let q_rows = if attn.q_gate_interleaved { 2 } else { 1 } * n_heads * head_dim;
     let want = [
-        ("attn_q", attn.q_proj.rows(), n_heads * head_dim),
+        ("attn_q", attn.q_proj.rows(), q_rows),
         ("attn_k", attn.k_proj.rows(), n_kv_heads * head_dim),
         // V and the output projection at the V width: `mimo2.cpp:52`
         // creates `wo` as `{n_embd_head_v * n_head, n_embd}`
@@ -989,16 +1039,18 @@ mod tests {
         assert!(err.contains("Mamba-1"), "{err}");
         // A pure recurrent model: every layer the block, from uniform
         // zeros that would otherwise read as a zero-head GQA model.
-        let s = LayerShapes::resolve("mamba", &[0, 0], &[0, 0], Some(&[0, 0]), 0).unwrap();
+        let s = LayerShapes::resolve("mamba", &[0, 0], &[0, 0], Some(&[0, 0]), 0, None).unwrap();
         let LayerShapes::PerLayer(v) = s else {
             panic!("per layer");
         };
         assert!(v
             .iter()
             .all(|l| l.attention == AttnShape::Mamba1 && l.ffn_dim == 0));
-        assert!(LayerShapes::resolve("mamba2", &[0, 0], &[0, 0], None, 0)
-            .is_ok_and(|s| matches!(s, LayerShapes::PerLayer(_))));
-        assert!(LayerShapes::resolve("mamba", &[4, 4], &[0, 0], None, 0).is_err());
+        assert!(
+            LayerShapes::resolve("mamba2", &[0, 0], &[0, 0], None, 0, None)
+                .is_ok_and(|s| matches!(s, LayerShapes::PerLayer(_)))
+        );
+        assert!(LayerShapes::resolve("mamba", &[4, 4], &[0, 0], None, 0, None).is_err());
         // The cache: one row of n_embd per token, no V.
         assert_eq!(AttnShape::ShortConv.cache_geometry(6, 6, 24), (1, 24, 0));
         // Mamba-2: no rows at all, the state rides beside the cache.
@@ -1012,9 +1064,16 @@ mod tests {
         assert_eq!(AttnShape::from_counts(4, 0, 40, nh), Ok(AttnShape::Absent));
         // Attention with no FFN: refused as deci's discarded branch,
         // served as Nemotron-H's one-block layer.
-        assert!(LayerShapes::resolve("deci", &[4, 4], &[2, 2], Some(&[16, 0]), 16).is_err());
-        let s = LayerShapes::resolve("nemotron_h", &[4, 4, 4], &[0, 2, 0], Some(&[0, 0, 40]), 16)
-            .unwrap();
+        assert!(LayerShapes::resolve("deci", &[4, 4], &[2, 2], Some(&[16, 0]), 16, None).is_err());
+        let s = LayerShapes::resolve(
+            "nemotron_h",
+            &[4, 4, 4],
+            &[0, 2, 0],
+            Some(&[0, 0, 40]),
+            16,
+            None,
+        )
+        .unwrap();
         let LayerShapes::PerLayer(v) = s else {
             panic!("per layer");
         };
@@ -1034,9 +1093,9 @@ mod tests {
         assert!(AttnShape::Mamba2.is_recurrent() && !AttnShape::ShortConv.is_recurrent());
         assert_eq!(AttnShape::Linear.cache_geometry(6, 6, 24), (0, 6, 6));
         assert_eq!(AttnShape::ShortConv.n_kv_heads(), 0);
-        let err = LayerShapes::resolve("plamo2", &[4, 4], &[2, 0], None, 16).unwrap_err();
+        let err = LayerShapes::resolve("plamo2", &[4, 4], &[2, 0], None, 16, None).unwrap_err();
         assert!(err.to_string().contains("Mamba-1"), "{err}");
-        let s = LayerShapes::resolve("lfm2", &[4, 4], &[0, 2], None, 16).unwrap();
+        let s = LayerShapes::resolve("lfm2", &[4, 4], &[0, 2], None, 16, None).unwrap();
         let LayerShapes::PerLayer(v) = s else {
             panic!("per layer");
         };
@@ -1047,7 +1106,7 @@ mod tests {
     /// converter is free to spell a scalar as an array.
     #[test]
     fn equal_arrays_collapse_to_uniform_even_for_a_layer_zero_architecture() {
-        let s = LayerShapes::resolve("llama", &[4, 4], &[2, 2], Some(&[16, 16]), 16).unwrap();
+        let s = LayerShapes::resolve("llama", &[4, 4], &[2, 2], Some(&[16, 16]), 16, None).unwrap();
         assert!(s.is_uniform());
     }
 
@@ -1056,7 +1115,7 @@ mod tests {
     /// the per-layer table.
     #[test]
     fn a_varying_array_is_refused_unless_llama_cpp_indexes_it_per_layer() {
-        let err = LayerShapes::resolve("llama", &[4, 4], &[2, 1], None, 16).unwrap_err();
+        let err = LayerShapes::resolve("llama", &[4, 4], &[2, 1], None, 16, None).unwrap_err();
         assert!(format!("{err}").contains("PER_LAYER_SHAPE_ARCHS"), "{err}");
         let s = LayerShapes::resolve(
             "deci",
@@ -1064,6 +1123,7 @@ mod tests {
             &[2, 0, 0, 0],
             Some(&[16, 8, 16, 0]),
             16,
+            None,
         )
         .unwrap();
         assert_eq!(s, LayerShapes::PerLayer(deci_like()));
@@ -1073,11 +1133,12 @@ mod tests {
     /// combination both graphs agree on is not.
     #[test]
     fn an_ffn_free_layer_with_attention_is_refused_and_one_without_is_not() {
-        let err = LayerShapes::resolve("deci", &[4, 4], &[2, 2], Some(&[16, 0]), 16).unwrap_err();
+        let err =
+            LayerShapes::resolve("deci", &[4, 4], &[2, 2], Some(&[16, 0]), 16, None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("deci.cpp:147-149"), "{msg}");
         assert!(msg.contains("blk.1"), "{msg}");
-        assert!(LayerShapes::resolve("deci", &[4, 0], &[2, 0], Some(&[16, 0]), 16).is_ok());
+        assert!(LayerShapes::resolve("deci", &[4, 0], &[2, 0], Some(&[16, 0]), 16, None).is_ok());
     }
 
     /// The accessor and the two cache constructors read the same table.
@@ -1149,6 +1210,7 @@ mod tests {
             o_bias: None,
             shortconv: None,
             ssm: None,
+            q_gate_interleaved: false,
         };
         assert!(
             check_gqa_projection_widths(0, shape, head_dim, head_dim, hidden, &build(24, 12))

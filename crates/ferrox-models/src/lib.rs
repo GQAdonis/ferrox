@@ -43,7 +43,6 @@ pub mod hf_pull;
 #[cfg(feature = "hub")]
 pub mod hub;
 pub mod hybrid_engine;
-pub mod hybrid_gguf_loader;
 pub mod hyper_connections;
 pub mod kda;
 pub mod kimi_decoder;

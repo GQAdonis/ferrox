@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **84** architectures run with
+Honest position, re-audited 2026-09-14. **87** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -1034,7 +1034,34 @@ two-argument `LLM_TN` spelling (`:80`, `blk.N.ffn_norm` with no
 (`tests/falcon_h1_graphs.rs`); running the block on a fresh state
 every token turns six tests red. Every `build_mamba2_layer` caller
 of the 140 graphs is served; `jamba`, `plamo2` and `mamba` are
-`build_mamba_layer` (Mamba-1) and say so.
+`build_mamba_layer` (Mamba-1) and said so.
+
+`jamba`, `mamba` and `mamba2` closed next on that block and on one
+rule. `ferrox-models/src/mamba1.rs` is `build_mamba_layer`
+(`mamba-base.cpp:4-148`) once: the same conv step and the same scan
+kernel as Mamba-2's with `n_head = d_inner`, `head_dim = 1` and a
+per-STATE decay (`ferrox_core::mamba2::Decay::PerState`, the kernel's
+`src3->ne[0] != 1` arm, one `exp` per state element), dt / B / C from
+one projection of the conv output, the RMS norms on them when the
+three weights exist (Jamba, REQUIRED) or `ssm.dt_b_c_rms` sets them
+weightless (FalconMamba), dt projected up with its bias.
+`ssm_block::SsmBlock` is the one value the decoder holds for either
+generation, so a third is one variant. The rule is `layer_shapes::
+PURE_RECURRENT`: a pure Mamba converter writes `head_count 0`,
+`head_count_kv` absent and `feed_forward_length 0`, uniform zeros
+that `LayerShapes::resolve` had read as a zero-head GQA model; on the
+two named architectures every layer is the block and nothing else,
+`head_dim` is 0 because nothing reads one, and the FFN-free block
+keeps its output (`mamba.cpp:88`). Jamba is the hybrid: Mamba-1 where
+the KV array is 0, attention with NO RoPE elsewhere (`jamba.cpp:98`),
+and the FFN dense or MoE PER LAYER by whether the file has a router
+(`:89-101,152`; `moe_interleave::DENSE_LAYER_BY_ROUTER_ABSENCE`, one
+loader of 140 that reads the file for it), softmax with `norm_w =
+false`. KL 7.3e-12 / 2.3e-12 / 1.8e-12 / 3.6e-13
+(`tests/mamba_graphs.rs`), the Mamba-1 rows at the `orion` tolerance
+class because `d_inner` one-element heads each take their own `exp`;
+swapping B and C turns five tests red. Every Mamba graph in llama.cpp
+is served but `plamo2`'s own spelling.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

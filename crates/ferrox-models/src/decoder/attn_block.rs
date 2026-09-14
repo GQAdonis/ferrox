@@ -103,7 +103,7 @@ impl Decoder {
             AttnShape::Absent => return None,
             // lfm2.cpp:197 / granite-hybrid.cpp:163: the recurrent block,
             // on this row's cache.
-            AttnShape::ShortConv | AttnShape::Mamba2 => {
+            AttnShape::ShortConv | AttnShape::Mamba2 | AttnShape::Mamba1 => {
                 return Some(self.recurrent_block(layer_idx, layer, normed, 1, kv))
             }
         };

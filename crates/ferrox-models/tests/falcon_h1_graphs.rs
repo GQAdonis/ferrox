@@ -216,7 +216,15 @@ fn falcon_h1_matches_llama_cpp_on_all_three_paths() {
 fn without_ssm_norm_matches_llama_cpp() {
     assert_all_three_paths_match(FH1_NOSSMNORM, &FH1_NOSSMNORM_GOLDEN);
     let d = load_graph_fixture(FH1_NOSSMNORM);
-    assert!(d.layers[0].attn.mamba2.as_ref().unwrap().norm.is_none());
+    assert!(d.layers[0]
+        .attn
+        .ssm
+        .as_ref()
+        .unwrap()
+        .mamba2()
+        .unwrap()
+        .norm
+        .is_none());
 }
 
 #[test]
@@ -261,7 +269,7 @@ fn the_loaded_decoder_is_the_graph() {
                 n_kv_heads: 2
             }
         ));
-        assert!(layer.attn.mamba2.is_some(), "blk.{il} has the block");
+        assert!(layer.attn.ssm.is_some(), "blk.{il} has the block");
         assert_eq!(layer.attn.q_proj.rows(), 24, "blk.{il} has attention");
     }
     let mut kv = graph_caches(&d);
@@ -309,12 +317,19 @@ fn both_parallel_branches_reach_the_residual() {
             vec![rows, cols],
         ))
     };
-    let m = d.layers[1].attn.mamba2.as_mut().unwrap();
+    let m = d.layers[1].attn.ssm.as_mut().unwrap().mamba2_mut().unwrap();
     let (rows, cols) = (m.out_proj.rows(), m.out_proj.cols());
     let saved = std::mem::replace(&mut m.out_proj, zero(rows, cols));
     let worst = worst_vs(&decode(&d), &FH1_GOLDEN);
     assert!(worst > 1e-2, "the Mamba-2 branch not seen: {worst}");
-    d.layers[1].attn.mamba2.as_mut().unwrap().out_proj = saved;
+    d.layers[1]
+        .attn
+        .ssm
+        .as_mut()
+        .unwrap()
+        .mamba2_mut()
+        .unwrap()
+        .out_proj = saved;
     assert_decoder_matches_on_all_three_paths(&d, &FH1_GOLDEN, GRAPH_TOL, "restored");
     let (rows, cols) = (
         d.layers[1].attn.o_proj.rows(),

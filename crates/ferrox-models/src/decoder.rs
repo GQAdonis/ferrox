@@ -165,10 +165,12 @@ pub struct AttnWeights {
     /// Metal launches refuse the model (a short-conv model is never
     /// uniform) and the layer (the destructure in `metal_attn_view`).
     pub shortconv: Option<crate::shortconv::ShortConv>,
-    /// The Mamba-2 block, `Some` on exactly the layers whose shape is
-    /// `AttnShape::Mamba2` (`crate::mamba2`); the same rules as
-    /// `shortconv`.
-    pub mamba2: Option<crate::mamba2::Mamba2>,
+    /// The state-space block (`crate::ssm_block`): `Some` on exactly the
+    /// layers whose shape is `AttnShape::Mamba1` / `Mamba2`, and on
+    /// every GQA layer of a `ModelConfig::parallel_ssm` model
+    /// (`crate::mamba2::PARALLEL_WITH_ATTENTION`); the same rules as
+    /// `shortconv` otherwise.
+    pub ssm: Option<crate::ssm_block::SsmBlock>,
 }
 
 /// How a layer's routed experts are held. `Resident` is the original
@@ -804,7 +806,7 @@ impl Decoder {
                 o_scale: None,
                 o_bias: None,
                 shortconv: None,
-                mamba2: None,
+                ssm: None,
             };
 
             // Leading dense layers (see ModelConfig::layer_is_dense's
@@ -1258,7 +1260,7 @@ impl Decoder {
             o_scale,
             o_bias,
             shortconv,
-            mamba2,
+            ssm,
         } = &layer.attn;
         // No Metal attention kernel gates, sinks, norms between the V
         // sum and `wo`, scales after it, adds a bias to it, or runs a
@@ -1270,7 +1272,7 @@ impl Decoder {
             || o_scale.is_some()
             || o_bias.is_some()
             || shortconv.is_some()
-            || mamba2.is_some()
+            || ssm.is_some()
         {
             return None;
         }
@@ -4441,7 +4443,8 @@ impl Decoder {
                     // consecutive positions of one sequence, on this
                     // layer's cache.
                     crate::layer_shapes::AttnShape::ShortConv
-                    | crate::layer_shapes::AttnShape::Mamba2 => {
+                    | crate::layer_shapes::AttnShape::Mamba2
+                    | crate::layer_shapes::AttnShape::Mamba1 => {
                         let out = self.recurrent_block(
                             l,
                             layer,
@@ -4867,7 +4870,8 @@ impl Decoder {
                     // ONE position of its own sequence, so each runs on
                     // its own cache.
                     crate::layer_shapes::AttnShape::ShortConv
-                    | crate::layer_shapes::AttnShape::Mamba2 => {
+                    | crate::layer_shapes::AttnShape::Mamba2
+                    | crate::layer_shapes::AttnShape::Mamba1 => {
                         let mut out = Vec::with_capacity(batch_size * hidden_dim);
                         for b in 0..batch_size {
                             let step = kv.step(b, l);
@@ -4887,7 +4891,7 @@ impl Decoder {
 
                 // falcon-h1.cpp:156-160: the parallel Mamba-2 block, each
                 // row on its own sequence's cache, before the push.
-                let parallel_ssm = layer.attn.mamba2.as_ref().map(|_| {
+                let parallel_ssm = layer.attn.ssm.as_ref().map(|_| {
                     let mut out = Vec::with_capacity(batch_size * hidden_dim);
                     for b in 0..batch_size {
                         let mut step = kv.step(b, l);

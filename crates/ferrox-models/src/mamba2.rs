@@ -48,7 +48,7 @@
 //! `mamba-base.cpp:271`, so it is loaded when present and applied when
 //! loaded.
 
-use ferrox_core::mamba2::{conv_step, scan_step, ScanDims};
+use ferrox_core::mamba2::{conv_step, scan_step, Decay, ScanDims};
 
 /// Architectures that run the Mamba-2 block IN PARALLEL with attention
 /// on every layer, both reading the same `attn_norm` output, the two
@@ -336,7 +336,16 @@ impl Mamba2 {
             {
                 *o = t + bias;
             }
-            scan_step(dims, &mut state.ssm, x, &dt, &self.a, b, c, &mut y);
+            scan_step(
+                dims,
+                &mut state.ssm,
+                x,
+                &dt,
+                Decay::PerHead(&self.a),
+                b,
+                c,
+                &mut y,
+            );
             // :268-269: y + x * D per head, then silu(z) * y.
             let head_dim = h.head_dim();
             for (hd, dd) in self.d.iter().enumerate() {

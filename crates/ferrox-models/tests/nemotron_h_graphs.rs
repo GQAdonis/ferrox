@@ -413,7 +413,7 @@ fn the_loaded_decoder_is_the_graph() {
         d.layers[2].moe.norm_weight != NormOp::None,
         "blk.2 norms with attn_norm"
     );
-    assert!(d.layers[0].attn.mamba2.is_some() && d.layers[3].attn.mamba2.is_some());
+    assert!(d.layers[0].attn.ssm.is_some() && d.layers[3].attn.ssm.is_some());
 }
 
 /// Every layer's cache counts positions, whichever block it holds, and

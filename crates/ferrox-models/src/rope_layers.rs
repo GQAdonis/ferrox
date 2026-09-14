@@ -216,6 +216,10 @@ pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> Rop
         // `nemotron-h.cpp:181-193` builds its attention with no
         // `ggml_rope_ext` at all: the Mamba-2 layers carry position.
         "nemotron_h" | "nemotron_h_moe" => RopeLayers::Never,
+        // `jamba.cpp:98` ("No RoPE :)"); `mamba` / `mamba2` have no
+        // attention at all. All three are `LLAMA_ROPE_TYPE_NONE`
+        // (llama-model.cpp:2555-2557).
+        "jamba" | "mamba" | "mamba2" => RopeLayers::Never,
         // The ALiBi graphs (`crate::alibi`): `bloom`, `refact`, `mpt`,
         // `jais`, and `baichuan` at 40 layers ONLY (`baichuan.cpp:11-14`;
         // the 7B rotates). One table decides both the bias and the

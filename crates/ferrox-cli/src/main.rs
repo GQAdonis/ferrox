@@ -1,16 +1,21 @@
 //! ferrox CLI, llama.cpp-style GGUF completion (`-m`/`-p`/`-n`/…) plus
 //! inspect / presets / smoke / Kimi helpers. See `docs/CLI.md`.
 
+mod batched_bench;
 mod bench_bw;
 mod bench_client;
+mod bench_contract;
 mod bench_guard;
 mod bench_model;
+mod bench_render;
 mod bench_suite;
 mod chat;
 mod download;
+mod gguf_split;
 mod hf;
 mod host_state;
 mod http;
+mod imatrix;
 mod layer_divergence;
 mod parity;
 mod perplexity;
@@ -19,6 +24,7 @@ mod quant_sensitivity;
 mod quantize;
 mod run;
 mod serve_bench;
+mod splice_pooler;
 mod verify;
 mod verify_engine;
 
@@ -89,21 +95,47 @@ enum Commands {
     /// HTTP-free and measures kernels against `llama-bench`. This one
     /// answers what the SERVER does under load. Start the server first.
     ServeBench(serve_bench::ServeBenchArgs),
+    /// Throughput as a function of batch size, like
+    /// `llama-batched-bench`: for every `-npp` x `-ntg` x `-npl`
+    /// combination, prompt speed, decode speed and the total, in
+    /// llama.cpp's ten columns. Drives the continuous batcher's engine
+    /// seams directly, no HTTP.
+    #[command(name = "batched-bench")]
+    BatchedBench(batched_bench::BatchedBenchArgs),
     /// Download a GGUF from Hugging Face Hub (`hf download`).
     Pull(pull::PullArgs),
 
     /// Download a GGUF from Hugging Face, same syntax as `hf download`.
     Download(download::DownloadArgs),
-    /// Write a quantized copy of a GGUF.
+    /// Write a quantized copy of a GGUF, byte-identical to
+    /// `llama-quantize`'s.
     ///
-    /// ferrox READS every quant kind it runs and writes `Q8_0`, plus
-    /// `Q4_K_S` / `Q4_K_M` with `--pure`. Every other llama.cpp target
-    /// -- the remaining K-quants, the IQ tiers, MXFP4 -- is refused BY
-    /// NAME: their encoders are an iterative per-super-block fit, and
-    /// an approximation of one produces a file that loads and generates
-    /// measurably worse text. Use `llama-quantize` for those; ferrox
-    /// reads what it writes.
+    /// ferrox READS every quant kind it runs and WRITES `Q8_0`, `Q4_K_S`,
+    /// `Q4_K_M`, `Q5_K_S`, `Q5_K_M` and `Q6_K` -- the full llama.cpp
+    /// mix for each, or `--pure` for the target's block format
+    /// everywhere -- with or without `--imatrix`. Every other target
+    /// (Q2_K/Q3_K, the IQ tiers, MXFP4, the legacy Q4_0 family) is
+    /// refused BY NAME: each needs its own transcription of an
+    /// iterative fit, and an approximation of one produces a file that
+    /// loads and generates measurably worse text. Use `llama-quantize`
+    /// for those; ferrox reads what it writes.
     Quantize(quantize::QuantizeArgs),
+    /// Compute an importance matrix from a calibration text:
+    /// llama.cpp's `llama-imatrix`, same file format in both
+    /// directions. Feed the result to `ferrox quantize --imatrix` or to
+    /// `llama-quantize --imatrix`.
+    Imatrix(imatrix::ImatrixArgs),
+    /// Split a GGUF into shards, or merge a shard set back into one
+    /// file: llama.cpp's `llama-gguf-split`, same flags and same
+    /// `<prefix>-NNNNN-of-MMMMM.gguf` names.
+    #[command(name = "gguf-split")]
+    GgufSplit(gguf_split::GgufSplitArgs),
+    /// Write a reranker GGUF that carries the pooler llama.cpp's
+    /// converter dropped (`bert.pooler.dense` -> `cls`), taken from
+    /// the checkpoint's own safetensors, so `/v1/rerank` scores on the
+    /// trained range instead of an uncalibrated one (issue #82).
+    #[command(name = "splice-pooler")]
+    SplicePooler(splice_pooler::SplicePoolerArgs),
     /// Print GGUF header metadata and tensor list for a model file.
     Inspect { path: String },
     /// Dry-run residency plan for a GGUF checkpoint: what it would
@@ -536,10 +568,14 @@ const SUBCOMMANDS: &[&str] = &[
     "smoke",
     "run-real",
     "bench",
+    "batched-bench",
     "verify",
     "layer-divergence",
     "quant-sensitivity",
     "quantize",
+    "imatrix",
+    "gguf-split",
+    "splice-pooler",
     "parity",
     "perplexity",
     "speculative",
@@ -584,6 +620,16 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
             // looked like the flag did not exist.
             "-hf" => "--hf-repo".into(),
             "-hff" => "--hf-file".into(),
+            // `llama-batched-bench`'s own spellings, for `batched-bench`.
+            "-npp" => "--n-pp".into(),
+            "-ntg" => "--n-tg".into(),
+            "-npl" => "--n-pl".into(),
+            "-pps" => "--pp-shared".into(),
+            "-tgs" => "--tg-separate".into(),
+            "-ub" => "--ubatch-size".into(),
+            "-kvu" => "--kv-unified".into(),
+            "-fa" => "--flash-attn".into(),
+            "-tb" => "--threads-batch".into(),
             _ => arg,
         })
         .collect();
@@ -674,6 +720,7 @@ fn instance_target(command: &Commands) -> Option<(&'static str, Option<String>)>
             }
             Some(("bench", model.clone()))
         }
+        Commands::BatchedBench(args) => Some(("batched-bench", Some(args.model.clone()))),
         Commands::Smoke { preset, .. } => Some(("smoke", Some(preset.clone()))),
         Commands::RunKimi { checkpoint_dir, .. } => {
             Some(("run-kimi", Some(checkpoint_dir.clone())))
@@ -721,21 +768,27 @@ fn main() -> anyhow::Result<()> {
     // and every one of those receipts recorded `backend_active:
     // "Metal"` next to `backend: "cpu"` without anything comparing the
     // two (#126).
-    if let Commands::Bench {
-        threads,
-        n_gpu_layers,
-        suite,
-        render,
-        ..
-    } = &cli.command
-    {
-        // `--suite` and `--render` do not benchmark in THIS process:
-        // the suite spawns a child per entry and render only reads
-        // receipts, so applying a backend here would pin the parent to
-        // one backend for children that each want their own.
-        if !suite && !render {
-            bench_model::apply_env(*threads, *n_gpu_layers)?;
+    match &cli.command {
+        Commands::Bench {
+            threads,
+            n_gpu_layers,
+            suite,
+            render,
+            ..
+        } => {
+            // `--suite` and `--render` do not benchmark in THIS process:
+            // the suite spawns a child per entry and render only reads
+            // receipts, so applying a backend here would pin the parent
+            // to one backend for children that each want their own.
+            if !suite && !render {
+                bench_model::apply_env(*threads, *n_gpu_layers)?;
+            }
         }
+        // Same ordering constraint, same function: the batched bench
+        // writes the same kind of receipt and is refused the same way
+        // when the label and the backend disagree.
+        Commands::BatchedBench(args) => bench_model::apply_env(args.threads, args.n_gpu_layers)?,
+        _ => {}
     }
 
     // Held for the whole run: dropping it deregisters this process.
@@ -750,6 +803,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Run(args) => run::run_infer(args)?,
         Commands::Chat(args) => chat::run_chat(args)?,
         Commands::ServeBench(args) => serve_bench::run_serve_bench(args)?,
+        Commands::BatchedBench(args) => batched_bench::run(args)?,
         Commands::BenchBw(args) => bench_bw::run_bench_bw(args)?,
         // Blocking, and it builds its own Tokio runtime: nothing above
         // this point has started one. It also claims the instance
@@ -762,6 +816,9 @@ fn main() -> anyhow::Result<()> {
         Commands::Pull(args) => pull::run_pull(args)?,
         Commands::Download(args) => download::run(args)?,
         Commands::Quantize(args) => quantize::run(args)?,
+        Commands::Imatrix(args) => imatrix::run(args)?,
+        Commands::GgufSplit(args) => gguf_split::run(args)?,
+        Commands::SplicePooler(args) => splice_pooler::run(args)?,
         Commands::Inspect { path } => {
             let file = ShardedGguf::open(&path)?;
             if file.shard_count() > 1 {
@@ -905,9 +962,7 @@ fn main() -> anyhow::Result<()> {
 
             let vocab = 32;
             let decoder = Decoder::new_random_small(cfg.clone(), 2, vocab);
-            let mut caches: Vec<KvCache> = (0..2)
-                .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-                .collect();
+            let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
             for pos in 0..steps {
                 let token = pos % vocab;
@@ -968,14 +1023,7 @@ fn main() -> anyhow::Result<()> {
                 }
             };
             let decoder = Decoder::from_gguf(&path, cfg)?;
-            let mut caches: Vec<ferrox_core::cache::KvCache> = (0..decoder.layers.len())
-                .map(|_| {
-                    ferrox_core::cache::KvCache::new(
-                        decoder.config.n_kv_heads,
-                        decoder.config.head_dim,
-                    )
-                })
-                .collect();
+            let mut caches: Vec<ferrox_core::cache::KvCache> = decoder.config.new_kv_caches();
             let logits = decoder.forward_token(token, pos, &mut caches);
             println!("logits ({} values):", logits.len());
             for (i, v) in logits.iter().enumerate() {
@@ -1092,7 +1140,7 @@ fn main() -> anyhow::Result<()> {
             max_load,
         } => {
             if render {
-                return bench_suite::render(std::path::Path::new(&bench_dir));
+                return bench_render::render(std::path::Path::new(&bench_dir));
             }
             if suite {
                 return bench_suite::run_suite(bench_suite::SuiteArgs {
@@ -1351,14 +1399,7 @@ fn main() -> anyhow::Result<()> {
                 let vocab = 256;
 
                 let decoder = Decoder::new_random_small(cfg, n_layers, vocab);
-                let mut caches: Vec<ferrox_core::cache::KvCache> = (0..n_layers)
-                    .map(|_| {
-                        ferrox_core::cache::KvCache::new(
-                            decoder.config.n_kv_heads,
-                            decoder.config.head_dim,
-                        )
-                    })
-                    .collect();
+                let mut caches: Vec<ferrox_core::cache::KvCache> = decoder.config.new_kv_caches();
 
                 let n_tokens = 32;
                 let t0 = Instant::now();
@@ -1400,14 +1441,7 @@ fn main() -> anyhow::Result<()> {
             cfg.moe.expert_ffn_dim = 32;
 
             let decoder = Decoder::new_random_small(cfg, 3, 256);
-            let mut caches: Vec<ferrox_core::cache::KvCache> = (0..3)
-                .map(|_| {
-                    ferrox_core::cache::KvCache::new(
-                        decoder.config.n_kv_heads,
-                        decoder.config.head_dim,
-                    )
-                })
-                .collect();
+            let mut caches: Vec<ferrox_core::cache::KvCache> = decoder.config.new_kv_caches();
 
             let prompt_tokens: Vec<usize> = ferrox_models::ByteTokenizer::encode(&prompt)
                 .into_iter()
@@ -1626,6 +1660,42 @@ mod cli_tests {
                 rewritten[1]
             );
         }
+    }
+
+    /// `ferrox quantize --help` and `Target::ALL` are two structures that
+    /// must agree about which targets write, and for three PRs they did
+    /// not: the help said "Q8_0, plus Q4_K_S / Q4_K_M with --pure" while
+    /// the code wrote six targets, mixes included. So the help is checked
+    /// against the table: every target the policy accepts is named in
+    /// the subcommand's long help, and `--imatrix` is mentioned because
+    /// the encoders take one.
+    #[test]
+    fn the_quantize_help_names_every_target_the_policy_accepts() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        let quantize = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "quantize")
+            .expect("quantize subcommand");
+        let help = quantize
+            .get_long_about()
+            .map(|s| s.to_string())
+            .expect("quantize has a long help");
+        for target in crate::quantize::policy::Target::ALL {
+            assert!(
+                help.contains(target.name()),
+                "quantize's help does not mention {}, which `--type` accepts",
+                target.name()
+            );
+        }
+        assert!(
+            help.contains("--imatrix"),
+            "quantize's help does not mention --imatrix"
+        );
+        assert!(
+            !help.contains("with `--pure`"),
+            "quantize's help still ties the K-quants to --pure"
+        );
     }
 
     /// The named case of the above, kept explicit because `serve` is the

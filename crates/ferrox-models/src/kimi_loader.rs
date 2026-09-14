@@ -48,7 +48,7 @@ use crate::config::LayerAttentionKind;
 use crate::kda::KdaAttnWeights;
 use crate::kimi_decoder::DenseMlpWeights;
 use crate::latent_moe::{KimiExpertBacking, KimiExpertWeights, KimiLatentMoeWeights};
-use crate::mla::MlaAttnWeights;
+use crate::mla::{MlaAttnWeights, MlaKvB, MlaQProj};
 use ferrox_core::expert_store::{ExpertKey, ExpertSource, ExpertStore};
 
 #[derive(Debug, Error)]
@@ -62,7 +62,8 @@ pub enum KimiLoadError {
 }
 
 /// Reads any real tensor as an owned `f32` vector, dispatching on its
-/// real declared dtype (`F32` direct, `BF16` dequantized) -- exposed
+/// real declared dtype through [`crate::safetensors_f32::widen_to_f32`]
+/// (`F32` direct, `F16` / `BF16` widened losslessly) -- exposed
 /// `pub` since not every real weight (e.g. the per-layer
 /// `input_layernorm.weight`/`post_attention_layernorm.weight`, which
 /// aren't nested inside `KdaAttnWeights`/`MlaAttnWeights`/
@@ -73,18 +74,8 @@ pub fn load_f32_vec(shard: &ShardedSafetensors, name: &str) -> Result<Vec<f32>, 
         .tensor_info(name)
         .ok_or_else(|| ferrox_safetensors::SafetensorsError::TensorNotFound(name.to_string()))?;
     let raw = shard.tensor_bytes(name)?;
-    match info.dtype {
-        SafetensorsDtype::F32 => {
-            let mut out = Vec::with_capacity(raw.len() / 4);
-            for chunk in raw.as_chunks::<4>().0 {
-                out.push(f32::from_le_bytes(*chunk));
-            }
-            Ok(out)
-        }
-        SafetensorsDtype::BF16 => ferrox_quant::dequant_bf16(raw)
-            .map_err(|_| KimiLoadError::UnsupportedDtype(name.to_string(), info.dtype)),
-        other => Err(KimiLoadError::UnsupportedDtype(name.to_string(), other)),
-    }
+    crate::safetensors_f32::widen_to_f32(info.dtype, raw)
+        .ok_or_else(|| KimiLoadError::UnsupportedDtype(name.to_string(), info.dtype))
 }
 
 fn load_weight_matrix(
@@ -200,19 +191,21 @@ pub fn load_mla_attn(
 ) -> Result<MlaAttnWeights, KimiLoadError> {
     let q_head_dim = qk_nope_head_dim + qk_rope_head_dim;
     Ok(MlaAttnWeights {
-        q_a_proj: load_weight_matrix(
-            shard,
-            &format!("{prefix}.self_attn.q_a_proj.weight"),
-            q_lora_rank,
-            hidden_dim,
-        )?,
-        q_a_layernorm: load_f32_vec(shard, &format!("{prefix}.self_attn.q_a_layernorm.weight"))?,
-        q_b_proj: load_weight_matrix(
-            shard,
-            &format!("{prefix}.self_attn.q_b_proj.weight"),
-            num_heads * q_head_dim,
-            q_lora_rank,
-        )?,
+        q: MlaQProj::LowRank {
+            a: load_weight_matrix(
+                shard,
+                &format!("{prefix}.self_attn.q_a_proj.weight"),
+                q_lora_rank,
+                hidden_dim,
+            )?,
+            norm: load_f32_vec(shard, &format!("{prefix}.self_attn.q_a_layernorm.weight"))?,
+            b: load_weight_matrix(
+                shard,
+                &format!("{prefix}.self_attn.q_b_proj.weight"),
+                num_heads * q_head_dim,
+                q_lora_rank,
+            )?,
+        },
         kv_a_proj_with_mqa: load_weight_matrix(
             shard,
             &format!("{prefix}.self_attn.kv_a_proj_with_mqa.weight"),
@@ -220,12 +213,12 @@ pub fn load_mla_attn(
             hidden_dim,
         )?,
         kv_a_layernorm: load_f32_vec(shard, &format!("{prefix}.self_attn.kv_a_layernorm.weight"))?,
-        kv_b_proj: load_weight_matrix(
+        kv_b: MlaKvB::Combined(load_weight_matrix(
             shard,
             &format!("{prefix}.self_attn.kv_b_proj.weight"),
             num_heads * (qk_nope_head_dim + v_head_dim),
             kv_lora_rank,
-        )?,
+        )?),
         o_proj: load_weight_matrix(
             shard,
             &format!("{prefix}.self_attn.o_proj.weight"),
@@ -1913,12 +1906,18 @@ mod tests {
         // attention/FFN combination `load_kimi_checkpoint` must
         // dispatch correctly.
         let model_cfg = crate::config::ModelConfig {
+            // Kimi's stack has no per-layer RoPE gate; llama.cpp writes
+            // no `use_rope` for it (`crate::rope_layers`).
+            rope_layers: crate::rope_layers::RopeLayers::All,
+            layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
             name: "synthetic-kimi-test",
             n_layers: 3,
+            n_mtp_blocks: 0,
             hidden_dim: d.hidden_dim,
             n_heads: 1,
             n_kv_heads: 1,
             head_dim: 4,
+            v_head_dim: None,
             vocab_size,
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,
@@ -1962,16 +1961,27 @@ mod tests {
             rope_freqs: None,
             rope_attn_factor: 1.0,
             rope_dim: None,
+            rope_dim_swa: None,
             rope_freqs_long: None,
             rope_freqs_short: None,
             rope_orig_ctx: None,
             rope_layout: crate::config::RopeLayout::Neox,
             qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-            swa_pattern: None,
-            swa_dense_first: false,
+            swa_layers: crate::swa_layers::SwaLayers::All,
+
             attn_logit_softcap: None,
             final_logit_softcap: None,
             embedding_scale: None,
+            residual_scale: None,
+            clamp_kqv: None,
+            attn_temperature: None,
+            router_input: crate::router_input::RouterInput::NormedFfnInput,
+            block_sub_norms: false,
+            parallel_residual: false,
+            attn_value_scale: None,
+            layer_loops: None,
+            skip_stream: false,
+            logit_multiplier: None,
             attention_scale: None,
             rope_theta_swa: None,
             ffn_activation: crate::config::FfnActivation::Swiglu,

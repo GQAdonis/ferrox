@@ -1,0 +1,75 @@
+{
+  "accelerator": "Apple M2 Pro",
+  "approx_params": 8046772224,
+  "arch": "llama",
+  "backend": "metal",
+  "backend_active": "Metal",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.20.0",
+  "host_load_1min_end": 1.73,
+  "host_load_1min_start": 1.93,
+  "host_spec": {
+    "arch": "aarch64",
+    "cores": 10,
+    "cpu": "Apple M2 Pro",
+    "label": "Apple M2 Pro (10c/6p) macOS 26.6.2",
+    "os": "macOS 26.6.2",
+    "perf_cores": 6,
+    "ram_gb": 32.0
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": false,
+    "measured": true,
+    "pressure": "nominal",
+    "source": "NSProcessInfo.thermalState"
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": false,
+    "measured": true,
+    "pressure": "nominal",
+    "source": "NSProcessInfo.thermalState"
+  },
+  "id": "mistral_7b_q4km",
+  "kind": "engine",
+  "load_s": 0.015069958,
+  "model_path": "models/Mistral-7B-Instruct-v0.2-Q4_K_M.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 4368439584,
+  "tests": [
+    {
+      "ferrox_samples": [
+        272.53045391424195,
+        272.6572989979511,
+        272.4520813221656
+      ],
+      "ferrox_stddev": 0.08455519755674742,
+      "ferrox_tps": 272.53045391424195,
+      "gap": 1.0266375591479493,
+      "llama_tps": 279.79,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        34.40107267124232,
+        34.30759840433173,
+        34.3216313304973
+      ],
+      "ferrox_stddev": 0.04115727046694998,
+      "ferrox_tps": 34.3216313304973,
+      "gap": 0.9451765182028125,
+      "llama_tps": 32.44,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 6,
+  "warmup_reps": 1
+}

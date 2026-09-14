@@ -30,11 +30,7 @@ fn real_gguf_forward_pass_matches_independent_python_reference() {
     let cfg = test_dense_fixture();
     let decoder = Decoder::from_gguf(fixture_path, cfg).expect("real GGUF file must load cleanly");
 
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
     let logits = decoder.forward_token(3, 0, &mut caches);
 
@@ -108,11 +104,7 @@ fn real_multi_expert_moe_gguf_forward_pass_matches_independent_python_reference(
     let decoder = Decoder::from_gguf(fixture_path, cfg)
         .expect("real multi-expert MoE GGUF file must load cleanly");
 
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
     let logits = decoder.forward_token(3, 0, &mut caches);
 
@@ -181,11 +173,7 @@ fn real_mixed_dense_and_moe_gguf_matches_independent_python_reference() {
     let decoder = Decoder::from_gguf(fixture_path, cfg)
         .expect("real mixed dense/MoE GGUF file must load cleanly");
 
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
     let logits = decoder.forward_token(3, 0, &mut caches);
 
@@ -278,11 +266,7 @@ fn model_config_from_gguf_matches_hand_written_dense_fixture_and_produces_identi
 
     let decoder =
         Decoder::from_gguf(fixture_path, derived).expect("derived config must load cleanly");
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     let logits = decoder.forward_token(3, 0, &mut caches);
     for (i, (got, expected)) in logits.iter().zip(GOLDEN_LOGITS.iter()).enumerate() {
         assert!(
@@ -316,11 +300,7 @@ fn model_config_from_gguf_matches_hand_written_moe_fixture_and_produces_identica
 
     let decoder =
         Decoder::from_gguf(fixture_path, derived).expect("derived config must load cleanly");
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     let logits = decoder.forward_token(3, 0, &mut caches);
     for (i, (got, expected)) in logits.iter().zip(GOLDEN_MOE_LOGITS.iter()).enumerate() {
         assert!(
@@ -349,11 +329,7 @@ fn model_config_from_gguf_matches_hand_written_mixed_fixture_and_produces_identi
 
     let decoder =
         Decoder::from_gguf(fixture_path, derived).expect("derived config must load cleanly");
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     let logits = decoder.forward_token(3, 0, &mut caches);
     for (i, (got, expected)) in logits.iter().zip(GOLDEN_MIXED_LOGITS.iter()).enumerate() {
         assert!(
@@ -386,16 +362,8 @@ fn split_gguf_fixture_loads_and_matches_single_file_logits_exactly() {
     let split = Decoder::from_gguf(split_path, test_dense_fixture())
         .expect("split fixture must load via shard discovery from shard 1");
 
-    let mut caches_a: Vec<KvCache> = single
-        .layers
-        .iter()
-        .map(|_| KvCache::new(single.config.n_kv_heads, single.config.head_dim))
-        .collect();
-    let mut caches_b: Vec<KvCache> = split
-        .layers
-        .iter()
-        .map(|_| KvCache::new(split.config.n_kv_heads, split.config.head_dim))
-        .collect();
+    let mut caches_a: Vec<KvCache> = single.config.new_kv_caches();
+    let mut caches_b: Vec<KvCache> = split.config.new_kv_caches();
 
     for (pos, tok) in [3usize, 7, 11].iter().enumerate() {
         let a = single.forward_token(*tok, pos, &mut caches_a);
@@ -478,16 +446,8 @@ fn metal_fused_moe_agrees_between_streamed_and_resident_experts() {
         let stored = Decoder::from_gguf_with_expert_cache(fixture_path, cfg(), Some(budget))
             .expect("store-backed load");
 
-        let mut caches_a: Vec<KvCache> = resident
-            .layers
-            .iter()
-            .map(|_| KvCache::new(resident.config.n_kv_heads, resident.config.head_dim))
-            .collect();
-        let mut caches_b: Vec<KvCache> = stored
-            .layers
-            .iter()
-            .map(|_| KvCache::new(stored.config.n_kv_heads, stored.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = resident.config.new_kv_caches();
+        let mut caches_b: Vec<KvCache> = stored.config.new_kv_caches();
 
         for (pos, tok) in [2usize, 5, 9, 1].iter().enumerate() {
             let a = resident.forward_token(*tok, pos, &mut caches_a);
@@ -526,16 +486,8 @@ fn store_backed_experts_produce_bit_identical_logits_to_resident() {
         let stored = Decoder::from_gguf_with_expert_cache(fixture_path, cfg(), Some(budget))
             .expect("store-backed load");
 
-        let mut caches_a: Vec<KvCache> = resident
-            .layers
-            .iter()
-            .map(|_| KvCache::new(resident.config.n_kv_heads, resident.config.head_dim))
-            .collect();
-        let mut caches_b: Vec<KvCache> = stored
-            .layers
-            .iter()
-            .map(|_| KvCache::new(stored.config.n_kv_heads, stored.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = resident.config.new_kv_caches();
+        let mut caches_b: Vec<KvCache> = stored.config.new_kv_caches();
 
         for (pos, tok) in [2usize, 5, 9, 1].iter().enumerate() {
             let a = resident.forward_token(*tok, pos, &mut caches_a);
@@ -546,4 +498,81 @@ fn store_backed_experts_produce_bit_identical_logits_to_resident() {
             );
         }
     }
+}
+
+/// `ferrox gguf-split --split` has to produce shards the loader people
+/// actually use can read, not only ones `ShardedGguf::open` accepts.
+///
+/// The checked-in `ferrox_real_test_split-*` fixtures were written by a
+/// Python script; this splits the SAME single-file fixture with the
+/// Rust tool, at a boundary that lands mid-layer, and runs a real
+/// forward pass over the result. Then it merges the shards back and
+/// runs the pass a third time. All three logit sequences must be
+/// bit-identical: `assert_eq!` on `Vec<f32>`, not a tolerance, because
+/// a split moves bytes and must not change one.
+///
+/// `--no-tensor-first-split` is used because the metadata-only first
+/// shard is the layout published checkpoints use, and it is the case
+/// where the loader has to find the hparams in a shard holding no
+/// tensors at all.
+#[test]
+fn tool_split_shards_and_their_merge_load_and_decode_identically_to_the_source() {
+    use ferrox_gguf::split::{
+        plan_merge, plan_split, write_merge, write_split, SplitMode, SplitOptions,
+    };
+
+    let single_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ferrox_real_test.gguf"
+    );
+
+    let dir = std::env::temp_dir().join(format!("ferrox_tool_split_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let source = ferrox_gguf::GgufFile::open(single_path).unwrap();
+    let opts = SplitOptions {
+        mode: SplitMode::MaxTensors(4),
+        no_tensor_first_split: true,
+    };
+    let plan = plan_split(&source, &opts).expect("the real fixture must plan a split");
+    assert!(
+        plan.shards.len() > 2,
+        "4 tensors per shard over {} tensors has to make several shards",
+        plan.n_tensors
+    );
+    assert!(
+        plan.shards[0].tensors.is_empty(),
+        "--no-tensor-first-split must leave shard 1 metadata-only"
+    );
+    let paths = write_split(&source, &plan, &dir.join("m"), |_| {}).expect("shards must write");
+
+    let merged_path = dir.join("merged.gguf");
+    let merge = plan_merge(&paths[0]).expect("the tool's own shards must merge");
+    write_merge(&merge, &merged_path).expect("the merge must write");
+
+    let logits = |path: &str| {
+        let decoder = Decoder::from_gguf(path, test_dense_fixture())
+            .unwrap_or_else(|e| panic!("{path} must load: {e}"));
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
+        [3usize, 7, 11]
+            .iter()
+            .enumerate()
+            .map(|(pos, tok)| decoder.forward_token(*tok, pos, &mut caches))
+            .collect::<Vec<_>>()
+    };
+
+    let want = logits(single_path);
+    assert_eq!(
+        logits(paths[0].to_str().unwrap()),
+        want,
+        "the tool's shards must decode bit-identically to the single file"
+    );
+    assert_eq!(
+        logits(merged_path.to_str().unwrap()),
+        want,
+        "merging the tool's shards must decode bit-identically to the single file"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }

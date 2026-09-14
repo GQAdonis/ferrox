@@ -50,17 +50,10 @@ fn greedy_params(max_tokens: usize, seed: u64) -> GenerationParams {
     GenerationParams {
         reasoning: None,
         max_tokens,
-        sampling: SamplingParams {
-            temperature: 0.0,
-            top_p: 1.0,
-            min_p: 0.0,
-            top_k: 0,
-            repetition_penalty: 1.0,
-            penalty_last_n: 64,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            sampler_order: ferrox_models::SamplerOrder::default(),
-        },
+        // `SamplingParams::default()` IS greedy with every filter
+        // off, so restating its fields here would be a second copy of
+        // the defaults that could drift from the first.
+        sampling: SamplingParams::default(),
         seed,
         stop: vec![],
         stop_token_ids: Vec::new(),
@@ -68,6 +61,8 @@ fn greedy_params(max_tokens: usize, seed: u64) -> GenerationParams {
         grammar: None,
         cancel: None,
         ignore_eos: false,
+        reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+        lora: None,
     }
 }
 
@@ -83,11 +78,7 @@ fn identity_decode_text(ids: &[usize]) -> String {
 }
 
 fn sequential_ids(decoder: &Decoder, prompt: &[usize], params: &GenerationParams) -> Vec<usize> {
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     let mut pos = 0;
     let mut logits = Vec::new();
     for &tok in prompt {

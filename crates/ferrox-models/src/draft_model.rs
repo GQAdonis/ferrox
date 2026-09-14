@@ -158,9 +158,7 @@ impl DraftModelSpeculator {
                 target: target_vocab,
             });
         }
-        let kv_caches = (0..decoder.config.n_layers)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let kv_caches = decoder.config.new_kv_caches();
         Ok(DraftModelSpeculator {
             decoder,
             kv_caches,
@@ -253,10 +251,15 @@ impl Drafter for DraftModelSpeculator {
             // same sequence the target's would. The block used to clone
             // `history` per call to concatenate the two; the window
             // borrows both halves instead.
+            // The XTC roll comes off THIS drafter's own stream, so the
+            // distribution reported as `q` below is the one the token
+            // was actually drawn from even when XTC is configured.
+            let xtc_roll = self.rng.xtc_roll(&self.sampling);
             let probs = sampling_distribution(
                 &logits,
                 &self.sampling,
                 PenaltyWindow::new(history, &tokens),
+                xtc_roll,
             );
             let token = self.rng.sample_from(&probs);
 
@@ -473,9 +476,7 @@ mod tests {
         let max_new = 8;
 
         let target = Decoder::new_random_small(cfg.clone(), 4, vocab);
-        let mut caches: Vec<KvCache> = (0..target.config.n_layers)
-            .map(|_| KvCache::new(target.config.n_kv_heads, target.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = target.config.new_kv_caches();
 
         // A different model, not a copy of the target: two layers
         // rather than four, so it disagrees constantly.
@@ -488,9 +489,7 @@ mod tests {
 
         // The same target, decoded the ordinary way.
         let plain = Decoder::new_random_small(cfg, 4, vocab);
-        let mut plain_caches: Vec<KvCache> = (0..plain.config.n_layers)
-            .map(|_| KvCache::new(plain.config.n_kv_heads, plain.config.head_dim))
-            .collect();
+        let mut plain_caches: Vec<KvCache> = plain.config.new_kv_caches();
         let mut pending = plain
             .forward_batch(&prompt, 0, &mut plain_caches)
             .pop()

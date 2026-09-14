@@ -164,11 +164,41 @@ impl RopeLayout {
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub name: &'static str,
+    /// Decoder layers: llama.cpp's `n_layer()`, which is the file's
+    /// `block_count` MINUS [`Self::n_mtp_blocks`].
     pub n_layers: usize,
+    /// NextN / MTP blocks the file appends after the trunk, inside its
+    /// `block_count`, which llama.cpp creates `TENSOR_SKIP` and never
+    /// runs (`crate::mtp_blocks`). Their tensors are `blk.N.*` for
+    /// `n_layers <= N < n_layers + n_mtp_blocks`; the loader marks them
+    /// deliberately unread. Zero for every architecture whose graph
+    /// does not read `nextn_predict_layers`.
+    pub n_mtp_blocks: usize,
     pub hidden_dim: usize,
+    /// Query heads of the WIDEST layer. Every layer's for a uniform
+    /// model, which is every model but the per-layer-shape ones
+    /// (`crate::layer_shapes`); a layer body must read its own count
+    /// through [`Self::layer_shape`], never this field.
     pub n_heads: usize,
+    /// KV heads of the WIDEST layer, so that a budget priced from it
+    /// over-counts rather than under-counts a heterogeneous model.
+    /// Same rule as `n_heads`: per-layer computation reads
+    /// [`Self::layer_shape`]; caches come from [`Self::new_kv_caches`].
     pub n_kv_heads: usize,
+    /// The K head width (`attention.key_length`, llama.cpp
+    /// `n_embd_head_k`): the width of every Q and K head, the width RoPE
+    /// rotates within, and the `1/sqrt` of the attention scale.
     pub head_dim: usize,
+    /// The V head width (`attention.value_length`, `n_embd_head_v`)
+    /// WHEN IT DIFFERS from [`Self::head_dim`]; `None` means V heads are
+    /// K's width, which is every architecture but MiMo-V2 (`head_dim:
+    /// 192, v_head_dim: 128`). Read it through [`Self::v_head_dim`],
+    /// never here: an `Option` rather than a second `usize` so that a
+    /// config whose `head_dim` is set or changed cannot leave a stale V
+    /// width beside it -- the two-fields-that-must-agree shape. See
+    /// [`crate::kv_head_dims`] for which architectures may declare them
+    /// apart and which fused paths refuse when they are.
+    pub v_head_dim: Option<usize>,
     pub vocab_size: usize,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
@@ -238,7 +268,19 @@ pub struct ModelConfig {
     /// (`<arch>.rope.dimension_count`, llama.cpp `hparams.n_rot`).
     /// `None` means the whole head rotates, which is the common case.
     /// Phi-3/Phi-4 rotate 96 of 128.
+    ///
+    /// This is the FULL-attention layers' width, llama.cpp's
+    /// `n_rot_full`; [`Self::rope_dim_swa`] is the sliding layers'.
     pub rope_dim: Option<usize>,
+    /// The SLIDING layers' rotary width when it differs from
+    /// [`Self::rope_dim`] -- llama.cpp's `n_rot_swa`, read from
+    /// `rope.dimension_count_swa` or halved-from-full for `step35`
+    /// (`crate::swa_geometry`), consumed through `n_rot(il)`
+    /// (`llama-hparams.cpp:85-91`). `None` means the sliding layers
+    /// rotate the same width as the full ones, which is every
+    /// architecture but the ones the table names. `Some(head_dim)` is
+    /// the whole head, and [`Self::layer_rope`] normalises it.
+    pub rope_dim_swa: Option<usize>,
     /// LongRoPE/YaRN magnitude scaling (`<arch>.rope.scaling.attn_factor`,
     /// llama.cpp `hparams.rope_attn_factor` folded into
     /// `cparams.yarn_attn_factor` at `llama-context.cpp:231`, then applied
@@ -261,36 +303,158 @@ pub struct ModelConfig {
     /// How Q/K RMSNorm weights are applied when present (see
     /// [`crate::capability::QkNormStyle`]).
     pub qk_norm_style: crate::capability::QkNormStyle,
-    /// Alternating SWA period, llama.cpp's `set_swa_pattern` argument.
+    /// WHICH LAYERS SLIDE -- llama.cpp's `is_swa_impl[il]`, as a
+    /// period with a phase, the file's own per-layer array, or every
+    /// layer. See [`crate::swa_layers`]. Meaningless without
+    /// [`Self::sliding_window`]; [`Self::layer_sliding_window`] is the
+    /// one accessor that combines the two.
     ///
-    /// `Some(0)` windows every layer and `Some(1)` windows none, which
-    /// are llama.cpp's two degenerate spellings and are NOT the same as
-    /// `None` (no period known, so every layer windows). Any larger `p`
-    /// alternates, with the phase in [`Self::swa_dense_first`].
-    pub swa_pattern: Option<usize>,
-    /// llama.cpp's `dense_first` argument to `set_swa_pattern`, which
-    /// decides WHICH layer of each period is the full-attention one.
+    /// Getting the phase wrong is not a near miss: on a 32-layer
+    /// period-4 model the two phases disagree about SIXTEEN layers,
+    /// each of which then attends over the wrong span at full speed.
+    /// `capability::default_swa_layout` carries the per-arch value,
+    /// transcribed from llama.cpp.
+    pub swa_layers: crate::swa_layers::SwaLayers,
+    /// WHICH LAYERS ROTATE -- llama.cpp's per-layer `use_rope`.
     ///
-    /// `false` puts it last (`il % p == p - 1`), `true` puts it first
-    /// (`il % p == 0`). Getting this wrong is not a near miss: on a
-    /// 32-layer period-4 model the two phases disagree about SIXTEEN
-    /// layers, each of which then attends over the wrong span at full
-    /// speed. `capability::default_swa_layout` carries the per-arch
-    /// value, transcribed from llama.cpp.
-    pub swa_dense_first: bool,
+    /// [`crate::rope_layers::RopeLayers::All`] for every architecture
+    /// that writes no gate, which is 134 of llama.cpp's 140. The rule
+    /// and the table that assigns it live in [`crate::rope_layers`];
+    /// nothing else in this crate may branch on an architecture name to
+    /// decide it, and [`Self::layer_rope`] returning `None` is the only
+    /// way a call site learns of it.
+    pub rope_layers: crate::rope_layers::RopeLayers,
+    /// WHICH LAYERS HAVE WHICH SHAPE -- llama.cpp's `n_head(il)`,
+    /// `n_head_kv(il)` and `n_ff(il)`.
+    ///
+    /// `Uniform` for every architecture whose graph reads layer 0, which
+    /// is all but the rows in `layer_shapes::PER_LAYER_SHAPE_ARCHS`.
+    /// [`Self::layer_shape`] is the one accessor; the fused Metal
+    /// launches and the CUDA resident KV are fenced off any model that
+    /// is not `Uniform`, because each holds one geometry.
+    pub layer_shapes: crate::layer_shapes::LayerShapes,
     /// Attention logit soft-capping (Gemma 2+). Applied as
     /// `softcap * tanh(score / softcap)` before softmax.
     pub attn_logit_softcap: Option<f32>,
     /// Final logit soft-capping (Gemma 2+). Applied to lm_head output.
     pub final_logit_softcap: Option<f32>,
-    /// Input embedding scale (Gemma: `sqrt(hidden_dim)`).
+    /// Input embedding scale (Gemma: `sqrt(hidden_dim)`; Granite:
+    /// `{arch}.embedding_scale`).
     pub embedding_scale: Option<f32>,
+    /// Multiplier applied to EVERY branch output -- attention and FFN
+    /// alike -- immediately before it rejoins the residual stream
+    /// (Granite `residual_multiplier`, `src/models/granite.cpp:235-238`
+    /// and `:288-292`).
+    ///
+    /// `None` means the plain `hidden += branch` every other
+    /// architecture computes. The decoder never applies this field
+    /// itself: [`crate::scalar_multipliers::residual_add`] is the one
+    /// residual add, and it takes this value as a parameter, because
+    /// `decoder.rs` spells the add out eighteen times and eighteen
+    /// hand-written copies that must agree about one scalar is the
+    /// defect shape this repo keeps paying for.
+    pub residual_scale: Option<f32>,
+    /// Multiplier applied to the lm_head's output, after the projection
+    /// and before [`Self::final_logit_softcap`].
+    ///
+    /// Already resolved into a MULTIPLIER at load time, whichever
+    /// direction the architecture's graph states it in: Granite divides
+    /// by `{arch}.logit_scale` (`granite.cpp:180`), so this field holds
+    /// `1.0 / logit_scale`. Keeping the direction in
+    /// [`crate::scalar_multipliers`] rather than here is what lets the
+    /// decoder have exactly one multiply, and stops a second
+    /// architecture with the opposite convention from needing a second
+    /// field.
+    ///
+    /// Guaranteed positive when `Some`, and that is load-bearing rather
+    /// than incidental: a Metal decode stack may fold the lm_head and
+    /// return an argmax token id, which is only sound while every
+    /// post-head transform is monotone increasing.
+    pub logit_multiplier: Option<f32>,
     /// Optional override for the attention score scale baked into Q
     /// *instead of* the kernel's default `1/sqrt(head_dim)`. When set,
     /// callers must pass `score_scale = 1.0` into the attention kernel
     /// (llama.cpp Gemma: scale Q then `build_attn(..., 1.0f)`). Prefer
     /// leaving this `None` when the override equals `1/sqrt(head_dim)`.
     pub attention_scale: Option<f32>,
+    /// Symmetric clamp on the Q, K and V projections
+    /// (`{arch}.attention.clamp_kqv`), applied after the QKV bias and
+    /// before the QK-norm and RoPE -- llama.cpp's `build_qkv`
+    /// (`llama-graph.cpp:1611-1652`).
+    ///
+    /// `Some(c)` only when the architecture's graph clamps AND the file
+    /// declares a positive value; llama.cpp's own test is `> 0.0f`, so
+    /// zero and a negative value are "no clamp" and resolve to `None`
+    /// here rather than to a clamp that zeroes every projection. The
+    /// resolution lives in [`crate::clamp_kqv`]; the decoder applies it
+    /// through ONE helper shared by every host body, and the fused
+    /// Metal launches are fenced off by `Decoder::metal_can_serve_model`
+    /// because no kernel implements it.
+    pub clamp_kqv: Option<f32>,
+    /// Per-position attention temperature -- llama.cpp's
+    /// `llm_graph_input_attn_temp`, the `[n_tokens]` vector
+    /// `log(floor((pos + offset) / floor_scale) + 1) * scale + 1` that
+    /// `mistral3.cpp:153-156` multiplies into Q after RoPE, before
+    /// `build_attn`, with `kq_scale` untouched. See
+    /// [`crate::attn_temperature`] for the census (three graphs of 140)
+    /// and the resolution.
+    ///
+    /// `Some` only for an architecture whose graph builds the input AND
+    /// a file declaring a nonzero `attention.temperature_scale`; the
+    /// key on any other architecture is dead metadata upstream and is
+    /// ignored here the same way. Applied through ONE helper,
+    /// `Decoder::apply_attn_temperature`, on every host body, and
+    /// fenced off the fused Metal launches by
+    /// `Decoder::metal_can_serve_model`, because none has a per-token Q
+    /// scale uniform.
+    pub attn_temperature: Option<crate::attn_temperature::AttnTemperature>,
+    /// WHICH TENSOR THE MoE ROUTER READS -- the normed FFN input for
+    /// every graph but one, the raw layer input for `smallthinker`
+    /// (`smallthinker.cpp:111`). See [`crate::router_input`] for the
+    /// census (four graphs of 140 pass a precomputed `probs_in`, one on
+    /// the generic path) and the seam. `Decoder::router_operand` is the
+    /// ONE place the operand is captured, and the GPU router paths
+    /// refuse a model whose operand they cannot read
+    /// (`Decoder::gpu_router_matches_host_routing`).
+    pub router_input: crate::router_input::RouterInput,
+    /// Whether this model's blocks norm INSIDE the two sublayers:
+    /// BitNet's `attn_sub_norm` (on the attention output, BEFORE `wo`)
+    /// and `ffn_sub_norm` (on `silu(gate) * up`, BEFORE `down`),
+    /// `bitnet.cpp:24,36,101-106,135-140`. See [`crate::sub_norms`] for
+    /// the census (one graph of 140) and the two readers: the loader,
+    /// which REQUIRES the pair when this is set, and
+    /// `Decoder::metal_can_serve_model`, which refuses every fused
+    /// launch, since none has a norm at either site.
+    pub block_sub_norms: bool,
+    /// Whether any layer of this model is a PARALLEL residual,
+    /// `x + attn(norm(x)) + ffn(norm(x))` (`crate::parallel_residual`;
+    /// `gptneox` under its key, `plamo` always, `stablelm` per layer by
+    /// tensor presence). The per-layer fact is `MoeWeights::parallel`;
+    /// this is the model-level one `Decoder::metal_can_serve_model`
+    /// reads, because every fused Metal launch bakes the pre-FFN norm
+    /// over the post-attention residual into its kernel.
+    pub parallel_residual: bool,
+    /// `{arch}.attention.value_scale`: MiMo-V2 multiplies the attention
+    /// branch by it AFTER `wo` (`mimo2.cpp:180-183`; every real export
+    /// carries `0.707`). `None` for no scale; see
+    /// [`crate::attn_value_scale`] for the one reader and the values
+    /// that mean none. Applied in `Decoder::attn_out_to_residual_rows`;
+    /// the fused Metal launches refuse a model that has one.
+    pub attn_value_scale: Option<f32>,
+    /// Nanbeige's `num_loops`: `Some` when the model's logical layers
+    /// are several passes over its physical ones (`nanbeige.cpp:19-31`).
+    /// [`Self::n_layers`] is then the LOGICAL count, `Decoder::layers`
+    /// stays physical, and `Decoder::layer_for` maps one to the other.
+    /// See [`crate::layer_loops`]; the fused Metal launches refuse a
+    /// looped model.
+    pub layer_loops: Option<crate::layer_loops::LayerLoops>,
+    /// Talkie's embedding skip stream (`talkie.cpp:50-52,123-126`): the
+    /// embeddings are RMS-normed without a weight before layer 0 and
+    /// every layer adds that vector, times its own
+    /// `layer_output_scale`, after its FFN residual. See
+    /// [`crate::skip_stream`]; the fused Metal launches refuse a model
+    /// that has one.
+    pub skip_stream: bool,
     /// RoPE base used on SWA layers (Gemma 3: defaults to `10000` when
     /// the GGUF omits `rope.freq_base_swa`; full-attn layers keep
     /// [`Self::rope_theta`]).
@@ -300,6 +464,26 @@ pub struct ModelConfig {
     /// Every field on this config that is a best-effort estimate rather
     /// than a confirmed value from an official config.json / GGUF file.
     pub best_effort_fields: &'static [&'static str],
+}
+
+/// One layer's RoPE, as [`ModelConfig::layer_rope`] hands it out: the
+/// three things llama.cpp's `ggml_rope_ext` call takes per layer that
+/// vary by layer.
+///
+/// A struct rather than a tuple so that a consumer names every field
+/// it takes; the Metal side destructures it exhaustively and refuses a
+/// `rot_dim` its one-uniform kernels cannot honour per layer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerRopeParams<'a> {
+    /// This layer's frequency base (`rope_theta`, or `rope_theta_swa`
+    /// on a sliding layer).
+    pub theta: f32,
+    /// This layer's per-band divisors, `rot_dim/2` long, or `None` to
+    /// divide by nothing.
+    pub freq_factors: Option<&'a [f32]>,
+    /// This layer's rotary width when narrower than `head_dim`; `None`
+    /// rotates the whole head. llama.cpp's `n_rot(il)`.
+    pub rot_dim: Option<usize>,
 }
 
 /// The resolved per-band RoPE divisors, for BOTH kinds of layer.
@@ -369,7 +553,13 @@ impl RopeFreqs {
 }
 
 /// Dense / expert FFN non-linearity used by the generic decoder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Not `Copy` and not `Eq` since [`FfnActivation::Xielu`]: that
+/// variant CARRIES its per-layer parameters, so the kind and the
+/// parameters cannot disagree, and a `ModelConfig` clone shares them
+/// through an `Arc`. [`ModelConfig::layer_ffn_act`] is how a layer
+/// body turns this into the `GluAct` it runs.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum FfnActivation {
     /// `silu(gate) * up` with separate gate/up matrices (Llama / Qwen).
     #[default]
@@ -378,9 +568,88 @@ pub enum FfnActivation {
     SwigluFused,
     /// Gemma GeGLU: `gelu(gate) * up`.
     Gelu,
+    /// UNGATED ReLU-squared: `down(relu(up(x))^2)`, two matrices in
+    /// sequence and no `ffn_gate` at all -- llama.cpp's
+    /// `LLM_FFN_RELU_SQR` under `LLM_FFN_SEQ` with a null gate
+    /// (`arcee.cpp:39-40,123-128`; also `plm`, `nemotron`, `jais2`,
+    /// `nemotron-h`, each of which needs more than this).
+    ///
+    /// The loader ALIASES the expert's `gate` to its `up` matrix (a
+    /// zero-copy view of the same bytes) and this maps to
+    /// `ferrox_moe::GluAct::ReluSqr`, which reads `up` alone. That is
+    /// what lets every gated path serve it unchanged; the dense hot
+    /// paths skip the aliased matmul through `GluAct::ungated`, and no
+    /// fused device kernel spells it, so `fused_kernel_gelu_flag` is
+    /// `None`.
+    ReluSqr,
+    /// UNGATED GELU: `down(gelu(up(x)))`, two matrices in sequence and
+    /// no `ffn_gate` -- llama.cpp's `LLM_FFN_GELU` under `LLM_FFN_SEQ`
+    /// with a null gate (`starcoder2.cpp:125-131`, `codeshell.cpp:
+    /// 120-126`; eleven graphs of 140 pass the pair, measured,
+    /// `capability::uses_gelu_ungated`). Aliased and served exactly as
+    /// [`Self::ReluSqr`], mapping to `ferrox_moe::GluAct::GeluUngated`;
+    /// no fused device kernel spells it. `ggml_gelu` is the tanh form
+    /// with an f16 table on the CPU, so its goldens hold at the GeGLU
+    /// tolerance.
+    GeluUngated,
+    /// GATED ReLU, `down(relu(gate(x)) * up(x))` with a REAL gate
+    /// matrix -- llama.cpp's `LLM_FFN_RELU` under `build_moe_ffn` with
+    /// `gate_exps` present, which takes `ggml_reglu_split(gate, up)`
+    /// (`llama-graph.cpp:2195-2197`; `smallthinker.cpp:158`, the only
+    /// graph of 140 that passes it there -- `capability::uses_reglu`).
+    ///
+    /// `ferrox_moe::GluAct::Reglu`, on a pair the loader did NOT alias.
+    /// Two variants rather than [`Self::ReluSqr`] with a flag, because
+    /// `ffn_is_ungated` (the loader's aliasing decision) and
+    /// `layer_ffn_acts` (the body) must agree about which of the two a
+    /// file is, and a variant is the one spelling both read. The
+    /// `GluAct` side is two variants for the same reason: it used to
+    /// be one, `ungated()` answered `relu(up)^2` for it, and the dense
+    /// hot path skipped a gate that was real (the SmallThinker fixture
+    /// found it; `ferrox_moe::GluAct` says how). No fused device kernel
+    /// spells it, so `fused_kernel_gelu_flag` is `None` and every Metal
+    /// launch refuses.
+    Reglu,
+    /// UNGATED xIELU with PER-LAYER parameters: `down(xielu_il(up(x)))`
+    /// -- llama.cpp's `ggml_xielu(up, alpha_n[il], alpha_p[il],
+    /// beta[il], eps[il])` (`apertus.cpp:132-138`), the four read as
+    /// `n_layer`-long arrays or broadcast scalars (`:6-9`).
+    ///
+    /// The table IS the variant, so there is no second field for it to
+    /// disagree with. `crate::act_layers` reads it and hands layer
+    /// `il`'s set out through [`ModelConfig::layer_ffn_act`]; the
+    /// loader aliases gate to up exactly as for [`Self::ReluSqr`], and
+    /// `ferrox_moe::GluAct::Xielu` reads the `up` operand alone. No
+    /// fused device kernel spells it, so every Metal launch refuses it.
+    Xielu(crate::act_layers::XieluLayers),
+    /// SwiGLU with a PER-LAYER, PER-SITE clamp: llama.cpp's
+    /// `swiglu_clamp_exp[il]` on the routed experts and
+    /// `swiglu_clamp_shexp[il]` on the dense layers and shared experts
+    /// (`step35.cpp:28-29`; applied at `llama-graph.cpp:2146-2164` and
+    /// `:1751-1768` as `min(silu(gate), l) * clamp(up, -l, l)`). A zero
+    /// entry is plain SwiGLU on that site; `ferrox_moe::GluAct::
+    /// SwigluClamped` is the body. No fused device kernel spells it.
+    SwigluClamped(crate::act_layers::SwigluClamps),
 }
 
 impl ModelConfig {
+    /// The V head width: the width of every V head, of each head's
+    /// attention output, and so of `o_proj`'s input (`n_heads *
+    /// v_head_dim()`). [`Self::head_dim`] unless the file declared
+    /// `attention.value_length` apart from `attention.key_length` on an
+    /// architecture that sizes them apart (`crate::kv_head_dims`).
+    #[inline]
+    pub fn v_head_dim(&self) -> usize {
+        self.v_head_dim.unwrap_or(self.head_dim)
+    }
+
+    /// Whether V heads are a different width from K heads. The fact
+    /// every fused path refuses on.
+    #[inline]
+    pub fn kv_head_dims_split(&self) -> bool {
+        self.v_head_dim() != self.head_dim
+    }
+
     /// Re-picks the LongRoPE factor set now that the run's context size
     /// is known, matching llama.cpp `llama_model::get_rope_factors`:
     /// `rope_freqs.weight` (Llama 3) always wins; otherwise the long set
@@ -431,23 +700,11 @@ impl ModelConfig {
     /// Sliding-window size for layer `il`, honouring Gemma-style
     /// alternating SWA patterns. `None` means full causal attention.
     pub fn layer_sliding_window(&self, layer_idx: usize) -> Option<usize> {
+        // llama.cpp's `is_swa(il)`, which `set_swa_pattern`
+        // (`src/llama-hparams.cpp:8-22`) or the file's own array fills
+        // in; `crate::swa_layers` is the one implementation of both.
         let window = self.sliding_window?;
-        // llama.cpp `llama_hparams::set_swa_pattern`
-        // (`src/llama-hparams.cpp:8-22`), both phases:
-        //
-        //   dense_first: is_swa = n_pattern == 0 || (il % n_pattern != 0)
-        //   otherwise:   is_swa = n_pattern == 0 || (il % n_pattern < n_pattern - 1)
-        //
-        // `period == 1` therefore windows NOTHING under either phase,
-        // which is the opposite of `None`. It used to be filtered out
-        // before it reached here and fell back to "every layer", which
-        // is exactly inverted.
-        let sliding = match self.swa_pattern {
-            None | Some(0) => true,
-            Some(period) if self.swa_dense_first => !layer_idx.is_multiple_of(period),
-            Some(period) => layer_idx % period < period - 1,
-        };
-        sliding.then_some(window)
+        self.swa_layers.slides(layer_idx).then_some(window)
     }
 
     /// The narrowest sliding window any layer of this model uses, or
@@ -503,39 +760,84 @@ impl ModelConfig {
             .expect("aligned_block_size returns a size BlockLayout accepts")
     }
 
-    /// BOTH halves of layer `il`'s RoPE: the frequency base and the
+    /// ALL THREE halves of layer `il`'s RoPE: the frequency base, the
     /// per-band divisors, which llama.cpp varies per layer together
-    /// (`llama-model.cpp:2029-2035`, and see [`RopeFreqs`]).
+    /// (`llama-model.cpp:2029-2035`, and see [`RopeFreqs`]), and the
+    /// rotary WIDTH, which it varies by the same sliding-or-full fact
+    /// (`n_rot(il)`, `llama-hparams.cpp:85-91`; [`Self::rope_dim_swa`]).
     ///
     /// Every RoPE call site takes the pair from here. Splitting them was
     /// the defect: `layer_rope_theta` varied the base per layer while
     /// `rope_freqs` was one global vector, so Gemma-3 4B/12B/27B roped
     /// their sliding layers at scaled positions llama.cpp leaves
     /// unscaled.
-    pub fn layer_rope(&self, layer_idx: usize) -> (f32, Option<&[f32]>) {
+    ///
+    /// **`None` means this layer does not rotate at all**, which is
+    /// llama.cpp's per-layer `use_rope` gate --
+    /// [`crate::rope_layers`] holds the rule and the six architectures
+    /// that have one. It is an `Option` rather than a separate
+    /// predicate beside the pair precisely so that a call site cannot
+    /// take the base and the divisors without also answering "does this
+    /// layer rotate": that is the third thing the three had to agree
+    /// about, and two of them were already one value for this reason.
+    pub fn layer_rope(&self, layer_idx: usize) -> Option<LayerRopeParams<'_>> {
         let sliding = self.layer_sliding_window(layer_idx).is_some();
+        if !self.rope_layers.rotates(layer_idx, sliding) {
+            return None;
+        }
         let theta = match (sliding, self.rope_theta_swa) {
             (true, Some(theta)) => theta,
             _ => self.rope_theta,
         };
-        (
+        let rot_dim = match (sliding, self.rope_dim_swa) {
+            (true, Some(w)) => Some(w),
+            _ => self.rope_dim,
+        }
+        // The whole head is spelled `None`, whichever key said so, so
+        // nothing downstream special-cases "narrower by zero".
+        .filter(|w| *w < self.head_dim);
+        Some(LayerRopeParams {
             theta,
-            self.rope_freqs.as_ref().map(|f| f.for_layer(sliding)),
-        )
+            freq_factors: self.rope_freqs.as_ref().map(|f| f.for_layer(sliding)),
+            rot_dim,
+        })
     }
 
-    /// RoPE frequency base for layer `il` (SWA layers may differ).
+    /// True when the sliding layers rotate a different width from the
+    /// full ones -- the whole-model fact the fused Metal launches refuse
+    /// on, since each takes ONE `rot_dim` uniform for every layer.
+    ///
+    /// Derived from [`Self::layer_rope`] rather than from the field, so
+    /// a `rope_dim_swa` that merely restates `rope_dim` (or the whole
+    /// head) is not a difference.
+    pub fn rope_dim_varies_by_layer(&self) -> bool {
+        let widths: Vec<Option<usize>> = (0..self.n_layers)
+            .filter_map(|il| self.layer_rope(il).map(|r| r.rot_dim))
+            .collect();
+        widths.windows(2).any(|w| w[0] != w[1])
+    }
+
+    /// Does layer `il` rotate at all? Derived from [`Self::layer_rope`]
+    /// rather than restated beside it, so the two can never disagree.
+    pub fn layer_rotates(&self, layer_idx: usize) -> bool {
+        self.layer_rope(layer_idx).is_some()
+    }
+
+    /// True when at least one layer of this model gets no rotation --
+    /// the whole-model question, for the eligibility checks and the
+    /// receipts that want it once rather than per layer.
+    pub fn any_layer_unrotated(&self) -> bool {
+        (0..self.n_layers).any(|il| !self.layer_rotates(il))
+    }
+
+    /// RoPE frequency base for layer `il` (SWA layers may differ), or
+    /// `None` where the layer does not rotate.
     ///
     /// Prefer [`Self::layer_rope`] anywhere the divisors are needed too,
     /// which is every site that actually rotates something. This one is
     /// for the callers that only report or compare the base.
-    pub fn layer_rope_theta(&self, layer_idx: usize) -> f32 {
-        self.layer_rope(layer_idx).0
-    }
-
-    /// Per-band RoPE divisors for layer `il`; see [`Self::layer_rope`].
-    pub fn layer_rope_freqs(&self, layer_idx: usize) -> Option<&[f32]> {
-        self.layer_rope(layer_idx).1
+    pub fn layer_rope_theta(&self, layer_idx: usize) -> Option<f32> {
+        self.layer_rope(layer_idx).map(|r| r.theta)
     }
 
     /// True when the sliding layers need different per-band divisors
@@ -613,10 +915,12 @@ pub fn glm_5_2() -> ModelConfig {
         name: "glm-5.2",
         attention: AttentionKind::Gqa,
         n_layers: 92,
+        n_mtp_blocks: 0,
         hidden_dim: 6144,
         n_heads: 48,
         n_kv_heads: 8,
         head_dim: 128,
+        v_head_dim: None,
         vocab_size: 151552,
         rope_theta: 1_000_000.0,
         rms_norm_eps: 1e-5,
@@ -646,6 +950,7 @@ pub fn glm_5_2() -> ModelConfig {
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
+        rope_dim_swa: None,
         rope_freqs_long: None,
         rope_freqs_short: None,
         rope_orig_ctx: None,
@@ -653,11 +958,22 @@ pub fn glm_5_2() -> ModelConfig {
         // via `glm_dsa`/`mla`, not this preset's Decoder path.
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-        swa_pattern: None,
-        swa_dense_first: false,
+        swa_layers: crate::swa_layers::SwaLayers::All,
+        rope_layers: crate::rope_layers::RopeLayers::All,
+        layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
+        residual_scale: None,
+        clamp_kqv: None,
+        attn_temperature: None,
+        router_input: crate::router_input::RouterInput::NormedFfnInput,
+        block_sub_norms: false,
+        parallel_residual: false,
+        attn_value_scale: None,
+        layer_loops: None,
+        skip_stream: false,
+        logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
         ffn_activation: FfnActivation::Swiglu,
@@ -686,10 +1002,12 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         name: "deepseek-v4-pro",
         attention: AttentionKind::Gqa,
         n_layers: 96,
+        n_mtp_blocks: 0,
         hidden_dim: 7168,
         n_heads: 56,
         n_kv_heads: 8,
         head_dim: 128,
+        v_head_dim: None,
         vocab_size: 129280,
         rope_theta: 1_000_000.0,
         rms_norm_eps: 1e-6,
@@ -726,17 +1044,29 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
+        rope_dim_swa: None,
         rope_freqs_long: None,
         rope_freqs_short: None,
         rope_orig_ctx: None,
         // llama.cpp maps LLM_ARCH_DEEPSEEK4 -> LLAMA_ROPE_TYPE_NORM.
         rope_layout: RopeLayout::Norm,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-        swa_pattern: None,
-        swa_dense_first: false,
+        swa_layers: crate::swa_layers::SwaLayers::All,
+        rope_layers: crate::rope_layers::RopeLayers::All,
+        layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
+        residual_scale: None,
+        clamp_kqv: None,
+        attn_temperature: None,
+        router_input: crate::router_input::RouterInput::NormedFfnInput,
+        block_sub_norms: false,
+        parallel_residual: false,
+        attn_value_scale: None,
+        layer_loops: None,
+        skip_stream: false,
+        logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
         ffn_activation: FfnActivation::Swiglu,
@@ -763,6 +1093,7 @@ pub fn kimi_k3() -> ModelConfig {
         sliding_window: None,
         name: "kimi-k3",
         n_layers: 93,
+        n_mtp_blocks: 0,
         hidden_dim: 7168,
         // n_heads/n_kv_heads/head_dim describe the Gqa fallback
         // Decoder actually runs today, not Kimi K3's real attention
@@ -773,6 +1104,7 @@ pub fn kimi_k3() -> ModelConfig {
         n_heads: 96,
         n_kv_heads: 96,
         head_dim: 192,
+        v_head_dim: None,
         vocab_size: 163840,
         // Not present in the published text_config; RoPE only ever
         // applies to Gated MLA's 64-dim qk_rope_head_dim slice in the
@@ -836,6 +1168,7 @@ pub fn kimi_k3() -> ModelConfig {
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
+        rope_dim_swa: None,
         rope_freqs_long: None,
         rope_freqs_short: None,
         rope_orig_ctx: None,
@@ -843,11 +1176,22 @@ pub fn kimi_k3() -> ModelConfig {
         // or KDA and never reaches Decoder::apply_rope_head.
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-        swa_pattern: None,
-        swa_dense_first: false,
+        swa_layers: crate::swa_layers::SwaLayers::All,
+        rope_layers: crate::rope_layers::RopeLayers::All,
+        layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
+        residual_scale: None,
+        clamp_kqv: None,
+        attn_temperature: None,
+        router_input: crate::router_input::RouterInput::NormedFfnInput,
+        block_sub_norms: false,
+        parallel_residual: false,
+        attn_value_scale: None,
+        layer_loops: None,
+        skip_stream: false,
+        logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
         ffn_activation: FfnActivation::Swiglu,
@@ -871,10 +1215,12 @@ pub fn test_dense_fixture() -> ModelConfig {
         name: "ferrox-test-dense",
         attention: AttentionKind::Gqa,
         n_layers: 2,
+        n_mtp_blocks: 0,
         hidden_dim: 32,
         n_heads: 4,
         n_kv_heads: 2,
         head_dim: 8,
+        v_head_dim: None,
         vocab_size: 32,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
@@ -894,17 +1240,29 @@ pub fn test_dense_fixture() -> ModelConfig {
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
+        rope_dim_swa: None,
         rope_freqs_long: None,
         rope_freqs_short: None,
         rope_orig_ctx: None,
         // Matches the independent reference's split-half apply_rope.
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-        swa_pattern: None,
-        swa_dense_first: false,
+        swa_layers: crate::swa_layers::SwaLayers::All,
+        rope_layers: crate::rope_layers::RopeLayers::All,
+        layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
+        residual_scale: None,
+        clamp_kqv: None,
+        attn_temperature: None,
+        router_input: crate::router_input::RouterInput::NormedFfnInput,
+        block_sub_norms: false,
+        parallel_residual: false,
+        attn_value_scale: None,
+        layer_loops: None,
+        skip_stream: false,
+        logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
         ffn_activation: FfnActivation::Swiglu,
@@ -924,10 +1282,12 @@ pub fn test_moe_fixture() -> ModelConfig {
         name: "ferrox-test-moe",
         attention: AttentionKind::Gqa,
         n_layers: 2,
+        n_mtp_blocks: 0,
         hidden_dim: 32,
         n_heads: 4,
         n_kv_heads: 2,
         head_dim: 8,
+        v_head_dim: None,
         vocab_size: 32,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
@@ -947,16 +1307,28 @@ pub fn test_moe_fixture() -> ModelConfig {
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
+        rope_dim_swa: None,
         rope_freqs_long: None,
         rope_freqs_short: None,
         rope_orig_ctx: None,
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-        swa_pattern: None,
-        swa_dense_first: false,
+        swa_layers: crate::swa_layers::SwaLayers::All,
+        rope_layers: crate::rope_layers::RopeLayers::All,
+        layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
+        residual_scale: None,
+        clamp_kqv: None,
+        attn_temperature: None,
+        router_input: crate::router_input::RouterInput::NormedFfnInput,
+        block_sub_norms: false,
+        parallel_residual: false,
+        attn_value_scale: None,
+        layer_loops: None,
+        skip_stream: false,
+        logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
         ffn_activation: FfnActivation::Swiglu,
@@ -979,10 +1351,12 @@ pub fn test_mixed_fixture() -> ModelConfig {
         name: "ferrox-test-mixed",
         attention: AttentionKind::Gqa,
         n_layers: 3,
+        n_mtp_blocks: 0,
         hidden_dim: 32,
         n_heads: 4,
         n_kv_heads: 2,
         head_dim: 8,
+        v_head_dim: None,
         vocab_size: 32,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
@@ -1002,16 +1376,28 @@ pub fn test_mixed_fixture() -> ModelConfig {
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
+        rope_dim_swa: None,
         rope_freqs_long: None,
         rope_freqs_short: None,
         rope_orig_ctx: None,
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-        swa_pattern: None,
-        swa_dense_first: false,
+        swa_layers: crate::swa_layers::SwaLayers::All,
+        rope_layers: crate::rope_layers::RopeLayers::All,
+        layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
+        residual_scale: None,
+        clamp_kqv: None,
+        attn_temperature: None,
+        router_input: crate::router_input::RouterInput::NormedFfnInput,
+        block_sub_norms: false,
+        parallel_residual: false,
+        attn_value_scale: None,
+        layer_loops: None,
+        skip_stream: false,
+        logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
         ffn_activation: FfnActivation::Swiglu,
@@ -1066,7 +1452,7 @@ mod tests {
         let mut cfg = test_dense_fixture();
         cfg.n_layers = 24;
         cfg.sliding_window = Some(128);
-        cfg.swa_pattern = Some(2);
+        cfg.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
 
         // Half the layers are full-attention, but the model is still
         // constrained: one mis-aligned sliding layer is enough.
@@ -1088,7 +1474,7 @@ mod tests {
         let mut cfg = test_dense_fixture();
         cfg.n_layers = 30;
         cfg.sliding_window = Some(512);
-        cfg.swa_pattern = Some(6);
+        cfg.swa_layers = crate::swa_layers::SwaLayers::period(6, false);
         assert!(
             cfg.layer_sliding_window(5).is_none(),
             "every 6th layer is full-attention"
@@ -1113,7 +1499,7 @@ mod tests {
         let mut alternating = test_dense_fixture();
         alternating.n_layers = 24;
         alternating.sliding_window = Some(128);
-        alternating.swa_pattern = Some(2);
+        alternating.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
         assert_eq!(alternating.kv_block_window(), Some(128));
         assert_eq!(
             alternating.uniform_sliding_window(),
@@ -1124,7 +1510,7 @@ mod tests {
         let mut uniform = test_dense_fixture();
         uniform.n_layers = 24;
         uniform.sliding_window = Some(128);
-        uniform.swa_pattern = None;
+        uniform.swa_layers = crate::swa_layers::SwaLayers::All;
         assert_eq!(uniform.uniform_sliding_window(), Some(128));
 
         // `Some(0)` is llama.cpp's spelling of "every layer slides"
@@ -1133,11 +1519,11 @@ mod tests {
         // used to assert the two were the same, which is how the
         // inversion stayed invisible.
         let mut period_zero = uniform.clone();
-        period_zero.swa_pattern = Some(0);
+        period_zero.swa_layers = crate::swa_layers::SwaLayers::period(0, false);
         assert_eq!(period_zero.uniform_sliding_window(), Some(128));
 
         let mut period_one = uniform.clone();
-        period_one.swa_pattern = Some(1);
+        period_one.swa_layers = crate::swa_layers::SwaLayers::period(1, false);
         assert_eq!(
             period_one.uniform_sliding_window(),
             None,
@@ -1154,7 +1540,7 @@ mod tests {
     fn a_full_causal_model_keeps_the_block_size_it_was_given() {
         let mut cfg = test_dense_fixture();
         cfg.sliding_window = None;
-        cfg.swa_pattern = None;
+        cfg.swa_layers = crate::swa_layers::SwaLayers::All;
         assert_eq!(cfg.kv_block_window(), None);
         let layout = cfg.kv_block_layout(48);
         assert_eq!(layout.block_size(), 48);

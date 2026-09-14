@@ -121,11 +121,7 @@ fn load() -> Decoder {
 #[test]
 fn gpt_oss_prefill_matches_llama_cpp() {
     let decoder = load();
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     let logits = decoder.forward_batch_last(&PROMPT, 0, &mut caches);
     assert_close(&logits, &GOLDEN_LOGITS, TOL, "prefill (forward_batch_last)");
 }
@@ -137,11 +133,7 @@ fn gpt_oss_prefill_matches_llama_cpp() {
 #[test]
 fn gpt_oss_decode_matches_llama_cpp() {
     let decoder = load();
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     let mut logits = Vec::new();
     for (pos, &tok) in PROMPT.iter().enumerate() {
         logits = decoder.forward_token(tok, pos, &mut caches);
@@ -154,11 +146,7 @@ fn gpt_oss_decode_matches_llama_cpp() {
 #[test]
 fn gpt_oss_multi_seq_matches_llama_cpp() {
     let decoder = load();
-    let mut caches: Vec<Vec<KvCache>> = vec![decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect()];
+    let mut caches: Vec<Vec<KvCache>> = vec![decoder.config.new_kv_caches()];
     let mut logits = Vec::new();
     for (pos, &tok) in PROMPT.iter().enumerate() {
         let out = decoder.forward_multi_seq(&[tok], &[pos], &mut caches);
@@ -178,9 +166,24 @@ fn gpt_oss_loader_wires_the_whole_graph() {
         .as_ref()
         .expect("gpt-oss checkpoint must take the gpt-oss path");
     assert_eq!(g.layers.len(), decoder.layers.len());
+    // The sinks live on the layer's attention weights now, loaded by
+    // tensor presence (`AttnWeights::sinks`); gpt-oss requires them
+    // and the loader refuses a gpt-oss file without one.
+    for layer in &decoder.layers {
+        assert_eq!(
+            layer.attn.sinks.as_ref().map(Vec::len),
+            Some(decoder.config.n_heads)
+        );
+    }
+    // `attn_output.bias` is `AttnWeights::o_bias` now, filled for every
+    // graph that creates the tensor (`ferrox_models::proj_bias`).
+    for layer in &decoder.layers {
+        assert_eq!(
+            layer.attn.o_bias.as_ref().map(Vec::len),
+            Some(decoder.config.hidden_dim)
+        );
+    }
     for layer in &g.layers {
-        assert_eq!(layer.attn_sinks.len(), decoder.config.n_heads);
-        assert_eq!(layer.o_bias.len(), decoder.config.hidden_dim);
         assert_eq!(layer.router_bias.len(), decoder.config.moe.n_experts);
         assert_eq!(layer.expert_bias.len(), decoder.config.moe.n_experts);
     }
@@ -188,7 +191,10 @@ fn gpt_oss_loader_wires_the_whole_graph() {
     // llama.cpp `openai-moe.cpp`: period 2, dense_first = false, so the
     // even layers are windowed and the odd ones are full.
     assert_eq!(decoder.config.sliding_window, Some(4));
-    assert_eq!(decoder.config.swa_pattern, Some(2));
+    assert_eq!(
+        decoder.config.swa_layers,
+        ferrox_models::swa_layers::SwaLayers::period(2, false)
+    );
     assert_eq!(decoder.config.layer_sliding_window(0), Some(4));
     assert_eq!(decoder.config.layer_sliding_window(1), None);
 
@@ -202,7 +208,7 @@ fn gpt_oss_loader_wires_the_whole_graph() {
     // `rope_freq_base_train_swa` default of 10000.
     assert_eq!(
         decoder.config.layer_rope_theta(0),
-        decoder.config.rope_theta
+        Some(decoder.config.rope_theta)
     );
 }
 
@@ -214,11 +220,7 @@ fn gpt_oss_loader_wires_the_whole_graph() {
 fn gpt_oss_golden_is_not_vacuous() {
     let baseline = {
         let decoder = load();
-        let mut caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         decoder.forward_batch_last(&PROMPT, 0, &mut caches)
     };
     assert_close(&baseline, &GOLDEN_LOGITS, TOL, "baseline");
@@ -234,17 +236,16 @@ fn gpt_oss_golden_is_not_vacuous() {
     // 1. No attention sinks (the term ferrox had nowhere at all).
     {
         let mut decoder = load();
-        for layer in decoder.gpt_oss.as_mut().unwrap().layers.iter_mut() {
+        for layer in decoder.layers.iter_mut() {
             layer
-                .attn_sinks
+                .attn
+                .sinks
+                .as_mut()
+                .expect("gpt-oss layers carry sinks")
                 .iter_mut()
                 .for_each(|s| *s = f32::NEG_INFINITY);
         }
-        let mut caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let broken = decoder.forward_batch_last(&PROMPT, 0, &mut caches);
         assert!(
             max_delta(&broken) > TOL * 10.0,
@@ -258,11 +259,7 @@ fn gpt_oss_golden_is_not_vacuous() {
         for layer in decoder.gpt_oss.as_mut().unwrap().layers.iter_mut() {
             layer.router_bias.iter_mut().for_each(|b| *b = 0.0);
         }
-        let mut caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let broken = decoder.forward_batch_last(&PROMPT, 0, &mut caches);
         assert!(max_delta(&broken) > TOL * 10.0, "router bias must matter");
     }
@@ -277,11 +274,7 @@ fn gpt_oss_golden_is_not_vacuous() {
                 b.down.iter_mut().for_each(|x| *x = 0.0);
             }
         }
-        let mut caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let broken = decoder.forward_batch_last(&PROMPT, 0, &mut caches);
         assert!(max_delta(&broken) > TOL * 10.0, "expert biases must matter");
     }
@@ -289,14 +282,10 @@ fn gpt_oss_golden_is_not_vacuous() {
     // 4. No attention output bias.
     {
         let mut decoder = load();
-        for layer in decoder.gpt_oss.as_mut().unwrap().layers.iter_mut() {
-            layer.o_bias.iter_mut().for_each(|b| *b = 0.0);
+        for layer in decoder.layers.iter_mut() {
+            layer.attn.o_bias = None;
         }
-        let mut caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let broken = decoder.forward_batch_last(&PROMPT, 0, &mut caches);
         assert!(
             max_delta(&broken) > TOL * 10.0,
@@ -308,12 +297,8 @@ fn gpt_oss_golden_is_not_vacuous() {
     //    `default_swa_pattern`: a missing pattern key meant "all SWA").
     {
         let mut decoder = load();
-        decoder.config.swa_pattern = None;
-        let mut caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        decoder.config.swa_layers = ferrox_models::swa_layers::SwaLayers::All;
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let broken = decoder.forward_batch_last(&PROMPT, 0, &mut caches);
         assert!(
             max_delta(&broken) > TOL * 10.0,
@@ -325,11 +310,7 @@ fn gpt_oss_golden_is_not_vacuous() {
     {
         let mut decoder = load();
         decoder.config.rope_layout = ferrox_models::config::RopeLayout::Norm;
-        let mut caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let broken = decoder.forward_batch_last(&PROMPT, 0, &mut caches);
         assert!(
             max_delta(&broken) > TOL * 10.0,

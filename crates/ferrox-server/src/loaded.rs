@@ -32,11 +32,13 @@
 //! [`ActiveModel`] itself, so `/v1/models` and `/health` report an
 //! encoder as the loaded model rather than reporting nothing.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
 use axum::Json;
 
+use ferrox_models::tokenizer::SpecialTokens;
 use ferrox_models::EmbeddingModel;
 
 use crate::{budget, serving, ApiError, Model};
@@ -80,6 +82,19 @@ pub(crate) struct ActiveModel {
     /// this model's `batcher`, so the batched and private decode paths
     /// admit on one object.
     pub(crate) ceiling: Option<Arc<budget::ContextCeiling>>,
+    /// The checkpoint file this model was loaded from, when it came
+    /// from one.
+    ///
+    /// Held for [`crate::slots`], which fingerprints the checkpoint so
+    /// a saved KV slot cannot be restored onto different weights.
+    /// `FERROX_MODEL_PATH` would be the wrong source for that:
+    /// `/admin/models/load` swaps the model without touching it, so a
+    /// slot saved after a swap would be stamped with the identity of
+    /// the checkpoint the process *started* on. Like `ceiling`, this is
+    /// a property of the model and travels with it.
+    ///
+    /// `None` for the synthetic fallback and for a Kimi directory.
+    pub(crate) checkpoint_path: Option<PathBuf>,
 }
 
 /// `FERROX_MODEL_NAME`, cached because `name()` returns a `&str` and is
@@ -111,6 +126,33 @@ impl ActiveModel {
         match &self.loaded {
             Loaded::Generative(m) => Ok(m),
             Loaded::Encoder(e) => Err(not_a_generative_model(e)),
+        }
+    }
+
+    /// The model facts the sampler chain needs that a request body
+    /// cannot carry: the vocabulary DRY's sequence breakers are
+    /// tokenised against, and the context size `dry_penalty_last_n = -1`
+    /// resolves to.
+    ///
+    /// Taken off the PINNED `ActiveModel` rather than looked up again,
+    /// so a request cannot resolve its sampler against one checkpoint
+    /// and decode against the one `/admin/models/load` swapped in
+    /// afterwards.
+    pub(crate) fn sampler_model(&self) -> crate::sampling_knobs::SamplerModel<'_> {
+        let vocab = self
+            .generative_opt()
+            .filter(|m| m.has_real_vocabulary())
+            .map(|m| m.as_ref() as &dyn ferrox_models::dry::DryVocab);
+        crate::sampling_knobs::SamplerModel {
+            vocab,
+            // `usize::MAX` when this server could not price a ceiling:
+            // see `SamplerModel::context_size` for why that is the
+            // derived answer rather than a chosen constant.
+            context_size: self
+                .ceiling
+                .as_ref()
+                .and_then(|c| c.limit())
+                .unwrap_or(usize::MAX),
         }
     }
 
@@ -146,9 +188,14 @@ impl ActiveModel {
     /// Deliberately NOT reached through `generative()`: routes that
     /// need a decode still go through it and still refuse, and this
     /// pair is the only thing that steps around it.
-    pub(crate) fn encode_any(&self, text: &str) -> Vec<usize> {
+    ///
+    /// `specials` reaches the generative tokenizer as is. An encoder's
+    /// `token_ids` is the embedding input, which llama.cpp tokenizes
+    /// with `parse_special = true` and which wraps its own `[CLS]` /
+    /// `[SEP]`; there is no separate setting to honour on that side.
+    pub(crate) fn encode_any(&self, text: &str, specials: SpecialTokens) -> Vec<usize> {
         match &self.loaded {
-            Loaded::Generative(m) => m.encode(text),
+            Loaded::Generative(m) => m.encode(text, specials),
             Loaded::Encoder(e) => e.token_ids(text).into_iter().map(|t| t as usize).collect(),
         }
     }

@@ -33,6 +33,7 @@
 
 use ferrox_models::capability::{default_swa_layout, resolve_profile, SwaPattern};
 use ferrox_models::config::test_dense_fixture;
+use ferrox_models::swa_layers::SwaLayers;
 
 /// `(gguf arch, period, dense_first, citation)`.
 ///
@@ -179,8 +180,7 @@ fn the_period_lands_on_the_layers_llama_cpp_windows() {
         let mut cfg = test_dense_fixture();
         cfg.n_layers = 64;
         cfg.sliding_window = Some(WINDOW);
-        cfg.swa_pattern = default_swa_layout(arch).map(|p| p.period);
-        cfg.swa_dense_first = default_swa_layout(arch).is_some_and(|p| p.dense_first);
+        cfg.swa_layers = SwaLayers::from_default(default_swa_layout(arch));
         for il in 0..cfg.n_layers {
             let want = llama_layer_is_swa(il, period, dense_first);
             let got = cfg.layer_sliding_window(il).is_some();
@@ -224,8 +224,7 @@ fn the_two_phases_are_not_the_same_answer() {
         let mut cfg = test_dense_fixture();
         cfg.n_layers = 32;
         cfg.sliding_window = Some(WINDOW);
-        cfg.swa_pattern = Some(period);
-        cfg.swa_dense_first = true;
+        cfg.swa_layers = SwaLayers::period(period, true);
         let differs = (0..cfg.n_layers)
             .filter(|&il| {
                 cfg.layer_sliding_window(il).is_some() != llama_layer_is_swa(il, period, false)
@@ -260,9 +259,7 @@ fn period_one_windows_nothing_and_period_zero_windows_everything() {
         let mut cfg = test_dense_fixture();
         cfg.n_layers = 8;
         cfg.sliding_window = Some(WINDOW);
-        cfg.swa_dense_first = dense_first;
-
-        cfg.swa_pattern = Some(1);
+        cfg.swa_layers = SwaLayers::period(1, dense_first);
         for il in 0..cfg.n_layers {
             assert_eq!(
                 cfg.layer_sliding_window(il),
@@ -271,7 +268,7 @@ fn period_one_windows_nothing_and_period_zero_windows_everything() {
             );
         }
 
-        cfg.swa_pattern = Some(0);
+        cfg.swa_layers = SwaLayers::period(0, dense_first);
         for il in 0..cfg.n_layers {
             assert_eq!(
                 cfg.layer_sliding_window(il),
@@ -299,14 +296,37 @@ fn period_one_windows_nothing_and_period_zero_windows_everything() {
 fn phi3_ignores_the_sliding_window_its_own_checkpoints_declare() {
     use ferrox_models::capability::{default_swa_layout, swa_disabled_by_arch};
 
-    assert!(swa_disabled_by_arch("phi3"));
+    // `phi3` is refused at EVERY layer count, unlike `exaone4` below.
+    for n_layers in [30, 32, 40, 64] {
+        assert!(swa_disabled_by_arch("phi3", n_layers));
+    }
     // The disable is per architecture and must not leak: these read
     // their windows normally.
     for other in ["gemma2", "gemma3", "gpt-oss", "cohere2", "phimoe"] {
         assert!(
-            !swa_disabled_by_arch(other),
+            !swa_disabled_by_arch(other, 32),
             "{other} honours its declared window"
         );
+    }
+
+    // The second cause behind the same predicate: `exaone4.cpp:4`
+    // wraps the WHOLE SWA setup in `if (n_layer() == 64)`, so
+    // EXAONE-4 1.2B ignores a window its file may well declare and
+    // EXAONE-4 32B does not. Both halves, or the test proves only that
+    // the name is listed.
+    assert!(
+        swa_disabled_by_arch("exaone4", 30),
+        "EXAONE-4 1.2B gets no window (exaone4.cpp:4)"
+    );
+    assert!(
+        !swa_disabled_by_arch("exaone4", 64),
+        "EXAONE-4 32B does (exaone4.cpp:4-9)"
+    );
+    // `exaone-moe` is a different row: exaone-moe.cpp:4 sets
+    // `swa_type = STANDARD` unconditionally, so no layer count exempts
+    // it.
+    for n_layers in [32, 48, 64] {
+        assert!(!swa_disabled_by_arch("exaone-moe", n_layers));
     }
 
     // It is a REFUSAL, not a period: `phi3` must have no entry in the

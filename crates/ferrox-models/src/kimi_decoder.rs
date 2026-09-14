@@ -192,7 +192,15 @@ pub fn kimi_forward_token(
                 kda::kda_forward_token(w, kda_cfg, &normed, cfg.rms_norm_eps, s)
             }
             (KimiLayerAttention::Mla(w), KimiLayerState::Mla { k_cache, v_cache }) => {
-                mla::mla_forward_token(w, mla_cfg, &normed, cfg.rms_norm_eps, k_cache, v_cache)
+                mla::mla_forward_token(
+                    w,
+                    mla_cfg,
+                    None,
+                    &normed,
+                    cfg.rms_norm_eps,
+                    k_cache,
+                    v_cache,
+                )
             }
             _ => unreachable!("layer attention kind and decode state kind must always match"),
         };
@@ -252,7 +260,7 @@ mod tests {
     use crate::kda::KdaAttnWeights;
     use crate::latent_moe::KimiExpertBacking;
     use crate::latent_moe::KimiExpertWeights;
-    use crate::mla::MlaAttnWeights;
+    use crate::mla::{MlaAttnWeights, MlaKvB, MlaQProj};
     use ferrox_core::tensor::Tensor;
 
     const HIDDEN_DIM: usize = 8;
@@ -902,20 +910,22 @@ mod tests {
         let layer1 = KimiDecoderLayerWeights {
             input_layernorm_weight: L1_INPUT_LAYERNORM_W.to_vec(),
             attn: KimiLayerAttention::Mla(Box::new(MlaAttnWeights {
-                q_a_proj: wm(&MLA_Q_A_PROJ, MLA_Q_LORA, HIDDEN_DIM),
-                q_a_layernorm: MLA_Q_A_NORM_W.to_vec(),
-                q_b_proj: wm(
-                    &MLA_Q_B_PROJ,
-                    MLA_NUM_HEADS * (MLA_QK_NOPE + MLA_QK_ROPE),
-                    MLA_Q_LORA,
-                ),
+                q: MlaQProj::LowRank {
+                    a: wm(&MLA_Q_A_PROJ, MLA_Q_LORA, HIDDEN_DIM),
+                    norm: MLA_Q_A_NORM_W.to_vec(),
+                    b: wm(
+                        &MLA_Q_B_PROJ,
+                        MLA_NUM_HEADS * (MLA_QK_NOPE + MLA_QK_ROPE),
+                        MLA_Q_LORA,
+                    ),
+                },
                 kv_a_proj_with_mqa: wm(&MLA_KV_A_PROJ, MLA_KV_LORA + MLA_QK_ROPE, HIDDEN_DIM),
                 kv_a_layernorm: MLA_KV_A_NORM_W.to_vec(),
-                kv_b_proj: wm(
+                kv_b: MlaKvB::Combined(wm(
                     &MLA_KV_B_PROJ,
                     MLA_NUM_HEADS * (MLA_QK_NOPE + MLA_V_HEAD_DIM),
                     MLA_KV_LORA,
-                ),
+                )),
                 o_proj: wm(&MLA_O_PROJ, HIDDEN_DIM, MLA_PROJ),
                 g_proj: Some(wm(&MLA_G_PROJ, MLA_PROJ, HIDDEN_DIM)),
             })),
@@ -1018,6 +1028,30 @@ mod tests {
             gate_lower_bound: KDA_GATE_LOWER_BOUND,
             use_full_rank_gate: true,
         }
+    }
+
+    /// One Kimi K3 decode step enters the CPU worker pool once.
+    ///
+    /// Kimi has no checkpoint this machine can load, so the instance is
+    /// the same synthetic two-layer stack every other test in this file
+    /// uses. The count being asserted does not depend on the weights:
+    /// it is how many times the driving thread crossed rayon's cold
+    /// submission path, which before `engine/entry.rs` was once per
+    /// parallel region and is now once per step.
+    ///
+    /// Sabotage: drop the `par::on_workers` from
+    /// `Engine::forward_token` and this goes red with the region count.
+    #[test]
+    fn one_kimi_decode_step_enters_the_pool_once() {
+        crate::engine::assert_one_pool_entry_per_step(
+            &crate::KimiEngine {
+                weights: make_weights(),
+                cfg: decoder_cfg(),
+                mla_cfg: mla_cfg(),
+                kda_cfg: kda_cfg(),
+            },
+            0,
+        );
     }
 
     #[test]

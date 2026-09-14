@@ -184,6 +184,50 @@ impl ReasoningFormat {
         }
     }
 
+    /// The opener and closer a chain of thought can be *written back*
+    /// between, for a prompt that continues one.
+    ///
+    /// `None` for the channel grammars (harmony, ATEM): their reasoning
+    /// is not a marker pair around text, so there is nothing a caller
+    /// could concatenate a replayed thought into. A continuation for
+    /// those families has to be refused rather than rendered, and this
+    /// is the one place that says which families those are.
+    pub fn continuation_markers(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            // Harmony has no markers at all; ATEM's pair is a channel
+            // HEADER (`<|start|>` ... `<|message|>`), which the parser
+            // uses for `prompt_opens_reasoning` and which is not a pair
+            // a thought can be written between.
+            ReasoningFormat::GptOss | ReasoningFormat::MuseGlimmer => None,
+            ReasoningFormat::DeepSeekV32
+            | ReasoningFormat::Think
+            | ReasoningFormat::ThinkAlwaysOpen
+            | ReasoningFormat::MiniMaxM3
+            | ReasoningFormat::Gemma4 => {
+                let m = self.markers();
+                Some((m.start, m.end))
+            }
+        }
+    }
+
+    /// The tool-call opener that can arrive INSIDE the block for this
+    /// family, ending the thought without a closer. Beside
+    /// [`Self::continuation_markers`] because the token budget needs
+    /// both: the closer it forces, and every sequence that ends a
+    /// thought naturally (`common/chat.cpp:1135,2142` list the tool
+    /// opener as a second end tag for the same reason).
+    pub fn tool_marker(self) -> Option<&'static str> {
+        self.markers().tool_start
+    }
+
+    /// Whether the parser reads every generation as starting INSIDE the
+    /// block regardless of what the prompt says. A prompt that closes
+    /// the block itself cannot tell such a parser so, which is why a
+    /// content continuation is refused for these families.
+    pub fn always_open(self) -> bool {
+        self.markers().always_open
+    }
+
     fn markers(self) -> Markers {
         match self {
             ReasoningFormat::DeepSeekV32 => Markers {

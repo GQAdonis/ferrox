@@ -19,7 +19,7 @@ use ferrox_core::cache::KvCache;
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::config::{ModelConfig, RopeLayout};
 use ferrox_models::decoder::Decoder;
-use ferrox_models::tokenizer::GgufBpeTokenizer;
+use ferrox_models::tokenizer::{GgufBpeTokenizer, SpecialTokens};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -142,7 +142,7 @@ fn llama31_8b_q4km_forced_continuation_receipt() {
     let decoder = Decoder::from_gguf(path, config.clone()).expect("load decoder");
 
     let mut tokens: Vec<usize> = tok
-        .encode(&receipt.prompt.rendered)
+        .encode(&receipt.prompt.rendered, SpecialTokens::Parse)
         .into_iter()
         .map(|t| t as usize)
         .collect();
@@ -159,9 +159,7 @@ fn llama31_8b_q4km_forced_continuation_receipt() {
         "tokenized prompt must match the pinned receipt IDs byte-for-byte"
     );
 
-    let mut caches: Vec<KvCache> = (0..config.n_layers)
-        .map(|_| KvCache::new(config.n_kv_heads, config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = config.new_kv_caches();
     let logits_per_pos = decoder.forward_batch(&tokens, 0, &mut caches);
     let mut last_logits = logits_per_pos.last().expect("non-empty prompt").clone();
     let top = top5(&last_logits);

@@ -36,37 +36,42 @@ use crate::kimi_decoder::{
     kimi_forward_token, KimiDecodeState, KimiDecoderConfig, KimiDecoderWeights,
 };
 use crate::kimi_tokenizer::KimiTokenizer;
+use crate::tokenizer::SpecialTokens;
 use ferrox_core::cache::KvCache;
 use ferrox_core::weight_matrix::WeightMatrix;
 
-/// A decoder that can run one incremental forward step given a token id
-/// and position, updating its own per-layer state in place.
-pub trait Engine {
-    type State;
+mod entry;
 
-    /// Builds fresh (empty) per-layer state for a new request.
-    fn new_state(&self) -> Self::State;
+pub use entry::Engine;
 
-    fn vocab_size(&self) -> usize;
-
-    fn forward_token(&self, token_id: usize, pos: usize, state: &mut Self::State) -> Vec<f32>;
-}
+/// The shared pool-entry assertion each engine's own tests call, and the
+/// probe for whether promotion happens in this process at all. See
+/// `entry.rs` for why each is one function and not one copy per engine.
+#[cfg(test)]
+pub(crate) use entry::{assert_one_pool_entry_per_step, on_workers_promotes_here};
 
 impl Engine for Decoder {
     type State = Vec<KvCache>;
 
     fn new_state(&self) -> Vec<KvCache> {
-        self.layers
-            .iter()
-            .map(|_| KvCache::new(self.config.n_kv_heads, self.config.head_dim))
-            .collect()
+        self.config.new_kv_caches()
     }
 
     fn vocab_size(&self) -> usize {
         self.config.vocab_size
     }
 
-    fn forward_token(&self, token_id: usize, pos: usize, state: &mut Self::State) -> Vec<f32> {
+    /// Delegates to the inherent [`Decoder::forward_token`], which is
+    /// itself promoted in `decoder/entry.rs`. The two wrappers nest, and
+    /// nesting is free -- the inner one sees a rayon worker and returns
+    /// the body directly -- so this stays a delegation rather than
+    /// reaching past the entry module for a private body.
+    fn forward_token_on_worker(
+        &self,
+        token_id: usize,
+        pos: usize,
+        state: &mut Self::State,
+    ) -> Vec<f32> {
         Decoder::forward_token(self, token_id, pos, state)
     }
 }
@@ -93,7 +98,12 @@ impl Engine for KimiEngine {
         self.weights.output_head.rows()
     }
 
-    fn forward_token(&self, token_id: usize, _pos: usize, state: &mut Self::State) -> Vec<f32> {
+    fn forward_token_on_worker(
+        &self,
+        token_id: usize,
+        _pos: usize,
+        state: &mut Self::State,
+    ) -> Vec<f32> {
         kimi_forward_token(
             &self.weights,
             &self.cfg,
@@ -125,7 +135,12 @@ impl Engine for Glm52Engine {
         self.weights.output_head.rows()
     }
 
-    fn forward_token(&self, token_id: usize, _pos: usize, state: &mut Self::State) -> Vec<f32> {
+    fn forward_token_on_worker(
+        &self,
+        token_id: usize,
+        _pos: usize,
+        state: &mut Self::State,
+    ) -> Vec<f32> {
         glm52_forward_token(&self.weights, &self.cfg, token_id, state)
     }
 }
@@ -147,6 +162,9 @@ pub struct MlaEngine {
     pub hidden_dim: usize,
     /// Present when any layer uses [`MlaLayerFfn::Moe`].
     pub moe: Option<MlaMoeRuntime>,
+    /// YaRN, when the file declares it (`crate::mla_yarn`): the `pe`
+    /// frequency rewrite, its magnitude and the softmax scale.
+    pub yarn: Option<crate::mla_yarn::MlaYarn>,
 }
 
 /// MoE routing knobs shared by every MoE layer (DeepSeek-2 / Mistral-4).
@@ -158,10 +176,16 @@ pub struct MlaMoeRuntime {
     pub expert_weights_scale: f32,
 }
 
+/// One dense layer's FFN: the gate / up / down triple and the
+/// activation that combines the first two, carried TOGETHER so the
+/// forward pass cannot run a `plm` layer's ungated ReLU-squared
+/// weights through SwiGLU. `act` is the architecture's
+/// (`crate::mla_arch::MlaArch::dense_act`); for an ungated one the
+/// loader aliases `gate` to `ffn_up`, as the generic loader does for
+/// `arcee`, and `ferrox_moe::run_expert` skips the aliased matmul.
 pub struct MlaDenseFfn {
-    pub gate: WeightMatrix,
-    pub up: WeightMatrix,
-    pub down: WeightMatrix,
+    pub weights: ferrox_moe::ExpertWeights,
+    pub act: ferrox_moe::GluAct,
 }
 
 pub struct MlaMoeFfn {
@@ -252,14 +276,20 @@ impl Engine for MlaEngine {
         self.output_head.rows()
     }
 
-    fn forward_token(&self, token_id: usize, _pos: usize, state: &mut Self::State) -> Vec<f32> {
-        use ferrox_core::matmul::{rms_norm, swiglu};
+    fn forward_token_on_worker(
+        &self,
+        token_id: usize,
+        _pos: usize,
+        state: &mut Self::State,
+    ) -> Vec<f32> {
+        use ferrox_core::matmul::rms_norm;
         let mut hidden = self.embedding.dequant_row(token_id);
         for (layer, (k_cache, v_cache)) in self.layers.iter().zip(state.layers.iter_mut()) {
             let normed = rms_norm(&hidden, &layer.attn_norm, self.rms_norm_eps);
             let attn_out = crate::mla::mla_forward_token(
                 &layer.attn,
                 &self.mla_cfg,
+                self.yarn.as_ref(),
                 &normed,
                 self.rms_norm_eps,
                 k_cache,
@@ -270,11 +300,7 @@ impl Engine for MlaEngine {
             }
             let ffn_in = rms_norm(&hidden, &layer.ffn_norm, self.rms_norm_eps);
             let down = match &layer.ffn {
-                MlaLayerFfn::Dense(d) => {
-                    let gate = d.gate.apply(&ffn_in);
-                    let up = d.up.apply(&ffn_in);
-                    d.down.apply(&swiglu(&gate, &up))
-                }
+                MlaLayerFfn::Dense(d) => ferrox_moe::run_expert(&ffn_in, &d.weights, d.act),
                 MlaLayerFfn::Moe(m) => self.moe_ffn_forward(m, &ffn_in),
             };
             for (h, d) in hidden.iter_mut().zip(down.iter()) {
@@ -304,7 +330,12 @@ impl Engine for DeepseekV4Engine {
         self.weights.output_head.rows()
     }
 
-    fn forward_token(&self, token_id: usize, _pos: usize, state: &mut Self::State) -> Vec<f32> {
+    fn forward_token_on_worker(
+        &self,
+        token_id: usize,
+        _pos: usize,
+        state: &mut Self::State,
+    ) -> Vec<f32> {
         deepseek_v4_forward_token(&self.weights, &self.cfg, token_id, state)
     }
 }
@@ -316,7 +347,10 @@ impl Engine for DeepseekV4Engine {
 /// loop encode/decode without caring which concrete tokenizer it was
 /// given.
 pub trait TextTokenizer {
-    fn encode(&self, text: &str) -> Vec<usize>;
+    /// `specials` is llama.cpp's `parse_special`: whether a literal
+    /// marker in `text` is the token it names or the characters it is
+    /// written with. See [`SpecialTokens`] for which callers want which.
+    fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<usize>;
     fn decode(&self, ids: &[usize]) -> String;
 
     /// The raw bytes, before any UTF-8 decision is made about them.
@@ -334,8 +368,8 @@ pub trait TextTokenizer {
 }
 
 impl TextTokenizer for KimiTokenizer {
-    fn encode(&self, text: &str) -> Vec<usize> {
-        KimiTokenizer::encode(self, text)
+    fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<usize> {
+        KimiTokenizer::encode(self, text, specials)
             .into_iter()
             .map(|id| id as usize)
             .collect()
@@ -362,11 +396,7 @@ mod tests {
         let decoder = Decoder::new_random_small(test_dense_fixture(), 2, 64);
         let tokens = [3usize, 7, 1, 9];
 
-        let mut direct_caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut direct_caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let mut direct_logits = Vec::new();
         for (pos, &tok) in tokens.iter().enumerate() {
             direct_logits = decoder.forward_token(tok, pos, &mut direct_caches);
@@ -390,11 +420,7 @@ mod tests {
         let decoder = Decoder::new_random_small(test_dense_fixture(), 2, 64);
         let tokens = vec![2usize, 5, 8];
 
-        let mut batch_caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut batch_caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let batch_logits = decoder.forward_batch(&tokens, 0, &mut batch_caches);
         let ground_truth = batch_logits.last().unwrap().clone();
 

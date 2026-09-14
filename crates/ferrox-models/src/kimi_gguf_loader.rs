@@ -46,7 +46,7 @@ use crate::kimi_decoder::{
 use crate::latent_moe::{KimiExpertBacking, KimiExpertWeights, KimiLatentMoeWeights};
 use crate::loader::LoadError;
 use crate::loader::{load_f32_vec, load_weight_matrix, split_expert_tensor};
-use crate::mla::MlaAttnWeights;
+use crate::mla::{MlaAttnWeights, MlaKvB, MlaQProj};
 
 /// Real per-layer hyperparameters needed to load any layer from a real
 /// Kimi K3 GGUF file -- the GGUF counterpart of
@@ -178,18 +178,15 @@ fn load_mla_attn(
     let q_head_dim = qk_nope_head_dim + qk_rope_head_dim;
 
     // Real on-disk k_b/v_b shapes are {qk_nope_head_dim, kv_lora_rank,
-    // n_head} / {kv_lora_rank, n_embd_head_v, n_head} (3D, per-head) --
-    // ferrox's `MlaAttnWeights::kv_b_proj` instead holds ferrox's own
-    // pre-split combined-per-head-2D convention (the same shape
+    // n_head} / {kv_lora_rank, n_embd_head_v, n_head} (3D, per-head).
+    // This loader reads the combined `attn_kv_b` (the shape
     // `kimi_loader::load_mla_attn` builds from the safetensors
-    // checkpoint's single combined `kv_b_proj`). Reassembling the real
-    // GGUF's already-split k_b/v_b into that single 2D matrix would
-    // require a real transpose/concat this loader does not yet
-    // implement -- reading them as two separate matrices instead is a
-    // real, disclosed gap, not silently wrong output: `find_info` will
-    // simply fail loudly if `attn_kv_b` doesn't exist (which it won't,
-    // for this checkpoint), rather than silently loading transposed or
-    // mismatched data.
+    // checkpoint's single combined `kv_b_proj`) into `MlaKvB::Combined`;
+    // `MlaKvB::Split` exists now (the DeepSeek loader fills it from the
+    // 3D pair and `mla_forward_token` runs the absorbed form on it), and
+    // taking it here is a change to make against a Kimi golden, not by
+    // analogy. `find_info` fails loudly if `attn_kv_b` is absent rather
+    // than loading transposed or mismatched data.
     let q_a_proj = load_weight_matrix(file, &format!("blk.{l}.attn_q_a.weight"))?;
     assert_eq!(
         q_a_proj.rows(),
@@ -234,12 +231,17 @@ fn load_mla_attn(
     );
 
     Ok(MlaAttnWeights {
-        q_a_proj,
-        q_a_layernorm: load_f32_vec(file, &format!("blk.{l}.attn_q_a_norm.weight"))?,
-        q_b_proj,
+        q: MlaQProj::LowRank {
+            a: q_a_proj,
+            norm: load_f32_vec(file, &format!("blk.{l}.attn_q_a_norm.weight"))?,
+            b: q_b_proj,
+        },
         kv_a_proj_with_mqa,
         kv_a_layernorm: load_f32_vec(file, &format!("blk.{l}.attn_kv_a_norm.weight"))?,
-        kv_b_proj: load_weight_matrix(file, &format!("blk.{l}.attn_kv_b.weight"))?,
+        kv_b: MlaKvB::Combined(load_weight_matrix(
+            file,
+            &format!("blk.{l}.attn_kv_b.weight"),
+        )?),
         o_proj,
         g_proj: Some(load_weight_matrix(
             file,
@@ -902,12 +904,18 @@ mod tests {
         // 0), 1 = MoE+MLA -- covering every real attention/FFN
         // combination `load_kimi_gguf_layer` must dispatch correctly.
         let model_cfg = crate::config::ModelConfig {
+            // Kimi's stack has no per-layer RoPE gate; llama.cpp writes
+            // no `use_rope` for it (`crate::rope_layers`).
+            rope_layers: crate::rope_layers::RopeLayers::All,
+            layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
             name: "synthetic-kimi-gguf-test",
             n_layers: 2,
+            n_mtp_blocks: 0,
             hidden_dim: d.hidden_dim,
             n_heads: 1,
             n_kv_heads: 1,
             head_dim: 4,
+            v_head_dim: None,
             vocab_size,
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,
@@ -951,16 +959,27 @@ mod tests {
             rope_freqs: None,
             rope_attn_factor: 1.0,
             rope_dim: None,
+            rope_dim_swa: None,
             rope_freqs_long: None,
             rope_freqs_short: None,
             rope_orig_ctx: None,
             rope_layout: crate::config::RopeLayout::Neox,
             qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-            swa_pattern: None,
-            swa_dense_first: false,
+            swa_layers: crate::swa_layers::SwaLayers::All,
+
             attn_logit_softcap: None,
             final_logit_softcap: None,
             embedding_scale: None,
+            residual_scale: None,
+            clamp_kqv: None,
+            attn_temperature: None,
+            router_input: crate::router_input::RouterInput::NormedFfnInput,
+            block_sub_norms: false,
+            parallel_residual: false,
+            attn_value_scale: None,
+            layer_loops: None,
+            skip_stream: false,
+            logit_multiplier: None,
             attention_scale: None,
             rope_theta_swa: None,
             ffn_activation: crate::config::FfnActivation::Swiglu,

@@ -1,0 +1,75 @@
+{
+  "accelerator": "Apple M2 Pro",
+  "approx_params": 663126016,
+  "arch": "qwen2",
+  "backend": "metal",
+  "backend_active": "Metal",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.20.0",
+  "host_load_1min_end": 1.69,
+  "host_load_1min_start": 1.84,
+  "host_spec": {
+    "arch": "aarch64",
+    "cores": 10,
+    "cpu": "Apple M2 Pro",
+    "label": "Apple M2 Pro (10c/6p) macOS 26.6.2",
+    "os": "macOS 26.6.2",
+    "perf_cores": 6,
+    "ram_gb": 32.0
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": false,
+    "measured": true,
+    "pressure": "nominal",
+    "source": "NSProcessInfo.thermalState"
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": false,
+    "measured": true,
+    "pressure": "nominal",
+    "source": "NSProcessInfo.thermalState"
+  },
+  "id": "qwen25_05b_q8",
+  "kind": "engine",
+  "load_s": 0.052323959,
+  "model_path": "models/hf_test/qwen2.5-0.5b-instruct-q8_0.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 675710816,
+  "tests": [
+    {
+      "ferrox_samples": [
+        4225.353588853174,
+        4511.223554141397,
+        4546.345894022759
+      ],
+      "ferrox_stddev": 143.7556861834672,
+      "ferrox_tps": 4511.223554141397,
+      "gap": 1.0940335677821094,
+      "llama_tps": 4935.43,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        217.71705091327863,
+        218.42456717896445,
+        212.56857360467106
+      ],
+      "ferrox_stddev": 2.6098117983576805,
+      "ferrox_tps": 217.71705091327863,
+      "gap": 0.6018361880723437,
+      "llama_tps": 131.03,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 6,
+  "warmup_reps": 1
+}

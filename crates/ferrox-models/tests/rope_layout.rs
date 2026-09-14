@@ -204,10 +204,12 @@ fn rope_layout_matches_llama_cpp() {
             continue;
         }
         let Some(&want) = expected.get(p.gguf_name) else {
-            // A ferrox-only alias (`mistral`, `mixtral`, `yi`, `phi4`,
-            // `kimi_k3`, the `granite-*` spellings) has no entry in
-            // llama.cpp's own name table, so there is nothing to pin it
-            // against.
+            // A ferrox-only alias (`phi4`, `kimi_k3`, the `granite-*`
+            // spellings) has no entry in llama.cpp's own name table, so
+            // there is nothing to pin it against.
+            // `a_ferrox_only_name_on_the_generic_path_is_declared`
+            // below is the other half of this skip: it is why the skip
+            // cannot silently grow.
             continue;
         };
         checked += 1;
@@ -227,6 +229,66 @@ fn rope_layout_matches_llama_cpp() {
         wrong.is_empty(),
         "RoPE layout disagrees with llama.cpp:\n  {}",
         wrong.join("\n  ")
+    );
+}
+
+/// A ferrox-only name that reaches a rotating path must be on a short,
+/// declared list.
+///
+/// `rope_layout_matches_llama_cpp`'s lookup miss is a `continue`, so
+/// every name absent from `LLAMA_ROPE_TYPES` is silently exempt from
+/// the only test that compares RoPE layouts. `mistral`, `mixtral` and
+/// `yi` sat in that blind spot as `GenericGqa { rope: Neox }` while the
+/// graph they claim to be -- `llama` -- is NORM, which is the
+/// wrong-pairs defect behind the Llama-3.1-8B bug, latent only because
+/// the rows refused for another reason. They are `DedicatedOnly` now.
+///
+/// This is what stops the blind spot from growing again: a ferrox-only
+/// name may exist, but if it is on the generic path somebody has to add
+/// it here and say why.
+#[test]
+fn a_ferrox_only_name_on_the_generic_path_is_declared() {
+    let known: std::collections::HashMap<&str, RopeLayout> =
+        LLAMA_ROPE_TYPES.iter().copied().collect();
+    // Two, both deliberate, both still refusing:
+    //
+    //  * `phi4` -- unlike the three alias rows it names a concrete
+    //    hypothesis a real file would settle (phi3's fused-QKV graph,
+    //    NEOX). `capability::phi4`'s UNKNOWN verdict carries it.
+    //  * `granite-moe` -- a spelling variant of llama.cpp's
+    //    `granitemoe`, and it carries the SAME layout (NORM, the
+    //    `LLM_ARCH_GRANITE_MOE` arm of `llama_model_rope_type`) and the
+    //    same `GRANITE_MULTIPLIERS` verdict, which is the point of
+    //    keeping one blocker string for all three granite rows.
+    //  * `glm4moe` -- llama.cpp decides it per checkpoint
+    //    (`llama-model.cpp:2700`: `MROPE` when `rope.dimension_sections`
+    //    says so, `NEOX` otherwise), so it is deliberately absent from
+    //    the table above. ferrox rotates NEOX, which is the text-tower
+    //    answer in both cases: `tests/glm4moe_graphs.rs` pins that
+    //    libllama's logits under MROPE with text positions are byte
+    //    for byte the NEOX ones.
+    //  * `glm4` -- the same per-checkpoint arm one line up
+    //    (`llama-model.cpp:2699`: `MROPE` with sections, `NORM`
+    //    without). ferrox rotates NORM and REFUSES a sectioned file
+    //    (`ferrox_models::mrope`), because for this one the converter
+    //    permuted the weights and the two rotations differ (measured,
+    //    `tests/glm4_graphs.rs`).
+    const DECLARED: &[&str] = &["phi4", "granite-moe", "glm4moe", "glm4"];
+    let mut undeclared = Vec::new();
+    for p in architecture_catalog() {
+        let ArchPath::GenericGqa { rope } = p.path else {
+            continue;
+        };
+        if known.contains_key(p.gguf_name) || DECLARED.contains(&p.gguf_name) {
+            continue;
+        }
+        undeclared.push(format!("{}: ferrox rotates it as {rope:?}", p.gguf_name));
+    }
+    assert!(
+        undeclared.is_empty(),
+        "on the generic path, rotated, and absent from llama.cpp's name table, so \
+         `rope_layout_matches_llama_cpp` skips them:\n  {}",
+        undeclared.join("\n  ")
     );
 }
 

@@ -1,6 +1,22 @@
-// Models: the inventory, the swap, and the download job.
+// Models: the library. What is on disk, how to get more, which one
+// answers, and how to give the memory back.
 //
-// Two rules this screen exists to respect.
+// **Loading is done here AND in the chat header's picker**, and both post
+// the same `/admin/models/load` to the same server. The picker is for
+// the person mid-conversation; this screen is for the person managing a
+// box, who should not have to leave for the chat to switch what is
+// running. One `Load` per row and one `Unload` on the loaded one, so
+// each row carries exactly the verb that applies to it, and the header
+// carries neither.
+//
+// **Downloads take what is on the clipboard.** One box accepts an
+// `owner/repo` identifier, `owner/repo:file-or-glob`, a repo URL or a
+// file URL (`lib/hf-source.ts` resolves them); the pattern box beside
+// it is the default when none of those names a file. Progress shows
+// under the box while a task runs and only then: a task list that
+// mostly says "done" is a log, and the Activity screen is the log.
+//
+// Two more rules this screen exists to respect.
 //
 // **A rate is shown only when the server calls the task `stable`.** The
 // backend runs a rolling-window estimator that refuses to divide until
@@ -13,14 +29,18 @@
 // only present in builds that have it; a 404 renders as a plain
 // explanation rather than as a broken table.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   Boxes,
   CloudDownload,
-  HardDriveDownload,
+  Loader2,
   RefreshCw,
   Search,
 } from "lucide-react";
+import { Link } from "react-router";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -52,6 +72,8 @@ import {
   fmtRate,
   isNum,
 } from "@/lib/format";
+import { parseHfSource } from "@/lib/hf-source";
+import { cn } from "@/lib/utils";
 
 /** Poll fast while something is moving, slowly when nothing is. */
 const BUSY_POLL_MS = 1000;
@@ -122,7 +144,7 @@ function TaskCard({
                 ? "ok"
                 : task.status === "cancelled"
                   ? "neutral"
-                  : "accent"
+                  : "strong"
           }
         >
           {task.status}
@@ -138,10 +160,67 @@ function TaskCard({
         )}
       </div>
       {terminal ? null : <Progress fraction={fraction} label={task.label} />}
-      <p className="font-mono text-[0.6875rem] text-faint">
+      <p className="font-mono text-2xs text-faint">
         {facts.join("  ·  ")}
       </p>
     </li>
+  );
+}
+
+type SortKey =
+  | "id"
+  | "quant"
+  | "arch"
+  | "context_length"
+  | "param_count"
+  | "size_bytes"
+  | "state";
+
+/** Column order for one key; nulls sort last either way. */
+function compareBy(key: SortKey, a: ModelEntry, b: ModelEntry): number {
+  const av = a[key];
+  const bv = b[key];
+  if (av == null && bv == null) return 0;
+  if (av == null) return 1;
+  if (bv == null) return -1;
+  if (typeof av === "number" && typeof bv === "number") return av - bv;
+  return String(av).localeCompare(String(bv), undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+/** A column header that orders the table; click again to flip. */
+function SortTh({
+  label,
+  column,
+  sort,
+  onSort,
+  numeric,
+}: {
+  label: string;
+  column: SortKey;
+  sort: { key: SortKey; dir: "asc" | "desc" };
+  onSort: (key: SortKey) => void;
+  numeric?: boolean;
+}) {
+  const active = sort.key === column;
+  const Icon = !active ? ArrowUpDown : sort.dir === "asc" ? ArrowUp : ArrowDown;
+  return (
+    <Th numeric={numeric} aria-sort={active ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}>
+      <button
+        type="button"
+        onClick={() => onSort(column)}
+        className={cn(
+          "inline-flex items-center gap-1 uppercase hover:text-fg",
+          numeric && "flex-row-reverse",
+          active && "text-fg",
+        )}
+      >
+        {label}
+        <Icon className={cn("size-3", active ? "opacity-100" : "opacity-40")} />
+      </button>
+    </Th>
   );
 }
 
@@ -151,9 +230,16 @@ export function ModelsScreen() {
   const [unsupported, setUnsupported] = useState(false);
   const [banner, setBanner] = useState<Banner>(null);
   const [filter, setFilter] = useState("");
-  const [repo, setRepo] = useState("");
+  const [quantFilter, setQuantFilter] = useState("");
+  const [archFilter, setArchFilter] = useState("");
+  const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({
+    key: "id",
+    dir: "asc",
+  });
+  const [source, setSource] = useState("");
   const [file, setFile] = useState("*Q4_K_M.gguf");
   const [queueing, setQueueing] = useState(false);
+  const [loadingId, setLoadingId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -209,25 +295,38 @@ export function ModelsScreen() {
     await refresh();
   };
 
-  const loadModel = (id: string) =>
-    act(`Loading ${id}`, () => postJson(routes.adminModelsLoad, { id }));
   const unloadModel = () =>
     act("Unload", () => postJson(routes.adminModelsUnload));
+  // `202 Accepted` means queued, not loaded; the row's state column,
+  // polled fast while anything moves, is what says when it landed.
+  const loadModel = async (id: string) => {
+    setLoadingId(id);
+    try {
+      await act("Load", () => postJson(routes.adminModelsLoad, { id }));
+    } finally {
+      setLoadingId(null);
+    }
+  };
   const cancelTask = (taskId: string) =>
     act("Cancel", () => postJson(routes.adminTaskCancel(taskId)));
 
   const startDownload = async (event: React.FormEvent) => {
     event.preventDefault();
+    const parsed = parseHfSource(source, file);
+    if ("error" in parsed) {
+      setBanner({ text: parsed.error, tone: "err" });
+      return;
+    }
     setQueueing(true);
     try {
       // The server resolves a `*` glob against the repo's file list and
       // refuses anything that is not a plain `.gguf` child of the model
       // directory, so no validation is duplicated here.
-      await postJson(routes.adminDownload, {
-        repo: repo.trim(),
-        file: file.trim(),
+      await postJson(routes.adminDownload, parsed);
+      setBanner({
+        text: `Download queued: ${parsed.file} from ${parsed.repo}.`,
+        tone: "info",
       });
-      setBanner({ text: `Download queued for ${repo.trim()}.`, tone: "info" });
       await refresh();
     } catch (error) {
       setBanner({
@@ -238,6 +337,17 @@ export function ModelsScreen() {
       setQueueing(false);
     }
   };
+
+  const quants = useMemo(
+    () =>
+      [...new Set((inventory?.models ?? []).map((m) => m.quant).filter(Boolean))].sort() as string[],
+    [inventory],
+  );
+  const archs = useMemo(
+    () =>
+      [...new Set((inventory?.models ?? []).map((m) => m.arch).filter(Boolean))].sort() as string[],
+    [inventory],
+  );
 
   if (unsupported) {
     return (
@@ -262,17 +372,31 @@ export function ModelsScreen() {
   }
 
   const active = inventory?.active ?? null;
-  const anyLoading = (inventory?.models ?? []).some(
-    (m) => m.state === "loading",
+  // Only what is moving, plus the most recent failure so a refused or
+  // broken download is not silently a task that vanished.
+  const liveTasks = tasks.filter(
+    (t) => t.status === "queued" || t.status === "running",
   );
+  const lastFailed = tasks.find((t) => t.status === "error") ?? null;
   const needle = filter.trim().toLowerCase();
-  const visible = (inventory?.models ?? []).filter(
-    (m) =>
-      !needle ||
-      m.id.toLowerCase().includes(needle) ||
-      (m.quant ?? "").toLowerCase().includes(needle) ||
-      (m.arch ?? "").toLowerCase().includes(needle),
-  );
+  const visible = (inventory?.models ?? [])
+    .filter(
+      (m) =>
+        (!needle ||
+          m.id.toLowerCase().includes(needle) ||
+          (m.quant ?? "").toLowerCase().includes(needle) ||
+          (m.arch ?? "").toLowerCase().includes(needle)) &&
+        (!quantFilter || m.quant === quantFilter) &&
+        (!archFilter || m.arch === archFilter),
+    )
+    .sort((a, b) => {
+      const c = compareBy(sort.key, a, b);
+      return sort.dir === "asc" ? c : -c;
+    });
+  const onSort = (key: SortKey) =>
+    setSort((s) =>
+      s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" },
+    );
 
   return (
     <Page>
@@ -281,20 +405,13 @@ export function ModelsScreen() {
         description={
           inventory?.model_dir
             ? `Scanning ${inventory.model_dir}`
-            : "Inventory, load / unload, and Hugging Face downloads."
+            : "What is on disk, Hugging Face downloads, and giving the memory back."
         }
         actions={
-          <>
-            {active ? (
-              <Button variant="default" size="sm" onClick={unloadModel}>
-                Unload {active}
-              </Button>
-            ) : null}
-            <Button variant="ghost" size="sm" onClick={() => void refresh()}>
-              <RefreshCw />
-              Refresh
-            </Button>
-          </>
+          <Button variant="ghost" size="sm" onClick={() => void refresh()}>
+            <RefreshCw />
+            Refresh
+          </Button>
         }
       />
 
@@ -302,20 +419,114 @@ export function ModelsScreen() {
 
       <Card>
         <CardHeader>
+          <CardTitle>Download a checkpoint</CardTitle>
+        </CardHeader>
+        <CardBody>
+          <form
+            onSubmit={startDownload}
+            className="flex flex-wrap items-end gap-3"
+          >
+            <Field
+              label="Hugging Face repo, repo:file, or URL"
+              className="min-w-72 flex-1"
+              htmlFor="source"
+            >
+              <Input
+                id="source"
+                required
+                value={source}
+                onChange={(e) => setSource(e.target.value)}
+                placeholder="unsloth/Llama-3.2-3B-Instruct-GGUF  or  https://huggingface.co/…/resolve/main/x.gguf"
+              />
+            </Field>
+            <Field
+              label="file (name or glob) when the source names none"
+              className="w-56"
+              htmlFor="file"
+            >
+              <Input
+                id="file"
+                value={file}
+                onChange={(e) => setFile(e.target.value)}
+                placeholder="*Q4_K_M.gguf"
+              />
+            </Field>
+            <Button type="submit" variant="primary" disabled={queueing}>
+              <CloudDownload />
+              Download
+            </Button>
+          </form>
+        </CardBody>
+        {liveTasks.length ? (
+          <CardBody className="border-t border-line">
+            <ul className="space-y-2">
+              {liveTasks.map((task) => (
+                <TaskCard
+                  key={task.task_id}
+                  task={task}
+                  onCancel={cancelTask}
+                />
+              ))}
+            </ul>
+          </CardBody>
+        ) : null}
+        {lastFailed ? (
+          <CardBody className="border-t border-line">
+            <Notice tone="err">
+              {lastFailed.label} failed: {lastFailed.error ?? "no reason given"}
+            </Notice>
+          </CardBody>
+        ) : null}
+        <CardFooter>
+          A rate appears only once the server's estimator calls it stable;
+          until then the progress line says so instead of guessing. Finished
+          tasks are in{" "}
+          <Link to="/ui/activity" className="link">
+            Activity
+          </Link>
+          .
+        </CardFooter>
+      </Card>
+      <Card>
+        <CardHeader>
           <CardTitle>Inventory</CardTitle>
-          {active ? (
-            <Badge tone="ok">active: {active}</Badge>
-          ) : (
-            <Badge tone="neutral">nothing loaded</Badge>
-          )}
+          {/* The `state` column and the row's own button say which
+              checkpoint is loaded; only the empty case needs a badge. */}
+          {active ? null : <Badge tone="neutral">nothing loaded</Badge>}
           <span className="flex-1" />
+          <select
+            value={quantFilter}
+            onChange={(e) => setQuantFilter(e.target.value)}
+            aria-label="Filter by quant"
+            className="h-8 rounded-lg border border-line bg-raised px-2 text-xs text-fg focus:border-fg/30 focus:outline-none"
+          >
+            <option value="">any quant</option>
+            {quants.map((q) => (
+              <option key={q} value={q}>
+                {q}
+              </option>
+            ))}
+          </select>
+          <select
+            value={archFilter}
+            onChange={(e) => setArchFilter(e.target.value)}
+            aria-label="Filter by architecture"
+            className="h-8 rounded-lg border border-line bg-raised px-2 text-xs text-fg focus:border-fg/30 focus:outline-none"
+          >
+            <option value="">any arch</option>
+            {archs.map((a) => (
+              <option key={a} value={a}>
+                {a}
+              </option>
+            ))}
+          </select>
           <div className="relative">
             <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-faint" />
             <Input
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
-              placeholder="Filter by id, quant or arch"
-              aria-label="Filter models"
+              placeholder="Search by id, quant or arch"
+              aria-label="Search models"
               className="h-8 w-56 pl-8 text-xs"
             />
           </div>
@@ -347,26 +558,34 @@ export function ModelsScreen() {
             )}
           </EmptyState>
         ) : !visible.length ? (
-          <EmptyState icon={Search} title={`Nothing matches “${filter}”`} />
+          <EmptyState
+            icon={Search}
+            title={
+              filter
+                ? `Nothing matches “${filter}”`
+                : "Nothing matches these filters"
+            }
+          />
         ) : (
           <TableScroll>
             <Table>
               <thead>
                 <Tr className="hover:bg-transparent">
-                  <Th>id</Th>
-                  <Th>quant</Th>
-                  <Th>arch</Th>
-                  <Th numeric>context</Th>
-                  <Th numeric>params</Th>
-                  <Th numeric>on disk</Th>
+                  <SortTh label="id" column="id" sort={sort} onSort={onSort} />
+                  <SortTh label="quant" column="quant" sort={sort} onSort={onSort} />
+                  <SortTh label="arch" column="arch" sort={sort} onSort={onSort} />
+                  <SortTh label="context" column="context_length" sort={sort} onSort={onSort} numeric />
+                  <SortTh label="params" column="param_count" sort={sort} onSort={onSort} numeric />
+                  <SortTh label="on disk" column="size_bytes" sort={sort} onSort={onSort} numeric />
                   <Th numeric>resident</Th>
-                  <Th>state</Th>
-                  <Th />
+                  <SortTh label="state" column="state" sort={sort} onSort={onSort} />
+                  <Th>
+                    <span className="sr-only">actions</span>
+                  </Th>
                 </Tr>
               </thead>
               <tbody>
                 {visible.map((entry) => {
-                  const loaded = entry.id === active;
                   return (
                     <Tr key={entry.id}>
                       <Td mono className="max-w-[22rem]">
@@ -396,11 +615,12 @@ export function ModelsScreen() {
                         <StateBadge entry={entry} activeId={active} />
                       </Td>
                       <Td className="text-right">
-                        {loaded ? (
+                        {entry.id === active ? (
                           <Button
                             variant="default"
                             size="sm"
                             onClick={unloadModel}
+                            title="Give the memory back without loading another"
                           >
                             Unload
                           </Button>
@@ -408,15 +628,13 @@ export function ModelsScreen() {
                           <Button
                             variant="primary"
                             size="sm"
-                            disabled={anyLoading}
-                            title={
-                              anyLoading
-                                ? "a load is already in progress"
-                                : undefined
-                            }
-                            onClick={() => loadModel(entry.id)}
+                            disabled={busy || loadingId !== null}
+                            onClick={() => void loadModel(entry.id)}
+                            title="Load this checkpoint for every client of this server"
                           >
-                            <HardDriveDownload />
+                            {loadingId === entry.id || entry.state === "loading" ? (
+                              <Loader2 className="animate-spin" />
+                            ) : null}
                             Load
                           </Button>
                         )}
@@ -430,81 +648,16 @@ export function ModelsScreen() {
         )}
 
         <CardFooter>
-          A load swaps the checkpoint for every client of this server; an
-          in-flight request finishes on the weights it started on.
+          Load swaps the checkpoint for every client of this server; an
+          in-flight request finishes on the weights it started on. The
+          same switch is in the model menu at the top of{" "}
+          <Link to="/ui/chat" className="link">
+            Chat
+          </Link>
+          .
         </CardFooter>
       </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Download a checkpoint</CardTitle>
-        </CardHeader>
-        <CardBody>
-          <form
-            onSubmit={startDownload}
-            className="flex flex-wrap items-end gap-3"
-          >
-            <Field
-              label="Hugging Face repo"
-              className="min-w-64 flex-1"
-              htmlFor="repo"
-            >
-              <Input
-                id="repo"
-                required
-                value={repo}
-                onChange={(e) => setRepo(e.target.value)}
-                placeholder="unsloth/Llama-3.2-3B-Instruct-GGUF"
-              />
-            </Field>
-            <Field label="file (name or glob)" className="w-48" htmlFor="file">
-              <Input
-                id="file"
-                required
-                value={file}
-                onChange={(e) => setFile(e.target.value)}
-                placeholder="*Q4_K_M.gguf"
-              />
-            </Field>
-            <Button type="submit" variant="primary" disabled={queueing}>
-              <CloudDownload />
-              Download
-            </Button>
-          </form>
-        </CardBody>
-        <CardFooter>
-          <code className="font-mono">POST /admin/download</code> starts a task;
-          progress appears below.
-        </CardFooter>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Tasks</CardTitle>
-          {tasks.length ? <Badge>{tasks.length}</Badge> : null}
-        </CardHeader>
-        {tasks.length ? (
-          <CardBody>
-            <ul className="space-y-2">
-              {tasks.map((task) => (
-                <TaskCard
-                  key={task.task_id}
-                  task={task}
-                  onCancel={cancelTask}
-                />
-              ))}
-            </ul>
-          </CardBody>
-        ) : (
-          <EmptyState
-            icon={CloudDownload}
-            title="No downloads or loads have run yet"
-          >
-            A rate appears only once the server's estimator calls it stable —
-            until then the progress line says so instead of guessing.
-          </EmptyState>
-        )}
-      </Card>
     </Page>
   );
 }

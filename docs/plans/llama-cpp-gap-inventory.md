@@ -105,12 +105,17 @@ ways. Every row below was read in llama.cpp's own source.
 | `grok` | **Hardcodes** `f_attn_logit_softcapping = 30.0` and `f_router_logit_softcapping = 30.0` before letting an optional key override, and requires `attn_out_norm` + `ffn_post_norm` | `src/models/grok.cpp:9-11,19-21,62,75-77` | `unsupported_feature_keys` fires only on a **present** metadata key (`capability.rs:1156-1177`), so a Grok GGUF omitting the keys would pass that gate. Router logit softcapping has no ferrox concept at all | **New code.** Same hardcoded-literal shape as the `bloom`/`refact` ALiBi class |
 | `dbrx` | LayerNorm (`LLM_NORM`, mean-subtracting) not RMSNorm, plus `f_clamp_kqv` and a required `attn_out_norm` | `src/models/dbrx.cpp:5,34,71,111-112,142` | The generic decoder is RMSNorm-only; `capability.rs:396-399` states this in the bias-refusal comment | **New code**, and it belongs in the existing "required LayerNorm bias" refusal group rather than in D |
 | `apertus` | xIELU activation with four **per-layer arrays** of parameters | `src/models/apertus.cpp:6-9,132-139` | `FfnActivation` has three variants: `Swiglu`, `SwigluFused`, `Gelu` (`crates/ferrox-models/src/config.rs:304-312`) | **New code** |
-| `bitnet` | A required `attn_sub_norm` inside the attention block | `src/models/bitnet.cpp:24,102-104` | No slot; the unread-tensor gate would catch it as `UnconsumedTensors` | **New code**, but the refusal would at least name the tensor |
-| `grovemoe` | Scales the MoE output by `hparams.expert_group_scale` after the routed sum | `src/models/grovemoe.cpp:167` | `MoeLayerConfig` carries `expert_weights_scale` (`loader.rs:403-405`) but no post-sum group scale | **New code**, small |
+| `bitnet` | A required `attn_sub_norm` inside the attention block, and `ffn_sub_norm` inside the FFN | `src/models/bitnet.cpp:24,36,101-106,135-140` | **CLOSED 2026-09-12.** `ferrox_models::sub_norms` (one `bool` on `ModelConfig`, two tensors on the layer, applied in the one attention tail and `ferrox_moe::run_expert_sub_normed`); the per-projection `.scale` tensors llama.cpp multiplies in for every architecture are refused by name (`ferrox_models::weight_scales`). libllama-golden fixture, `tests/sub_norm_graphs.rs` | ~~New code~~ Two slots, one graph of 140; real BitNet GGUFs still need `TQ1_0` / `TQ2_0` kernels |
+| `grovemoe` | A SECOND expert bank (`*_chexps`) fed and weighted from the first bank's routing, then scaled by `expert_group_scale` | `src/models/grovemoe.cpp:57-59,137-167`; `llama-graph.cpp:1997,2035-2039` | ferrox's MoE layer holds one bank. **And, read against `modeling_grove_moe.py` on 2026-09-12, llama.cpp's graph disagrees with the reference twice**: the chunk experts read the routed experts' OUTPUT (`:148-152`) where the reference reads the same input, and their weights are gathered at the CHUNK index (`llama-graph.cpp:2035-2039`) where the reference gathers at the original expert's. Neither was discussed in upstream PR #15510 | **New code**, and there is no single graph to match until upstream settles it; refused by name with the finding in the verdict |
 | `step35` | Per-layer SwiGLU clamp arrays (`swiglu_clamp_exp`, `swiglu_clamp_shexp`) | `src/models/step35.cpp:28-29` | ferrox has a `swiglu_oai` clamp for gpt-oss only (`decoder.rs:400-403`) | **Probably parameterisable** from the gpt-oss clamp |
-| `smallthinker` | `LLM_FFN_RELU` experts, not SiLU | `src/models/smallthinker.cpp:158` | No ReLU variant in `FfnActivation` (`config.rs:304-312`) | **New code**, tiny |
+| `smallthinker` | `LLM_FFN_RELU` experts, not SiLU; and the router reads `inpL`, the raw layer input | `src/models/smallthinker.cpp:111,151-161,158` | **CLOSED 2026-09-12.** `FfnActivation::Reglu` (gated `relu(gate) * up`, distinct from `arcee`'s aliased `ReluSqr`) and `ferrox_models::router_input` (`RouterInput::RawLayerInput`, captured before attention in `Decoder::router_operand`); `n_swa` pinned to 4096 as `smallthinker.cpp:8` does (`capability::swa_window_override`). Three libllama-golden fixtures, `tests/router_input_graphs.rs` | ~~New code, tiny~~ The activation was the small half; the router operand was the row's real blocker and no seam had touched it |
 | `olmo2`, `seed_oss`, `exaone4` | Required `attn_post_norm` and (olmo2, exaone4) `ffn_post_norm` applied after the branch, before the residual | `src/models/olmo2.cpp:47,52,161-163,178-180`; `seed-oss.cpp:37,114-116`; `exaone4.cpp:60,67,152-153,166-167` | ferrox HAS `post_attn_norm` / `post_ffn_norm` (they are two of the five features `north-star.md:9` records the paged path having lost, so they exist on the contiguous path) | **Likely a fixture away**, if the loader wires the slots for non-Gemma families. UNKNOWN until someone reads the wiring; `grep -n post_attn_norm crates/ferrox-models/src/loader.rs` settles it |
-| `bailingmoe2`, `ernie4_5-moe` | Sigmoid-routed MoE with `ffn_exp_probs_b` router bias, shared expert, `expert_weights_norm` | `src/models/bailingmoe2.cpp:61,169-171`; `ernie4-5-moe.cpp:86-88` | ferrox implements exactly this shape and `dots1` pins it (`capability.rs:280-284`) | **A fixture away.** No new code claimed |
+| `bailingmoe2`, `ernie4_5-moe` | ~~Sigmoid-routed~~ MoE with `ffn_exp_probs_b` router bias, shared expert, `expert_weights_norm` | `src/models/bailingmoe2.cpp:61,169-171`; `ernie4-5-moe.cpp:86-88` | ferrox implements exactly this shape and `dots1` pins it (`capability.rs:280-284`) | **CLOSED, and the sigmoid half was wrong.** `ernie4-5-moe.cpp:90` HARDCODES `LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX`; only `bailingmoe2` reads its gating function from the file (`bailingmoe2.cpp:11`). Both rows are audited now, and `routing_ernie_moe_through_sigmoid_instead_of_softmax_diverges_from_llama_cpp` is what stops the claim coming back |
+| `arctic` | A dense `{n_embd, n_embd}` FFN summed with the routed experts on every layer; the routed branch (router and experts) reading `ffn_norm_exps(inpSA)`, the layer input under a second norm | `src/models/arctic.cpp:38-48,118-154` | **CLOSED 2026-09-12.** `ferrox_models::parallel_dense_ffn` (two rows: `grok` Grok-2 with `sqrt(2)/2`, `arctic` required with no scale; the shared-expert slot under the dense names), `RouterInput::NormedLayerInput` (one row). libllama goldens for `arctic`, `arctic_wscale` (the key llama.cpp ignores) and `grok_dense_ffn`, `tests/parallel_dense_ffn_graphs.rs` | ~~New code~~ Two seams, one with reach two |
+| `plm` | DeepSeek-2 MLA attention on a dense model: direct `attn_q`, `attn_kv_a_mqa` / `attn_kv_a_norm` / `attn_kv_b`, ungated ReLU-squared FFN, tied lm_head | `src/models/plm.cpp:23-24,32-40,84-166,181-187`; `conversion/plm.py:14-19` | **CLOSED 2026-09-12** on the MLA engine: `ferrox_models::mla_arch` (the three-column table), `ferrox_models::mla_q_proj` (direct or low-rank Q; the lite DeepSeek-V2 rule with it), `MlaDenseFfn::act`. libllama golden, KL 1.87e-13, `tests/plm_graphs.rs` -- the MLA engine's first. The engine refuses `rope.scaling.type` by name now | ~~New code~~ Three columns on an engine that had the attention |
+| `talkie` | No norm weights, a `{1, n_head}` Q gain after RoPE, an embedding skip stream, `attn_output.scale` / `ffn_down.scale`, `logit_scale` | `src/models/talkie.cpp:5,26,50-52,82-91,117,123-126,141`; `conversion/talkie.py:26-31` | **CLOSED 2026-09-12.** `NormOp::RmsNoParams`, `QkNormStyle::PerHeadScalar`, `ferrox_models::skip_stream`, and `ferrox_models::weight_scales` serving the two companions; `MultiplierSupport::TALKIE`. Two libllama-golden fixtures, `tests/skip_stream_graphs.rs` | ~~New code~~ Four seams, each one graph of 140 |
+| `nanbeige` | Runs the same physical layers `num_loops` times, each logical layer with its own KV, `output_norm` between passes | `src/models/nanbeige.cpp:6-31,69-73,167-175` | **CLOSED 2026-09-12.** `ferrox_models::layer_loops`: `Decoder::layers` stays physical, `ModelConfig::n_layers` is logical, `Decoder::layer_for` is the one mapping, the loop norm sits at the end of both FFN bodies; the fused Metal launches refuse a looped model. Three libllama-golden fixtures, `tests/layer_loop_graphs.rs` | ~~New code~~ A mapping, not a copy |
+| `mimo2` | A V head width that differs from the K head width; `attention.value_scale` | `src/models/mimo2.cpp:47-48,52,132-140,152-154,180-183`; `conversion/mimo.py:154,163-165` | **CLOSED 2026-09-12.** `ferrox_models::kv_head_dims` (`ModelConfig::v_head_dim`, `KvCache::new_split`, `causal_gqa_attention_row`, the split prefill kernel) and `ferrox_models::attn_value_scale`; every fused Metal launch, the CUDA resident hook, the slot file and the KV block file refuse a split model. Three libllama-golden fixtures, `tests/split_kv_head_dim_graphs.rs` | ~~New code~~ Found `expert_weights_scale` honoured for every architecture where llama.cpp reads it in twenty loaders (`EXPERT_WEIGHTS_SCALE_READERS`) |
 | `minimax-m2` | Plain GQA, whole-vector QK norm, partial NEOX RoPE, sigmoid MoE with `exp_probs_b` | `src/models/minimax-m2.cpp:26,30-31,96-106,131-141` | Already stated in the refusal reason: "UNAUDITED, not unimplemented" | **A fixture away**; already tracked in roadmap `b2-close-the-68` |
 
 The finding that matters more than any individual row: **the refusal
@@ -636,7 +641,7 @@ These are the rows that matter most, because nothing errors.
 | `--rope-scaling`, `--rope-freq-base`, `--rope-freq-scale`, `--yarn-*` | `arg.cpp:2281-2340` | ALL MISSING | medium | M |
 | `-ot` / `--override-tensor`, `-cmoe` / `--cpu-moe`, `-ncmoe` | `arg.cpp:2670,2676,2683` | MISSING. **Notable**: this is per-tensor CPU/GPU placement, which is exactly what ferrox's `ferrox-core` expert-residency stack was built to execute and which nothing currently drives | high | L |
 | `-sm` / `--split-mode`, `-mg` / `--main-gpu`, `-ts` / `--tensor-split` | `arg.cpp:2717,2768,2741` | MISSING; ferrox has no multi-GPU concept | medium | XL |
-| `--lora` / `--lora-scaled` | `arg.cpp:2865,2875` | MISSING; no LoRA anywhere in the workspace | medium | XL |
+| `--lora` / `--lora-scaled` | `arg.cpp:2865,2875` | **DONE** (`run.rs`, `ferrox-server/src/cli.rs`; the adapter is a `WeightMatrix::Adapted` decoration in `ferrox-core/src/weight_matrix/lora.rs`, attached by name in `ferrox-models/src/lora_attach.rs`). Routed-expert targets, aLoRA and the dedicated engines refuse by name | -- | -- |
 | `-l` / `--logit-bias` | `arg.cpp:2193` | MISSING; the API refuses it by name on `/v1/completions` (`openai_extra.rs:198-207`) and silently drops it on chat (§3.2/E5) | medium | M |
 | `--keep`, `-r` / `--reverse-prompt`, `-sp` / `--special`, `--in-prefix`/`--in-suffix` | `arg.cpp:1630,1835,1842,1898,1906` | ALL MISSING | medium | S-M |
 | `--jinja` / `--no-jinja` | `arg.cpp:3571` | MISSING; ferrox always uses its own engine (`chat_template.rs`) | medium | S |
@@ -667,11 +672,11 @@ ferrox ships two binaries. Subcommands: `crates/ferrox-cli/src/main.rs:43-393`.
 | **`tools/perplexity`** (ppl, hellaswag, winogrande, KL-divergence) | **NONE.** `verify` / `parity` / `layer-divergence` compare against a reference implementation, not a corpus. Nothing in ferrox can answer "did this quantization hurt the model" -- which `roadmap.md:82` already names as `tooling-quality-eval` | high | M |
 | `tools/imatrix` | NONE | medium | L |
 | `tools/gguf-split` | NONE. ferrox *reads* shards (`ferrox_gguf::ShardedGguf`) but cannot produce or merge them | medium | M |
-| `tools/export-lora` | NONE | medium | L |
+| `tools/export-lora` | NONE. The adapter format and the merge arithmetic exist now (`ferrox_models::lora`), so this is a `quantize`-adjacent write path: dequantize each named tensor, add `scale * B A`, requantize, write. Not built with `--lora` because it did not fall out of it | medium | M |
 | `tools/mtmd` (multimodal) | NONE | medium | XL |
 | `tools/tokenize` | Partial: `ferrox parity tokenize` (`main.rs:202`) is a comparison harness, not a dump | low | S |
 | `tools/rpc`, `tools/tts`, `tools/cvector-generator` | NONE | low | XL |
-| `tools/batched-bench` | `ferrox serve-bench` (`main.rs:88`) covers it over HTTP; no HTTP-free equivalent | low | M |
+| `tools/batched-bench` | `ferrox batched-bench` (HTTP-free, drives `forward_multi_seq`; ported 2026-09-11); `ferrox serve-bench` covers the HTTP side | — | done |
 | `tools/fit-params` | `ferrox inspect-plan` (`main.rs:102-127`) is a genuine equivalent, arguably richer | -- | -- |
 | `tools/llama-bench` | `ferrox bench` (`main.rs:289`), an explicit work-alike with `--compare` | -- | -- |
 
@@ -733,7 +738,7 @@ llama.cpp's routes are one contiguous block,
 | **`POST /tokenize`** | `:259` | **PATH MISMATCH.** ferrox mounts `/v1/tokenize` (`lib.rs:4274`, `routes.rs:21`); llama.cpp has no `/v1/` spelling and ferrox has no bare one. Neither client works against the other | high | S |
 | **`POST /detokenize`** | `:260` | **PATH MISMATCH**, same (`lib.rs:4275`, `routes.rs:22`) | high | S |
 | `POST /apply-template` | `:261` | MISSING, despite an 860-line `chat_template.rs` | medium | S |
-| `GET /lora-adapters`, `POST /lora-adapters` | `:269-270` | MISSING | medium | XL |
+| `GET /lora-adapters`, `POST /lora-adapters` | `:269-270` | **DONE** (`ferrox-server/src/lora.rs`), with the per-request `lora` field on the three completion routes. Differences from upstream are named there: an unknown id is a 400 rather than ignored, and a scale change is exclusive against the generations in flight rather than a per-slot list | -- | -- |
 | **`GET /slots`** | `:272` | **MISSING.** Nearest are ferrox-only and differently shaped: `/v1/stats` (`lib.rs:4252`), `/v1/requests` (`:4253`), `/v1/cache/status` (`:4254`) | high | M |
 | `POST /slots/:id` (save/restore/erase) | `:273` | MISSING; no KV save/restore to disk | medium | L |
 | `POST /models`, `/models/load`, `/models/unload` | `:226-228` | ferrox has `/admin/models{,/load,/unload}` (`lib.rs:4283-4285`) -- same capability, different paths | low | S |
@@ -1047,3 +1052,49 @@ belongs in the gap inventory because "same or better performance on the
 same models" is the goal and a KL of 7.7e-3 is the sort of thing that
 becomes a wrong answer at a longer context or a narrower top-2 margin —
 gemma-2's margin here is 4.7e-2, which is not much headroom.
+
+### 10.1 Measured 2026-09-12: on PLM's MLA, Q8_0 drifts too, and it is llama.cpp's loss
+
+The section above says `Q8_0` activations MATCH. That held for every
+generic-path checkpoint measured (Llama-3.2-1B Q8_0: 2.4e-4 with flash
+attention off, 6.9e-4 with it on) and does NOT hold for the first real
+MLA checkpoint put in front of `ferrox parity`: **PLM-1.8B-Instruct
+Q8_0** reads `WRONG` at KL 3.54e-2 (top-1 agrees, top-10 overlap 9/10).
+
+The arbiter is the dequantized file (`scripts/dequantize_gguf.py`
+writes the same checkpoint as ALL_F32; 6.8 GiB), run through both
+engines with `--dump-logits`, on the same five token ids:
+
+| | KL |
+|---|---|
+| llama.cpp f32 vs ferrox f32 (the graph) | **4.53e-5** |
+| llama.cpp f32 vs llama.cpp Q8_0 (llama.cpp's own quantization loss) | **3.72e-2** |
+| llama.cpp f32 vs ferrox Q8_0 (ferrox's) | **4.52e-5** |
+| ferrox f32 vs ferrox Q8_0 | 2.8e-9 |
+| llama.cpp Q8_0 vs ferrox Q8_0 (what `parity` reports) | 3.54e-2 |
+
+So the graph agrees to 4.5e-5 (the residual is llama.cpp's F16 KV
+cache; the F32 fixtures agree to 1e-13), ferrox's Q8_0 inference is
+2.8e-9 from its own f32 -- Q8_0 WEIGHTS are that lossless -- and the
+entire `WRONG` is the reference's 8-bit ACTIVATION quantization, which
+on this graph costs three orders of magnitude more than on a Llama.
+Where it bites was bisected on a real-dims synthetic fixture, quantizing
+one tensor at a time: `attn_kv_a_mqa` and `attn_kv_b` Q8_0 each move
+llama.cpp 7e-2 from the f32 answer, `attn_q` 8e-3, `attn_output` 1e-4,
+`ffn_up` 4e-8. The compressed latent (`kv_lora_rank = 512` wide,
+RMS-normed) is quantized to Q8_0 in 32-wide blocks before `kv_b`
+re-expands it into every head's K and V, and MLA latents carry the
+outlier channels that per-block 8-bit quantization is worst at.
+
+Two things follow. `ferrox parity`'s `WRONG` line for Q8_0 (1e-2
+absolute, from llama.cpp's build-to-build spread) assumes the reference
+is exact to within noise on Q8_0, and on MLA it is not; the dequantized
+file is the way to tell, and the recipe is in `docs/CLI.md`. And the
+number worth having about PLM is the other one: ferrox serves the Q8_0
+file at 4.5e-5 from f32 where llama.cpp serves it at 3.7e-2.
+
+The same run found that llama.cpp aborts on this file with flash
+attention on (`ggml_set_rows: GGML_ASSERT(a->ne[0] == b->ne[0])` from
+`build_attn`, K head 192 / V head 128; 1269cb1), so
+`LLAMA_LOGITS_FLASH_ATTN=0` was added to the dumper; that is
+llama.cpp's defect, not measured here beyond noting it.

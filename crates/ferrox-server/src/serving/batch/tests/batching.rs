@@ -58,17 +58,11 @@ fn continuous_batching_composes_with_paged_kv() {
         let par = GenerationParams {
             reasoning: None,
             max_tokens: params[i].max_tokens,
-            sampling: SamplingParams {
-                temperature: params[i].sampling.temperature,
-                top_p: params[i].sampling.top_p,
-                min_p: params[i].sampling.min_p,
-                top_k: params[i].sampling.top_k,
-                repetition_penalty: params[i].sampling.repetition_penalty,
-                penalty_last_n: 64,
-                presence_penalty: params[i].sampling.presence_penalty,
-                frequency_penalty: params[i].sampling.frequency_penalty,
-                sampler_order: params[i].sampling.sampler_order,
-            },
+            // Cloned rather than field-by-field: a hand-written copy
+            // of `SamplingParams` is this repo's dominant defect at its
+            // smallest, and this one already omitted every sampler
+            // added after it was written.
+            sampling: params[i].sampling.clone(),
             seed: params[i].seed,
             stop: vec![],
             stop_token_ids: Vec::new(),
@@ -76,6 +70,8 @@ fn continuous_batching_composes_with_paged_kv() {
             grammar: None,
             cancel: params[i].cancel.clone(),
             ignore_eos: false,
+            reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+            lora: None,
         };
         threads.push(thread::spawn(move || {
             barrier.wait();
@@ -127,7 +123,7 @@ fn a_window_model_slides_while_continuously_batched() {
     let block_size = 4;
     let mut cfg = test_dense_fixture();
     cfg.sliding_window = Some(window);
-    cfg.swa_pattern = None;
+    cfg.swa_layers = ferrox_models::swa_layers::SwaLayers::All;
     let vocab = cfg.vocab_size;
     let decoder = Arc::new(Decoder::new_random_small(cfg, 2, vocab));
     assert_eq!(decoder.config.uniform_sliding_window(), Some(window));
@@ -248,17 +244,11 @@ fn continuous_batch_matches_sequential_generate_token_ids() {
         let par = GenerationParams {
             reasoning: None,
             max_tokens: params[i].max_tokens,
-            sampling: SamplingParams {
-                temperature: params[i].sampling.temperature,
-                top_p: params[i].sampling.top_p,
-                min_p: params[i].sampling.min_p,
-                top_k: params[i].sampling.top_k,
-                repetition_penalty: params[i].sampling.repetition_penalty,
-                penalty_last_n: 64,
-                presence_penalty: params[i].sampling.presence_penalty,
-                frequency_penalty: params[i].sampling.frequency_penalty,
-                sampler_order: params[i].sampling.sampler_order,
-            },
+            // Cloned rather than field-by-field: a hand-written copy
+            // of `SamplingParams` is this repo's dominant defect at its
+            // smallest, and this one already omitted every sampler
+            // added after it was written.
+            sampling: params[i].sampling.clone(),
             seed: params[i].seed,
             stop: vec![],
             stop_token_ids: Vec::new(),
@@ -266,6 +256,8 @@ fn continuous_batch_matches_sequential_generate_token_ids() {
             grammar: None,
             cancel: params[i].cancel.clone(),
             ignore_eos: false,
+            reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+            lora: None,
         };
         threads.push(thread::spawn(move || {
             barrier.wait();
@@ -452,11 +444,7 @@ fn prefill_chunking_does_not_change_logits() {
     let prompt: Vec<usize> = (0..11).map(|i| (i * 3 + 1) % 16).collect();
 
     let mut sequential: Vec<f32> = Vec::new();
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     for (pos, &tok) in prompt.iter().enumerate() {
         sequential = decoder.forward_token(tok, pos, &mut caches);
     }

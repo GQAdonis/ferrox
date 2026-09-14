@@ -187,8 +187,12 @@ pub fn run(args: QuantSensitivityArgs) -> anyhow::Result<()> {
 
     let prompt = args.prompt.clone().unwrap_or_else(|| PROMPT.to_string());
     let path = crate::pull::resolve_model_path(&args.model)?;
-    let (mut decoder, tokens, _eos) =
-        crate::verify_engine::load_and_tokenize(Path::new(&path), &prompt, args.prompt_tokens)?;
+    let (mut decoder, tokens, _eos) = crate::verify_engine::load_and_tokenize(
+        Path::new(&path),
+        &prompt,
+        ferrox_models::tokenizer::SpecialTokens::Parse,
+        args.prompt_tokens,
+    )?;
 
     let n_layers = decoder.layers.len();
     let (from, to) = parse_layer_range(args.layers.as_deref(), n_layers)?;
@@ -417,9 +421,7 @@ fn percentile(xs: &mut [f64], q: f64) -> f64 {
 }
 
 fn last_logits(decoder: &Decoder, tokens: &[usize]) -> Vec<f32> {
-    let mut caches: Vec<KvCache> = (0..decoder.layers.len())
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     decoder.forward_batch_last(tokens, 0, &mut caches)
 }
 

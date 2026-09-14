@@ -4,7 +4,7 @@
 //! `.gguf` **file** through either the generic `Decoder` path or
 //! [`ferrox_models::load_mla_engine_from_path`] for MLA architectures
 //! (deepseek2 / mistral4 dense-lead), or [`ferrox_models::load_glm52_engine_from_path`]
-//! for GLM-5.2 / GLM4-family GGUFs (`glm-dsa`, `glm4`, `glm4moe`) when
+//! for GLM-5.2 GGUFs (`glm-dsa`) when
 //! the file itself names via `tokenizer.ggml.model`
 //! (`gpt2` -> `GgufBpeTokenizer`, `llama` -> `GgufSpmTokenizer`, `t5` ->
 //! `GgufUnigramTokenizer`); or a Kimi K3 checkpoint **directory** (real
@@ -29,7 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ferrox_gguf::ShardedGguf;
-use ferrox_models::tokenizer::StopTokens;
+use ferrox_models::tokenizer::{SpecialTokens, StopTokens};
 use ferrox_models::{
     deepseek_v4_pro, glm_5_2, kimi_k3, load_gemma4_engine_from_path, load_glm52_engine_from_path,
     load_mla_engine_from_path, select_engine_kind, ByteTokenizer, Decoder, Gemma4Engine,
@@ -157,13 +157,28 @@ pub enum ServerTokenizer {
 }
 
 impl ServerTokenizer {
-    pub fn encode(&self, text: &str) -> Vec<usize> {
+    /// `specials` is llama.cpp's `parse_special`. Every route picks the
+    /// setting its llama.cpp counterpart uses; see the callers of
+    /// `Model::encode`.
+    pub fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<usize> {
         match self {
-            ServerTokenizer::Bpe(t) => t.encode(text).into_iter().map(|id| id as usize).collect(),
-            ServerTokenizer::Spm(t) => t.encode(text).into_iter().map(|id| id as usize).collect(),
-            ServerTokenizer::Unigram(t) => {
-                t.encode(text).into_iter().map(|id| id as usize).collect()
-            }
+            ServerTokenizer::Bpe(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
+            ServerTokenizer::Spm(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
+            ServerTokenizer::Unigram(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
+            // A byte vocabulary has no special entries, so the setting
+            // has nothing to select.
             ServerTokenizer::Byte => ByteTokenizer::encode(text)
                 .into_iter()
                 .map(|id| id as usize)
@@ -204,8 +219,8 @@ impl ServerTokenizer {
 }
 
 impl TextTokenizer for ServerTokenizer {
-    fn encode(&self, text: &str) -> Vec<usize> {
-        ServerTokenizer::encode(self, text)
+    fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<usize> {
+        ServerTokenizer::encode(self, text, specials)
     }
 
     fn decode(&self, ids: &[usize]) -> String {
@@ -363,9 +378,11 @@ fn load_encoder_checkpoint(path: &str) -> anyhow::Result<Arc<ferrox_models::Embe
 /// real download with "missing hparam glm4moe.attention.q_lora_rank" --
 /// true, and about a key the architecture is not supposed to have.
 /// Refusing on the generic path names the norm slot that is genuinely
-/// missing instead. See `ferrox-models/tests/glm4moe_refusal.rs`.
+/// missing instead, and runs it there since 2026-09-12
+/// (`ferrox-models/tests/glm4moe_graphs.rs`). `glm4` (GLM-4-0414) left
+/// the same day for the same reason (`tests/glm4_graphs.rs`).
 fn is_glm52_arch(arch: &str) -> bool {
-    matches!(arch, "glm-dsa" | "glm4")
+    arch == "glm-dsa"
 }
 
 pub fn load() -> anyhow::Result<LoadedModel> {
@@ -409,12 +426,15 @@ fn load_gguf_file(path: &str) -> anyhow::Result<LoadedModel> {
             return load_encoder_checkpoint(path).map(LoadedModel::Encoder);
         }
         if is_glm52_arch(arch) {
+            crate::lora::refuse_env_for_engine("GLM-5.2")?;
             return load_glm52_checkpoint(path, &file).map(LoadedModel::Glm52);
         }
         if matches!(select_engine_kind(arch), Ok(SelectedEngineKind::Mla)) {
+            crate::lora::refuse_env_for_engine("MLA")?;
             return load_mla_checkpoint(path, &file).map(LoadedModel::Mla);
         }
         if matches!(select_engine_kind(arch), Ok(SelectedEngineKind::Gemma4)) {
+            crate::lora::refuse_env_for_engine("Gemma-4")?;
             return load_gemma4_checkpoint(path, &file).map(LoadedModel::Gemma4);
         }
     }
@@ -622,7 +642,10 @@ fn load_real_gguf_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<G
     // automatic decision needs and why it cannot be made without a path.
     let weight_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let expert_cache_bytes = expert_cache_bytes_for(weight_bytes)?;
-    let decoder = Decoder::from_gguf_with_expert_cache(path, config, expert_cache_bytes)?;
+    let mut decoder = Decoder::from_gguf_with_expert_cache(path, config, expert_cache_bytes)?;
+    // After the base, before it becomes the active model: an adapter the
+    // checkpoint does not fit fails the load by name.
+    crate::lora::attach_from_env(&mut decoder, file)?;
 
     Ok(GgufLoaded {
         decoder,
@@ -816,6 +839,7 @@ fn build_synthetic_decoder(preset: &str) -> anyhow::Result<Decoder> {
 pub fn load_from_path(path: &str) -> anyhow::Result<LoadedModel> {
     let path = ferrox_models::hf_pull::resolve_model_path(path)?;
     if Path::new(&path).is_dir() {
+        crate::lora::refuse_env_for_engine("Kimi")?;
         load_real_kimi_checkpoint(&path).map(LoadedModel::Kimi)
     } else {
         load_gguf_file(&path)
@@ -829,7 +853,7 @@ mod glm_dispatch_tests {
     #[test]
     fn glm4moe_does_not_go_to_the_mla_loader() {
         assert!(!super::is_glm52_arch("glm4moe"));
+        assert!(!super::is_glm52_arch("glm4"));
         assert!(super::is_glm52_arch("glm-dsa"));
-        assert!(super::is_glm52_arch("glm4"));
     }
 }

@@ -24,6 +24,8 @@ namespaces, and the prefix tells you which:
 | `FERROX_MODEL_DIR` | Extra directory `GET /admin/models` scans, and the one `POST /admin/download` writes into. Without it, the directory holding `FERROX_MODEL_PATH` is used; with neither, downloads are refused (`412`) rather than guessing a location |
 | `FERROX_ADDR` | Bind address, e.g. `127.0.0.1:8383` |
 | `FERROX_API_KEY` | Require `Authorization: Bearer <key>`. Also gates the whole `/admin` control surface, which can swap models and write files |
+| `FERROX_LORA` | Comma-separated `path:scale` LoRA adapter specs, what `--lora` / `--lora-scaled` lower to. Read at every model load, so a hot-swapped checkpoint gets the same adapters or is refused by name |
+| `FERROX_LORA_INIT_WITHOUT_APPLY` | `1`, load the adapters at scale 0 until `POST /lora-adapters` sets them (`--lora-init-without-apply`) |
 
 ## Hugging Face
 
@@ -49,11 +51,11 @@ library or overriding the CLI.
 | `FERROX_VULKAN_LOADER` | Path to a `libvulkan` the loader should use. Only needed when the platform default is not found; the error names this variable |
 | `FERROX_MODEL_NAME` | What the served model is called in `/v1/models` and every response's `model` field. Same as `--alias`. Read in one place, so it cannot apply to some routes and not others |
 | `FERROX_CACHE` | Where `-hf` puts downloaded checkpoints. Default `$XDG_CACHE_HOME/ferrox`, else `~/.cache/ferrox`; models go under `hub/<owner>__<repo>/`. llama.cpp spells this `LLAMA_CACHE` |
-| `FERROX_KV_WINDOW` | `1` evicts KV rows behind a sliding window on the CPU contiguous store. **Off by default.** Gemma-3-4B at 32768 tokens holds 1.69 GiB at rest instead of 9.13 GiB, with a 1.95 GiB prefill peak. Output is token-identical either way, tested on a real quantized SWA checkpoint. Turns itself off under `FERROX_METAL_ATTN`, and does not apply to a draft model; disables the prefix cache, which cannot represent a windowed cache. See the note below |
-| `FERROX_CPU_POOL` | `rayon` (default) or `spin`. `spin` runs decode on a persistent pool parked on a spin-then-park barrier, the shape llama.cpp's `ggml_threadpool` uses, instead of forking and joining per operation. **Opt-in, and measured on 2026-09-04.** On a quiet 20-core Cortex-A725 (aarch64, `tg128`, 19 threads) `spin` is **+123% at 3B and +87% at 8B**, which takes decode from LOSING to llama.cpp to beating it: 23.14 vs 17.86 tok/s at 3B, 12.41 vs 9.06 at 8B on the same host and file. On a quiet 10-core Xeon it is +49% / +23% / +15% at 135M / 3B / 8B. **The exception is very small models**: at 135M it is 37% SLOWER on aarch64 (and 31% slower on an M2 Pro), reproducibly and on quiet hosts, so it is not contention. That is why this is still opt-in rather than the default. Output is token-identical on both settings, which is tested |
+| `FERROX_KV_WINDOW` | `1` evicts KV rows behind a sliding window on the CPU contiguous store. **Off by default.** Gemma-3-4B at 32768 tokens holds 1.69 GiB at rest instead of 9.13 GiB, with a 1.96 GiB admission ceiling, and `--ctx-size auto` is priced against that ceiling rather than the unwindowed one. Output is token-identical either way, tested on a real quantized SWA checkpoint. Turns itself off under `FERROX_METAL_ATTN`, and does not apply to a draft model; disables the prefix cache, which cannot represent a windowed cache. See the note below |
+| `FERROX_CPU_POOL` | **An A/B override, not the decision.** Unset, the scheduler is chosen **per operation from its size**: an operation carrying at least `par::policy::SPIN_MIN_OP_MACS` multiply-accumulates (2.1M, i.e. `rows x cols`) runs on a persistent pool parked on a spin-then-park barrier, the shape llama.cpp's `ggml_threadpool` uses; anything smaller forks and joins with rayon as before. `spin` / `persistent` / `1` / `on` pins the pool at every size; `rayon` / `0` / `off` pins fork-join at every size and is the exact revert. The rule exists because the pool is not uniformly better, **measured on 2026-09-04**: on a quiet 20-core Cortex-A725 (aarch64, `tg128`, 19 threads) it is **+123% at 3B and +87% at 8B**, taking decode from LOSING to llama.cpp to beating it (23.14 vs 17.86 tok/s at 3B, 12.41 vs 9.06 at 8B), and **-37% at 135M**, reproducibly and on quiet hosts, so it is not contention. On a quiet 10-core Xeon it is +49% / +23% / +15% at 135M / 3B / 8B. The crossover constant is *bracketed* by those model-level numbers rather than swept; see its doc comment. Output is token-identical on all settings, which is tested |
 | `FERROX_CPU_POOL_SPIN_US` | Microseconds a `spin` worker spins before parking. Default 100. A pool that never parks burns a core per thread on an idle server |
 | `FERROX_CPU_THREADS` | Worker threads; same as `-t`. Default: **performance cores** (`hw.perflevel0.physicalcpu` on macOS), matching llama.cpp, not logical cores |
-| `FERROX_CPU_INT_DOT` | int8×int8 matvec + repacked GEMV. **On by default** in `ferrox` / `ferrox-server`; `0` opts out. Off in the library so golden cross-validation stays reference-exact |
+| `FERROX_CPU_INT_DOT` | int8×int8 matvec + repacked GEMV/GEMM. **On by default** in `ferrox` / `ferrox-server`; `0` opts out. Off in the library so golden cross-validation stays reference-exact. It is the master switch, not the whole rule: which half of the tier a workload takes is per architecture. **aarch64** takes both halves. **x86_64 with AVX2+FMA** takes the batched GEMM (prefill) and leaves decode on the AVX2 f32 dot, because the int8 matvec measured 4x to 8.8x slower there (#127) while the batch half has AVX2 kernels for Q4_K, Q5_K, Q6_K, Q8_0 and Q4_0 (#152). An x86 host without AVX2 takes neither. Either half repacks weights into the interleaved layout, so the retained copies are bounded by `FERROX_REPACK_CACHE_BYTES` below — on x86 this is what starts spending that budget, since nothing repacked there before |
 | `FERROX_METAL_FA_VEC` | `0`, disable llama-style FA-vec for decode **and** prefill and fall back to the legacy online-softmax GQA. Default **on** for `head_dim` in {64, 96, 128, 256}; other widths take the legacy kernel either way. Prefill at 64 / 128 / 256 with at least 8 new tokens goes further and takes the simdgroup-MMA `flash_attn_ext` kernel, which is not separately switchable |
 | `FERROX_METAL_SCRATCH_BUDGET_BYTES` | Ceiling on the pooled Metal scratch buffers (default 768 MiB). Past it a returned buffer is dropped rather than kept for reuse. Lower it on a small machine where the pool competes with the weights |
 | `FERROX_METAL_WEIGHT_CACHE_BYTES` | Ceiling on the resident Metal weight-buffer cache. Default is effectively unlimited, which is right on unified memory; cap it on a small machine. An unparseable value also means unlimited |
@@ -65,7 +67,11 @@ library or overriding the CLI.
 | Variable | Purpose |
 |---|---|
 | `FERROX_CONTINUOUS_BATCHING` | `1` enables, `0` disables. When unset on Metal builds with fused attention, continuous batching is **on by default** for safe parallel serving. Also: `ferrox serve --cont-batching` / `-cb`, `--no-cont-batching`. |
-| `FERROX_CB_MAX_SEQS` | Continuous batching: cap on in-flight sequences (llama.cpp `-np`). CLI: `-np N` / `--parallel N`. Default: unlimited |
+| `FERROX_CB_MAX_SEQS` | Continuous batching: cap on in-flight sequences (llama.cpp `-np`). CLI: `-np N` / `--parallel N`. Default: unlimited. Reported as `ferrox_scheduler_max_seqs` on `/metrics` |
+| `FERROX_CB_PREFILL_CHUNK`, `FERROX_CHUNKED_PREFILL` | Prompt tokens per forward pass, on the batch scheduler and the private decode loop respectively. One number with two spellings; `-b` / `-ub` set both from one value (the smaller of the two flags, llama.cpp's own rule). Defaults: 128 on the scheduler, unchunked on the private loop |
+| `FERROX_SLOT_SAVE_PATH` | Directory for slot files (`POST /slots/{id}?action=save\|restore`). CLI: `--slot-save-path DIR`. Unset means the route refuses with a 501 naming the flag. Requires `FERROX_PREFIX_CACHE_ENTRIES`, which is where a restored slot lives |
+| `FERROX_REASONING_BUDGET` | Server default for `reasoning_budget_tokens`: `-1` unrestricted, `0` end the thought as it opens, `N` tokens of thought before the closer is forced. CLI: `--reasoning-budget N`. Default: `-1` |
+| `FERROX_PREFILL_ASSISTANT` | Whether a trailing assistant message is continued by default (`continue_final_message` auto). `0`/`false` off. CLI: `--prefill-assistant` / `--no-prefill-assistant`. Default: on, as llama.cpp |
 | `FERROX_CB_PREFILL_CHUNK` | Continuous batching: prompt tokens per prefill chunk (default `128`). The scheduler runs one chunk plus one batched decode step per tick, so this is the granularity at which a long prompt yields to in-flight decodes |
 | `FERROX_CB_MAX_QUEUE` | Continuous batching: requests allowed to wait for admission (default `512`). Past it, new requests get `503` + `Retry-After` instead of queueing without bound |
 | `FERROX_CB_KV_BLOCKS` | Continuous batching: total KV blocks the scheduler may hand out. Unset means it is *derived* at load alongside `FERROX_CB_MAX_CONTEXT`, or absent when the model cannot be priced. Admission is `blocks_needed <= blocks_free`, where a request needs `ceil((prompt + max_tokens) / block_size)` blocks reserved for its whole lifetime |
@@ -86,6 +92,7 @@ library or overriding the CLI.
 | `FERROX_PAGED_KV_SLIDE_INTERVAL` | Decode steps between window slides on a paged store (default 128). Only applies when *every* layer of the served model slides by the same window, because a page group holds one block in each layer, so a single full-attention layer disables sliding entirely. A smaller number returns pages sooner and costs a page operation more often; the admission bound pays for whatever accumulates in between |
 | `FERROX_PREFIX_CACHE_ENTRIES` | Prefix-cache capacity for the private generate path: whole KV snapshots in an LRU list, reported under `GET /cache/stats`. Mutually exclusive with continuous batching and with paged KV. Paged KV carries no such exclusion: it composes with continuous batching and shares prefixes through the radix tree instead |
 | `FERROX_EXPERT_CACHE_BYTES` | MoE expert-streaming cache budget |
+| `FERROX_REPACK_CACHE_BYTES` | Bytes the interleaved-weight (`repack`) cache may retain. **`0` disables it**, which makes every CPU matvec rebuild its interleaved copy per call: the behaviour before that cache existed, correct and slower, and the way to run a memory-constrained host. Unset, the budget is derived from what the host says is available, less the standard fit headroom, less whatever `FERROX_EXPERT_CACHE_BYTES` has committed, divided by four — the expert budget is subtracted from the same pool rather than competing with it, because on unified memory a repacked byte and an expert byte are the same RAM. The cache evicts least-recently-used entries to stay under whatever it gets, and a matrix that does not fit is packed uncached. Retaining these copies is worth ~90% of a CPU decode token on Q8_0 (#128) and cost +527 MB of peak footprint at TinyLlama-1.1B Q8_0 unbounded |
 | `FERROX_SSD_STREAMING` | `1`, stream MoE experts from disk |
 
 Streaming is **off by default and turns itself on only when the weights
@@ -134,9 +141,12 @@ Held by `cargo test -p ferrox-models --features metal --test
 paged_metal_parity -- --ignored`, which greedy-decodes the same prompt
 twice in one process, once through each cache, on a dense model, an MoE
 model and a sliding-window model. It runs one model per process on
-purpose: two checkpoints loaded into a single process do not answer the
-same as either alone on Metal, which is a separate bug and not one this
-check should be at the mercy of.
+purpose: two checkpoints in one process used not to answer the same as
+either alone on Metal, because the resident-buffer caches keyed on a
+host address a dropped model's allocator had already handed on. That
+was GitHub issue #180 and is fixed; `model_swap_isolation` is the check
+that holds it, and the per-process isolation here stays because this
+suite should not be at the mercy of it either way.
 
 `FERROX_PREFIX_CACHE_ENTRIES` had the same bug and no refusal in front
 of it. A stored snapshot is the host rows, so on Metal it was all zeros,
@@ -211,6 +221,7 @@ do that without a GPU capture.
 |---|---|
 | `FERROX_METAL_MM_TIMING` | `1`, accumulate **wall-clock** setup / GPU-wait / readback microseconds across the prefill GEMM paths and print the totals. This is how long the host waited, which is what a `pp512` number is made of |
 | `FERROX_METAL_GPU_TIMING` | `1`, accumulate **GPU-clock** milliseconds per tagged submission (`moe-decode/tok`, `dense-decode/tok`, `prefill-dense-stack`) from the command buffer's own timestamps, and print a running mean. Different question from the above: this one excludes host stalls |
+| `FERROX_METAL_KERNEL_TIMING` | `1`, attribute the dense decode stack's GPU time to dispatch KINDS (matvec, attention, norm, RoPE, ...) and print a table. Apple GPUs sample the timestamp counter only at encoder boundaries, so every op group gets its own sampled encoder while this is on: the small-kernel rows carry an encoder boundary each and the between-encoder gaps are their own row. The ratio between two builds or two models measured the same way is the number it exists for |
 | `FERROX_METAL_BARRIER_LOG` | `1`, log the running barriers-per-op ratio from `MemRanges`. `1.00` means the pass is fully serialised; lower means dispatches are overlapping. This is the direct measure of what a graph change bought |
 
 ## Test and development fixtures
@@ -222,7 +233,7 @@ tests that read them skip instead.
 
 | Variable | Purpose |
 |---|---|
-| `FERROX_TEST_MODELS_DIR` | Root the real-GGUF sweeps scan (default `models`). Read by `bos_policy`, `chat_template_real_gguf` and `paged_metal_parity` -- a git worktree has no `models/` of its own, which is what this is for. Unrelated to `FERROX_MODEL_DIR`, which is server config |
+| `FERROX_TEST_MODELS_DIR` | Root the real-GGUF sweeps scan (default `models`). Read by `bos_policy`, `chat_template_real_gguf`, `paged_metal_parity` and `model_swap_isolation` -- a git worktree has no `models/` of its own, which is what this is for. Unrelated to `FERROX_MODEL_DIR`, which is server config |
 | `FERROX_TEST_GEMMA2_GGUF` | Gemma-2 GGUF for the Metal quality gate |
 | `FERROX_TEST_QWEN2MOE_GGUF` | Qwen2-MoE GGUF for the "capital of France" check |
 | `FERROX_TEST_SMOLLM2_GGUF` | SmolLM2 GGUF for the same check on Metal |
@@ -269,12 +280,19 @@ What it saves, on Gemma-3-4B at 32768 tokens of host f32 KV:
 |---|---|
 | Off (every layer holds everything) | 9,126,805,504 |
 | On, at rest | 1,692,590,080 |
-| On, prefill peak | 1,948,942,336 |
+| On, admission ceiling (prefill peak) | 1,962,934,272 |
 
 The peak is not the full 9.13 GiB because prefill evicts per layer: one
 layer holds the whole prompt at a time rather than all 34 at once. Five
 of the 34 layers are full attention and still hold everything, which is
 most of what remains.
+
+The ceiling prices each windowed layer at `window + slack` rows -- the
+top of the cycle a draining cache runs through, `KvWindow::max_rows` --
+rather than at the exact instantaneous count, which oscillates. That
+costs 0.7% against a number that already carries a whole layer's prompt,
+and it buys a cost that never falls as the context grows, which is what
+`--ctx-size auto`'s search for the largest fitting context needs.
 
 **It is off by default because it is new, not because it is doubted.**
 Output is token-identical with it on or off, asserted on identical logit
@@ -292,7 +310,23 @@ It disables itself in three cases rather than guessing:
 - Beside the prefix cache, which refuses to store a windowed cache
   rather than hand back a truncation it cannot represent.
 
-The server's admission check still prices the full, unwindowed number.
-That is the safe direction and it is correct while the switch is off; a
-context is refused that would in fact have fit, rather than admitted and
-then OOM.
+**Admission and `--ctx-size auto` price what the switch really keeps.**
+`KvBudget` carries the same per-layer residency the stores evict with,
+so a run with the switch on is offered the context it can really carry
+instead of one divided by every layer's full per-token cost. On
+gemma-2-2b-it-Q4_K_M (window 4096 on 13 of 26 layers) against a
+3.72 GiB budget, `ctx auto` reads 6912 tokens with the switch off and
+7680 with it on; the same header at a 32768 context prices its KV line
+at 6.50 GiB off and 4.06 GiB on. With the switch off the residency says
+every layer keeps everything, which is the arithmetic this engine always
+had, asserted rather than assumed.
+
+What is still priced at the full number, because no store evicts there
+yet: the paged store ([#61](https://github.com/antonellof/ferrox/issues/61)
+step 4) and the prompt region while a prefill batch is being written
+(step 5).
+
+The byte figures inside a *context-length* refusal
+(`ContextCeiling::bytes_for`) are still the unwindowed ones. They are a
+message, not a decision -- the decision is the position ceiling above,
+which does know.

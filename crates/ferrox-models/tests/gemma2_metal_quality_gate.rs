@@ -15,7 +15,7 @@ use ferrox_core::cache::KvCache;
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::config::ModelConfig;
 use ferrox_models::decoder::Decoder;
-use ferrox_models::tokenizer::{should_add_bos_token, GgufSpmTokenizer};
+use ferrox_models::tokenizer::{should_add_bos_token, GgufSpmTokenizer, SpecialTokens};
 
 const PROMPT: &str = "The capital of France is";
 const MAX_NEW: usize = 24;
@@ -37,7 +37,11 @@ fn argmax(logits: &[f32]) -> usize {
 }
 
 fn greedy_continuation(decoder: &Decoder, tok: &GgufSpmTokenizer, file: &ShardedGguf) -> String {
-    let mut tokens: Vec<usize> = tok.encode(PROMPT).into_iter().map(|t| t as usize).collect();
+    let mut tokens: Vec<usize> = tok
+        .encode(PROMPT, SpecialTokens::Parse)
+        .into_iter()
+        .map(|t| t as usize)
+        .collect();
     if should_add_bos_token(file) {
         if let Some(bos) = file.metadata_u64("tokenizer.ggml.bos_token_id") {
             let bos = bos as usize;
@@ -46,9 +50,7 @@ fn greedy_continuation(decoder: &Decoder, tok: &GgufSpmTokenizer, file: &Sharded
             }
         }
     }
-    let mut caches: Vec<KvCache> = (0..decoder.config.n_layers)
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     let mut logits = decoder.forward_batch_last(&tokens, 0, &mut caches);
     let mut text = String::new();
     for _ in 0..MAX_NEW {

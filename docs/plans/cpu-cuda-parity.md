@@ -86,15 +86,25 @@ tok/s column cannot show.
 | Q5_K | yes | yes | **new** | yes |
 | Q6_K | yes | yes | **new** | yes |
 | Q5_0 | no | **new** | **new** | yes |
-| IQ4_XS / IQ4_NL | no | **no** | **no** | matvec+GEMM |
-| Q2_K, Q3_K | no | **no** | **no** | **no** |
+| IQ4_NL | yes | **new, unverified** | **new, unverified** | **no** |
+| IQ4_XS | yes | **new, unverified** | **new, unverified** | matvec+GEMM |
+| Q2_K | yes | **new, unverified** | **new, unverified** | **no** |
+| Q3_K | yes | **new, unverified** | **new, unverified** | **no** |
 | Q4_1, Q5_1, Q8_1 | no | **no** | **no** | **no** |
 | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S | IQ1_M only | **no** | **no** | **no** |
-| MXFP4 | yes | **no** | **no** | **no** |
+| MXFP4 | yes | **new, unverified** | **new, unverified** | **no** |
 
 "no" means the tensor is decoded on the host and the GPU is idle for
 that matmul. It still answers correctly, which is why this never
 surfaced as a bug.
+
+"new, unverified" means the kernel exists, its arithmetic is checked
+against `ferrox_quant` by a Rust twin, and for the GEMM the emitted
+CUDA C is executed on a host CPU and compared to that twin bit for bit
+(`crates/ferrox-cuda/tools/mul_mm_host_check/run.sh`, 75,042 positions
+over eleven kinds and three shapes each, zero mismatches on 2026-09-09).
+**No GPU has run it.** `cargo test -p ferrox-cuda --features cuda --
+--ignored` on a real device is the exit criterion, plus a bench row.
 
 ## The four kinds of gap, and why the distinction matters
 
@@ -228,13 +238,22 @@ could never have worked even had the diagnosis been right.
 **Exit:** tok/s against llama.cpp on the same GPU and model, with
 utilization already high on both sides. Not a utilization target.
 
-**The hazard to design around first.** Metal's equivalent
-(`take_resident_activation_if_matches`) matches on LENGTH alone, which
-is safe there only because exactly one site sets it and it is cleared
-aggressively. Copied to CUDA without that discipline, two same-length
-activations alias and the model silently answers wrong, which is worse
-than being slow. Whatever carries residency needs an identity the
-caller cannot get wrong, not a length comparison.
+**The hazard to design around first, and it was real.** Metal's
+equivalent used to match on LENGTH alone, which this note called safe
+"only because exactly one site sets it and it is cleared aggressively".
+It was not safe. There is one publisher but THREE consumers, each
+routinely handed a `hidden_dim`-long activation that is not the
+published one, and the publication was a thread-local raw pointer into
+`DECODE_SCRATCH` -- a process-wide `Mutex` the pointer escaped, so two
+concurrent `ferrox-server` requests could have one answer the other's
+`lm_head` with its own activation, lengths agreeing by construction.
+Fixed in `ferrox-metal/src/resident_act.rs` (issue #166): the
+publication lives inside the thing the mutex protects, records the host
+address and length of the exact vector the stack returned, is dropped by
+any borrow of the buffer it describes, and holds the guard while the
+buffer is bound. Read that module before writing the CUDA twin.
+Whatever carries residency needs an identity the caller cannot get
+wrong, not a length comparison.
 
 ### 3. Decide the CPU pool by work size, not by environment variable
 
@@ -250,16 +269,84 @@ the pool per operation.
 measured on both aarch64 and x86 rather than guessed. `spin` stops
 being a user-visible knob.
 
-### 4. Find the 60 ms (#128)
+### 4. Find the 60 ms (#128)  [NAMED 2026-09-10: rayon's cold submit]
 
-Flat in thread count and model size, so it is not fork-join and not
-arithmetic. At 8B it is 27% of the token; at 135M it is 93%.
+**The premise of this step was wrong twice, and both corrections are
+recorded because each one cost work.**
 
-It also caps speculative decoding, which runs a small model as the
-drafter and pays the constant on every draft token.
+The first framing, "a fixed ~60 ms per token, flat in model size", was
+corrected by #155: the cost was proportional to gate and up projection
+BYTES and fired only on Q8_0 and Q4_0, because the int-dot matvec
+repacked the whole weight matrix on every call. That was 89% to 90% of
+decode and it is fixed.
 
-**Exit:** the constant named and removed, and 135M decode within 2x of
-llama.cpp on a quiet host.
+The second framing, in a comment on #128, measured 5.48 us per
+fork-join region, multiplied by ~210 regions per token, got 6.7% of the
+token, and concluded scheduling could not be what remained. **The
+arithmetic was right and the denominator was stale.** It was taken
+against a 17.23 ms token, i.e. WITH the repack bug still inflating the
+work. Once #155 removed that work the token fell to about 5 ms and the
+same fixed dispatch became a much larger share of it.
+
+#### What it actually is
+
+`rayon::join` and the `par_iter` bridges both funnel into
+`Registry::in_worker`, which has two arms with very different costs.
+From a rayon worker: run one half inline, post the other for stealing,
+wait on a `SpinLatch`, no syscall. From any other thread: inject the
+job and block on a `LockLatch`, which is a pthread mutex and condvar.
+Every forward pass was driven from a thread rayon did not own, so it
+paid the second arm once per region, roughly five per layer.
+
+Sampled with `sample` on an M2 Pro over SmolLM2-135M Q8_0 `tg128`,
+CPU-only, `-t 6`:
+
+| | share of the driving thread's wall time |
+|---|---|
+| `__psynch_cvwait` under rayon's `LockLatch` | **74%** |
+| attention (`causal_gqa_attention_softcap`) | 10% |
+| the one matvec that ran inline (`o_proj`) | 5% |
+
+Across all twelve threads in that process, the NEON `q8_0x4` matvec
+kernel held 6.6% of the samples and `__psynch_cvwait` 63.7%. During the
+74% the driving thread spent asleep, the six workers it was waiting for
+held about an eighth as many kernel samples between them: most of the
+wait was the round trip, not the work.
+
+#### The fix, and what it measured
+
+`ferrox_core::par::on_workers` wraps a whole forward pass in one
+`rayon::scope`, so the step runs on a worker and every nested region
+takes the hot arm. `~150` cold entries per token become **one**.
+`decoder/entry.rs` is the one place every public `Decoder::forward_*`
+does this, and `par::cold_regions` is a per-thread operation counter so
+the property is a test rather than a stopwatch.
+
+Interleaved `main, branch, main, branch` on the M2 Pro, CPU only, which
+is NOT a benchmark host, so these are ratios and not ledger rows:
+
+| model | decode | prefill |
+|---|---|---|
+| SmolLM2-135M Q8_0 | **+29%** (4 of 4 rounds) | flat |
+| Llama-3.2-3B Q4_K_M | **+9%** (4 of 4 rounds) | flat |
+| Llama-3.1-8B Q4_K_M | +3%, swap-bound on this host | not run |
+
+Against `llama-bench` on the same host and file, best-of-3 at `tg64`,
+the gap moved from about 1.9x to about 1.5x. The host was too noisy for
+that number to be worth more than its order of magnitude; the
+main-versus-branch ratio is the reliable half.
+
+Metal and CUDA are deliberately NOT promoted. Moving the step off the
+main thread changes Metal's output (`Llama-3.2-3B Q4_K_M --ngl 99`,
+greedy, diverges around the tenth token, deterministically on both
+sides), because the Metal stack carries thread-local state across a
+step. `on_workers` asks `weight_matrix::active_backend` first, and with
+that gate the Metal answer is byte-identical to `main` over three runs.
+
+**Exit:** 135M decode within 2x of llama.cpp on a QUIET host. Still
+owed: the numbers above are from a laptop, so the ledger row in
+`benchmarks/RESULTS.md` has not moved and must be re-measured on the
+rented aarch64 box it was taken on.
 
 ### 5. x86 CPU  [DONE for decode, 2026-09-04]
 
@@ -296,17 +383,33 @@ in the wild uses it:
   Rust twin bit for bit; the matvec's C has no such harness and no GPU
   has run either. `cargo test -p ferrox-cuda --features cuda --
   --ignored` is the exit criterion, plus a Q5_0 bench row.
-- **CUDA IQ4_XS.** Metal has it; CUDA does not. It is a codebook
-  lookup, so it needs its own `MulMmKind` shape rather than an affine
-  `dequant_src`: the kernel needs the 16-entry `KVALUES_IQ4NL` table
-  visible to every thread (a `__constant__` array, not a per-block
-  scale) and its `dequant_src` contract would have to become "given
-  the block and `il`, index the codebook" rather than "multiply by a
-  scale and add a bias". The `dequant_twin` seam survives unchanged;
-  only the emitted helper's shape differs.
-- **Q2_K and Q3_K everywhere.** Common in small-memory builds, and
-  absent on all three GPU backends.
-- **MXFP4 on GPU.** gpt-oss ships it. CPU has it; no GPU does.
+- **CUDA IQ4_NL and IQ4_XS, landed 2026-09-09, UNVERIFIED ON
+  HARDWARE.** Matvec and GEMM together. They are codebook formats, so
+  `MulMmKind` grew a `codebook: Option<Codebook>` field and
+  `kernel_src` emits it as a `__constant__ float[16]` ahead of
+  `dequant_src`; the `dequant_twin` seam is unchanged, because its
+  contract was always "given the block and `il`, write 16 floats in
+  ascending element order" and a table lookup satisfies it exactly as
+  an affine transform does. The GEMM's `Codebook` row is ONE slice: the
+  emitter formats it into the CUDA and the Rust twin indexes it, so
+  there is nothing to drift. The matvec kernels are `&'static str` and
+  carry the sixteen values as a literal, which is a second structure --
+  `every_embedded_codebook_is_the_mul_mm_codebook` parses them back out
+  of the kernel text and holds them to the `Codebook`, bit for bit.
+- **MXFP4 on GPU, landed 2026-09-09, UNVERIFIED ON HARDWARE.** gpt-oss
+  ships it and no GPU backend had it at all, so every expert decoded on
+  the host with the device idle. Matvec and GEMM, the same codebook
+  seam, with the E2M1 table and an E8M0 scale helper. 17-byte blocks:
+  the only odd stride in the table, so nothing in either kernel may
+  assume a block pointer is aligned to anything.
+- **CUDA Q2_K and Q3_K, landed 2026-09-09, UNVERIFIED ON HARDWARE.**
+  Common in small-memory builds, and they were absent on all three GPU
+  backends. Matvec and GEMM, both affine. Q3_K is the fiddly one: its
+  third quant bit is a bit plane in `hmask` and it is INVERTED (a set
+  bit means bias 0, a clear one bias 4), and its six-bit scales use a
+  four-arm packing that is not Q4_K's. Sabotaging that inversion in the
+  emitted CUDA alone makes the host check report 3,968 mismatches out
+  of 4,096, so the check sees it. Metal still has neither.
 - The IQ1/IQ2/IQ3 family last: rare, and each is a separate codebook.
 
 **Exit per kind:** a kernel, a scalar twin, a `parity` run, and a bench
@@ -363,5 +466,5 @@ all, which is honest and temporary.
 | 4 fixed per-token cost | #128 | not started |
 | 5 x86 decode | #127 | **done**: default was wrong, 6.8x to 1.4x |
 | 5b x86 prefill | | not started, now the largest CPU gap (6x to 10x) |
-| 6 kernel coverage | | Q4_K/Q5_K/Q6_K landed on CUDA, Q5_0 2026-09-05 (unverified); 15 kinds still host-only |
+| 6 kernel coverage | | Q4_K/Q5_K/Q6_K landed on CUDA, Q5_0 2026-09-05, Q2_K/Q3_K/IQ4_NL/IQ4_XS/MXFP4 2026-09-09 (all unverified on hardware); 10 kinds still host-only |
 | 7 ledger | #126 | **done**: three hosts, and a committed-receipt check |

@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { AssistantRuntimeProvider } from "@assistant-ui/react";
 import * as Popover from "@radix-ui/react-popover";
-import { Link, useOutletContext } from "react-router";
+import { Link, useNavigate, useOutletContext, useParams } from "react-router";
 import {
   Check,
   ChevronDown,
+  History,
   Loader2,
-  MessagesSquare,
+  Search,
   SlidersHorizontal,
   SquarePen,
-  Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Field, Input, Textarea } from "@/components/ui/field";
@@ -29,6 +29,7 @@ import { cn } from "@/lib/utils";
 import { Thread } from "@/screens/chat/thread";
 import {
   DEFAULT_SAMPLING,
+  LEGACY_MAX_TOKENS,
   useFerroxRuntime,
   type Sampling,
 } from "@/screens/chat/runtime";
@@ -37,15 +38,27 @@ import {
   type Transcript,
 } from "@/screens/chat/persistence";
 import { conversationLabel } from "@/lib/conversations";
+import { parseReasoningBudget } from "@/lib/sampling-wire";
+import { describeAway, RESUME_WINDOW_MS } from "@/lib/entry-state";
+import { useTabActivity } from "@/lib/use-tab-activity";
 
-const SETTINGS_KEY = "ferrox.studio.sampling.v1";
+const SETTINGS_KEY = "ferrox.studio.sampling.v2";
+/** The shape whose default `maxTokens` was 512. */
+const LEGACY_SETTINGS_KEY = "ferrox.studio.sampling.v1";
 
 function loadSampling(): Sampling {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    return raw
-      ? { ...DEFAULT_SAMPLING, ...JSON.parse(raw) }
-      : { ...DEFAULT_SAMPLING };
+    if (raw) return { ...DEFAULT_SAMPLING, ...JSON.parse(raw) };
+    // A v1 blob was written on every change, so nearly every one of
+    // them carries the old default of 512 without the user ever having
+    // chosen it. That number is the bug this migration exists for: it
+    // is dropped, and any other value is kept as the choice it was.
+    const legacy = localStorage.getItem(LEGACY_SETTINGS_KEY);
+    if (!legacy) return { ...DEFAULT_SAMPLING };
+    const parsed = JSON.parse(legacy) as Partial<Sampling>;
+    if (parsed.maxTokens === LEGACY_MAX_TOKENS) delete parsed.maxTokens;
+    return { ...DEFAULT_SAMPLING, ...parsed };
   } catch {
     return { ...DEFAULT_SAMPLING };
   }
@@ -110,6 +123,9 @@ function useServingModel(healthModelId: string | null): [Loaded, () => void] {
   return [state, useCallback(() => setNonce((n) => n + 1), [])];
 }
 
+/** How often the switcher re-reads the inventory while a load is in flight. */
+const LOAD_POLL_MS = 1000;
+
 /**
  * Switch the served model without leaving the conversation.
  *
@@ -117,47 +133,120 @@ function useServingModel(healthModelId: string | null): [Loaded, () => void] {
  * per-request parameter — this server serves one checkpoint at a time.
  * The menu says so rather than implying the next message could pick a
  * different model on its own.
+ *
+ * The POST answers `202 Accepted` the moment the load task is QUEUED,
+ * not when the weights are in: a checkpoint takes seconds to minutes to
+ * mmap and probe. So the request's return is not the swap's end. The
+ * switcher polls `GET /admin/models`, whose entry for the target reads
+ * `loading` while the worker runs and then `loaded` or `error`, and the
+ * header shows a spinner with the target's name for the whole of that
+ * window — including after the menu is closed, which is where the old
+ * version went silent and the header kept naming the previous model.
  */
 function ModelSwitcher({
   active,
   onSwitched,
+  onLoadingChange,
 }: {
   active: string | null;
   onSwitched: () => void;
+  /** The id a load is in flight for, or `null` once it has a verdict. */
+  onLoadingChange: (id: string | null) => void;
 }) {
   const [inventory, setInventory] = useState<Inventory | null>(null);
   const [unsupported, setUnsupported] = useState(false);
-  const [busy, setBusy] = useState<string | null>(null);
+  /** The id a load was accepted for, until the server reports a verdict. */
+  const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Controlled, so that picking an entry closes the menu: the header
+  // trigger carries the spinner from there on, and an error re-opens
+  // nothing -- it is shown the next time the menu is opened.
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  // The parent disables the composer for the same window; one state,
+  // reported outward, so the two cannot disagree about when it ends.
+  useEffect(() => onLoadingChange(loading), [loading, onLoadingChange]);
+  const needle = query.trim().toLowerCase();
+  const visible = (inventory?.models ?? []).filter(
+    (m) =>
+      !needle ||
+      m.id.toLowerCase().includes(needle) ||
+      (m.quant ?? "").toLowerCase().includes(needle) ||
+      (m.arch ?? "").toLowerCase().includes(needle),
+  );
 
   const refresh = useCallback(() => {
-    getJson<Inventory>(routes.adminModels)
-      .then(setInventory)
+    return getJson<Inventory>(routes.adminModels)
+      .then((inv) => {
+        setInventory(inv);
+        return inv;
+      })
       .catch((e) => {
         if (e instanceof ApiError && e.isMissingEndpoint) setUnsupported(true);
+        return null;
       });
   }, []);
 
+  // While a load is in flight, the inventory is the source of truth for
+  // its outcome: `loading` -> keep waiting, `loaded` -> done, `error` ->
+  // the message the server kept for it. Anything else (the entry gone,
+  // another client unloaded it) ends the wait without a claim.
+  useEffect(() => {
+    if (!loading) return;
+    let cancelled = false;
+    const tick = async () => {
+      const inv = await refresh();
+      if (cancelled || !inv) return;
+      const entry = inv.models.find((m) => m.id === loading);
+      if (entry?.state === "loading") return;
+      if (entry?.state === "loaded" || inv.active === loading) {
+        onSwitched();
+      } else if (entry?.state === "error") {
+        setError(entry.error ?? `Loading ${loading} failed.`);
+      } else {
+        setError(`Loading ${loading} ended without a verdict from the server.`);
+      }
+      setLoading(null);
+    };
+    void tick();
+    const id = setInterval(tick, LOAD_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [loading, refresh, onSwitched]);
+
   const swap = async (id: string) => {
-    setBusy(id);
     setError(null);
     try {
       await postJson(routes.adminModelsLoad, { id });
-      onSwitched();
-      refresh();
+      setLoading(id);
+      setOpen(false);
     } catch (e) {
       setError((e as Error).message);
-    } finally {
-      setBusy(null);
     }
   };
 
   return (
-    <Popover.Root onOpenChange={(open) => open && refresh()}>
+    <Popover.Root
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (next) void refresh();
+      }}
+    >
       <Popover.Trigger asChild>
-        <Button variant="default" size="sm" className="max-w-[16rem]">
-          <span className="truncate font-mono text-[0.6875rem]">
-            {active ?? "no model loaded"}
+        <Button
+          variant="default"
+          size="sm"
+          className="max-w-[16rem]"
+          aria-busy={!!loading}
+        >
+          {loading ? (
+            <Loader2 className="size-3.5 shrink-0 animate-spin" />
+          ) : null}
+          <span className="truncate font-mono text-2xs">
+            {loading ?? active ?? "no model loaded"}
           </span>
           <ChevronDown className="text-faint" />
         </Button>
@@ -167,7 +256,7 @@ function ModelSwitcher({
           align="end"
           sideOffset={6}
           collisionPadding={12}
-          className="z-50 w-[min(24rem,calc(100vw-1.5rem))] rounded-card border border-line bg-raised p-1.5 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+          className="z-50 w-[min(24rem,calc(100vw-1.5rem))] rounded-xl border border-line bg-raised p-1.5 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
         >
           {unsupported ? (
             <p className="p-2 text-xs text-faint">
@@ -179,29 +268,48 @@ function ModelSwitcher({
           ) : !inventory.models.length ? (
             <p className="p-2 text-xs text-faint">
               No checkpoints found.{" "}
-              <Link to="/ui/models" className="text-accent underline">
+              <Link to="/ui/models" className="link">
                 Download one
               </Link>
               .
             </p>
           ) : (
+            <>
+              <div className="relative mb-1">
+                <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-faint" />
+                <input
+                  autoFocus
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search models"
+                  aria-label="Search models"
+                  className="h-8 w-full rounded-lg border border-line bg-inset pr-2 pl-8 text-xs text-fg placeholder:text-faint focus:border-fg/30 focus:outline-none"
+                />
+              </div>
+              {!visible.length ? (
+                <p className="p-2 text-xs text-faint">Nothing matches “{query}”.</p>
+              ) : null}
             <ul className="max-h-72 space-y-0.5 overflow-y-auto">
-              {inventory.models.map((entry) => {
+              {visible.map((entry) => {
                 const isActive = entry.id === inventory.active;
+                // The server's own view, so a load started by another
+                // client shows here too, not only one this menu began.
+                const isLoading =
+                  entry.id === loading || entry.state === "loading";
                 return (
                   <li key={entry.id}>
                     <button
                       type="button"
-                      disabled={isActive || !!busy}
+                      disabled={isActive || !!loading || isLoading}
                       onClick={() => swap(entry.id)}
                       className={cn(
                         "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors",
                         isActive
-                          ? "bg-accent-soft text-accent"
+                          ? "bg-inset font-medium text-fg"
                           : "hover:bg-inset disabled:opacity-50",
                       )}
                     >
-                      {busy === entry.id ? (
+                      {isLoading ? (
                         <Loader2 className="size-3.5 shrink-0 animate-spin" />
                       ) : isActive ? (
                         <Check className="size-3.5 shrink-0" />
@@ -212,10 +320,12 @@ function ModelSwitcher({
                         <span className="block truncate font-mono text-xs">
                           {entry.id}
                         </span>
-                        <span className="block truncate text-[0.6875rem] text-faint">
-                          {[entry.quant, entry.arch, fmtBytes(entry.size_bytes)]
-                            .filter(Boolean)
-                            .join(" · ")}
+                        <span className="block truncate text-2xs text-faint">
+                          {isLoading
+                            ? "loading…"
+                            : [entry.quant, entry.arch, fmtBytes(entry.size_bytes)]
+                                .filter(Boolean)
+                                .join(" · ")}
                         </span>
                       </span>
                     </button>
@@ -223,13 +333,14 @@ function ModelSwitcher({
                 );
               })}
             </ul>
+            </>
           )}
           {error ? (
-            <p className="mt-1 rounded-lg bg-err-soft px-2 py-1.5 text-[0.6875rem] text-err">
+            <p className="mt-1 rounded-lg bg-err-soft px-2 py-1.5 text-2xs text-err">
               {error}
             </p>
           ) : null}
-          <p className="mt-1 border-t border-line px-2 pt-1.5 text-[0.6875rem] text-faint">
+          <p className="mt-1 border-t border-line px-2 pt-1.5 text-2xs text-faint">
             Loading a checkpoint swaps it for every client of this server. A
             request already in flight finishes on the weights it started on.
           </p>
@@ -262,7 +373,7 @@ function SamplingPanel({
           align="end"
           sideOffset={6}
           collisionPadding={12}
-          className="z-50 w-[min(24rem,calc(100vw-1.5rem))] space-y-3 rounded-card border border-line bg-raised p-3 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+          className="z-50 w-[min(24rem,calc(100vw-1.5rem))] space-y-3 rounded-xl border border-line bg-raised p-3 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
         >
           <div className="grid grid-cols-3 gap-2">
             <Field label="temperature">
@@ -286,21 +397,49 @@ function SamplingPanel({
               />
             </Field>
             <Field label="max_tokens">
+              {/* Empty is a value: no cap, the context is the limit. A
+                  reasoning model counts its thinking against this
+                  number, and a cap that fits an answer rarely fits the
+                  thought that precedes it. */}
               <Input
                 type="number"
                 min="1"
-                max="32768"
                 step="1"
-                value={value.maxTokens}
-                onChange={(e) =>
-                  set(
-                    "maxTokens",
-                    Math.max(1, Math.round(Number(e.target.value) || 1)),
-                  )
-                }
+                placeholder="no cap"
+                value={value.maxTokens ?? ""}
+                onChange={(e) => {
+                  const n = Math.round(Number(e.target.value));
+                  set("maxTokens", e.target.value === "" || n < 1 ? null : n);
+                }}
               />
             </Field>
           </div>
+          <p className="text-2xs text-faint">
+            With no cap, an answer runs until the model stops or the context
+            fills; Stop cancels it on the server. A cap counts thinking too.
+          </p>
+          <Field
+            label="reasoning_budget_tokens"
+            hint="Tokens of thinking allowed before the server closes the thought and the answer begins. Empty is unrestricted; 0 skips thinking."
+          >
+            {/* Empty is unrestricted (llama.cpp's -1, which the box folds
+                onto empty). Unlike max_tokens this never cuts the
+                answer: once the budget is spent the server forces the
+                closing tag and the model answers with whatever is left. */}
+            <Input
+              type="number"
+              min="0"
+              step="1"
+              placeholder="unrestricted"
+              value={value.reasoningBudget ?? ""}
+              onChange={(e) =>
+                set(
+                  "reasoningBudget",
+                  parseReasoningBudget(e.target.value, value.reasoningBudget),
+                )
+              }
+            />
+          </Field>
           <Field
             label="system prompt"
             hint="Sent as the first message of every request, not stored on the server."
@@ -312,95 +451,6 @@ function SamplingPanel({
               onChange={(e) => set("system", e.target.value)}
             />
           </Field>
-        </Popover.Content>
-      </Popover.Portal>
-    </Popover.Root>
-  );
-}
-
-/**
- * The saved conversations, and the switch between them.
- *
- * Only rendered when the server actually keeps conversations. In local
- * mode there is exactly one transcript and a list of it would be a
- * menu with one entry pretending to be a library.
- */
-function ConversationPicker({ transcript }: { transcript: Transcript }) {
-  const { summaries, current } = transcript;
-
-  return (
-    <Popover.Root
-      onOpenChange={(open) => {
-        if (open) transcript.refresh();
-      }}
-    >
-      <Popover.Trigger asChild>
-        <Button variant="default" size="sm" className="max-w-[14rem]">
-          <MessagesSquare className="text-faint" />
-          <span className="truncate text-[0.6875rem]">
-            {current ? conversationLabel(current) : "New conversation"}
-          </span>
-          <ChevronDown className="text-faint" />
-        </Button>
-      </Popover.Trigger>
-      <Popover.Portal>
-        <Popover.Content
-          align="end"
-          sideOffset={6}
-          collisionPadding={12}
-          className="z-50 w-[min(26rem,calc(100vw-1.5rem))] rounded-card border border-line bg-raised p-1.5 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
-        >
-          {!summaries.length ? (
-            <p className="p-2 text-xs text-faint">
-              Nothing saved yet. A conversation is created on this server the
-              first time you send a message.
-            </p>
-          ) : (
-            <ul className="max-h-80 space-y-0.5 overflow-y-auto">
-              {summaries.map((entry) => {
-                const isActive = entry.id === current?.id;
-                return (
-                  <li key={entry.id} className="flex items-center gap-1">
-                    <button
-                      type="button"
-                      onClick={() => transcript.open(entry.id)}
-                      className={cn(
-                        "min-w-0 flex-1 rounded-lg px-2 py-1.5 text-left transition-colors",
-                        isActive
-                          ? "bg-accent-soft text-accent"
-                          : "hover:bg-inset",
-                      )}
-                    >
-                      <span className="block truncate text-xs">
-                        {conversationLabel(entry)}
-                      </span>
-                      <span className="block truncate text-[0.6875rem] text-faint">
-                        {[
-                          `${entry.message_count} message${entry.message_count === 1 ? "" : "s"}`,
-                          entry.model,
-                        ]
-                          .filter(Boolean)
-                          .join(" · ")}
-                      </span>
-                    </button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      title="Delete this conversation from the server"
-                      onClick={() => transcript.remove(entry.id)}
-                    >
-                      <Trash2 />
-                    </Button>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-          <p className="mt-1 border-t border-line px-2 pt-1.5 text-[0.6875rem] text-faint">
-            Stored on the server, not in this browser. Deleting one deletes it
-            for every client of this server, and nothing is ever deleted to
-            make room.
-          </p>
         </Popover.Content>
       </Popover.Portal>
     </Popover.Root>
@@ -428,27 +478,43 @@ function ChatInner({
     ? null
     : serving.error
       ? `Could not read ${routes.models}: ${serving.error}`
-      : "No model is loaded — load one on the Models screen before sending.";
+      : "No model is loaded — pick one from the model menu above before sending.";
+  // A load in flight pauses the composer: a message sent now would be
+  // answered by whichever checkpoint happened to be in when it landed.
+  const [loadingModel, setLoadingModel] = useState<string | null>(null);
+  const composerDisabled = loadingModel
+    ? `Loading ${loadingModel}… sending resumes when it is in.`
+    : disabledReason;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-line bg-raised/70 px-4 py-2.5 backdrop-blur">
-        <h1 className="text-sm font-semibold tracking-tight">Chat</h1>
+        {/* The conversation's own title, as the sidebar names it; the
+            library itself is the sidebar, not a menu up here. */}
+        <h1 className="min-w-0 max-w-[40%] truncate text-sm font-semibold tracking-tight">
+          {transcript.current ? conversationLabel(transcript.current) : "New chat"}
+        </h1>
         {serving.synthetic ? (
           <Badge tone="err">synthetic weights</Badge>
         ) : null}
         {transcript.saving ? (
-          <span className="text-[0.6875rem] text-faint">saving…</span>
+          <span className="text-2xs text-faint">saving…</span>
         ) : null}
         <span className="flex-1" />
-        {transcript.mode === "server" ? (
-          <ConversationPicker transcript={transcript} />
-        ) : null}
-        <ModelSwitcher active={serving.modelId} onSwitched={refreshServing} />
+        <ModelSwitcher
+          active={serving.modelId}
+          onSwitched={refreshServing}
+          onLoadingChange={setLoadingModel}
+        />
         <SamplingPanel value={sampling} onChange={setSampling} />
-        <Button variant="ghost" size="sm" onClick={transcript.newChat}>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={transcript.newChat}
+          className="md:hidden"
+          title="New chat"
+        >
           <SquarePen />
-          <span className="hidden sm:inline">New chat</span>
         </Button>
       </header>
 
@@ -456,8 +522,38 @@ function ChatInner({
       transport ||
       serving.synthetic ||
       disabledReason ||
+      transcript.stale ||
       transcript.error ? (
         <div className="shrink-0 space-y-2 border-b border-line bg-raised/40 px-4 py-2.5">
+          {transcript.stale ? (
+            <Notice>
+              <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <span>
+                  You were away for {describeAway(transcript.stale.awayMs)}, so
+                  this is a new chat. Anything idle for over{" "}
+                  {Math.round(RESUME_WINDOW_MS / 60_000)} minutes is not picked
+                  back up on its own.
+                </span>
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={transcript.resumeStale}
+                >
+                  <History />
+                  <span className="max-w-[14rem] truncate">
+                    Reopen {transcript.stale.label}
+                  </span>
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={transcript.dismissStale}
+                >
+                  Dismiss
+                </Button>
+              </span>
+            </Notice>
+          ) : null}
           {transcript.error ? (
             <Notice tone="err">
               This conversation is not being saved: {transcript.error} The
@@ -468,7 +564,7 @@ function ChatInner({
             <Notice tone="warn">
               {disabledReason}{" "}
               <Link to="/ui/models" className="underline underline-offset-2">
-                Open Models
+                Or download one
               </Link>
             </Notice>
           ) : null}
@@ -485,9 +581,9 @@ function ChatInner({
 
       <div className="min-h-0 flex-1">
         <Thread
-          disabledReason={disabledReason}
+          disabledReason={composerDisabled}
           footer={
-            <p className="text-center text-[0.6875rem] text-faint">
+            <p className="text-center text-2xs text-faint">
               {transcript.mode === "server"
                 ? "Transcript is stored on the server, branches included, and survives this browser."
                 : transcript.mode === "local"
@@ -504,6 +600,11 @@ function ChatInner({
 
 export function ChatScreen() {
   const health = useOutletContext<HealthState>();
+  const navigate = useNavigate();
+  // `/ui/chat` is a new chat and `/ui/chat/<id>` is that conversation.
+  // The URL is the only place that says which one is open, so the
+  // address bar cannot disagree with the screen — see `lib/entry-state`.
+  const { conversationId } = useParams();
   const [sampling, setSamplingState] = useState<Sampling>(loadSampling);
   const [serving, refreshServing] = useServingModel(
     health?.health?.model?.id ?? null,
@@ -550,12 +651,44 @@ export function ChatScreen() {
       ),
   });
 
+  // A push moves you somewhere you asked to go; a replace corrects an
+  // address that was never a place. Opening a conversation and starting
+  // a new chat are the first kind, so Back undoes them. The URL a
+  // just-created conversation gets, and the URL a declined entry is put
+  // back to, are the second.
+  const onRoute = useCallback(
+    (id: string | null, opts?: { replace?: boolean }) => {
+      navigate(id ? `/ui/chat/${encodeURIComponent(id)}` : "/ui/chat", {
+        replace: opts?.replace ?? false,
+      });
+    },
+    [navigate],
+  );
+
   // Above the provider on purpose: the sync loop needs the runtime
   // object itself (export/import/subscribe), not the React context a
   // component under the provider would read.
   const transcript = useTranscript(runtime, {
     model: () => servingRef.current.modelId,
+    routeId: conversationId ?? null,
+    onRoute,
   });
+
+  // Coming back to a tab that has been away long enough drops to a new
+  // chat — but never over the top of work in progress. A running
+  // generation or a half-typed message means the tab was left mid-task,
+  // and "you were away" is not a reason to throw that out.
+  const transcriptRef = useLatest(transcript);
+  useTabActivity(
+    useCallback(
+      (awayMs: number) => {
+        if (runtime.thread.getState().isRunning) return;
+        if (runtime.thread.composer.getState().text.trim()) return;
+        transcriptRef.current.onReturnedAfterAway(awayMs);
+      },
+      [runtime, transcriptRef],
+    ),
+  );
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>

@@ -179,6 +179,57 @@ pub enum AttnShape {
     /// `n_head == 0`. No norm, no projection; the residual passes
     /// straight into the FFN's input.
     Absent,
+    /// LFM2's short convolution (`lfm2.cpp:9-11`, `:139-189`): the same
+    /// `n_head > 0 && n_head_kv == 0` counts as [`AttnShape::Linear`],
+    /// meaning a different block, decided by architecture
+    /// ([`ZeroKvLayer`]). `attn_norm`, then `crate::shortconv`, then
+    /// the residual add; the layer's cache holds its conv inputs
+    /// ([`Self::cache_geometry`]).
+    ShortConv,
+}
+
+/// What `head_count_kv == 0` with `head_count > 0` MEANS for an
+/// architecture, because two graphs spell two different blocks with the
+/// same two counts and the counts alone cannot tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZeroKvLayer {
+    /// `deci.cpp:115-118`: `attn_norm` then `wo`.
+    Linear,
+    /// `lfm2.cpp:197`: the short convolution (`crate::shortconv`).
+    ShortConv,
+    /// A recurrent block ferrox has no body for; the reason names it.
+    Unserved(&'static str),
+}
+
+impl ZeroKvLayer {
+    /// The table. Every architecture in [`PER_LAYER_SHAPE_ARCHS`] whose
+    /// graph reads `n_head_kv(il) == 0` as a layer kind has a row here;
+    /// anything else that reaches a zero is `Linear`, the reading the
+    /// generic path had before the table existed, which only deci's
+    /// converter writes.
+    pub fn for_arch(arch: &str) -> Self {
+        if crate::shortconv::is_shortconv_architecture(arch) {
+            return ZeroKvLayer::ShortConv;
+        }
+        match arch {
+            "jamba" | "granite-hybrid" | "granitehybrid" | "falcon-h1" => ZeroKvLayer::Unserved(
+                "a Mamba-2 block (`build_mamba2_layer`, mamba-base.cpp), which ferrox has no \
+                 body for",
+            ),
+            "nemotron-h" | "nemotron_h" | "nemotron_h_moe" => ZeroKvLayer::Unserved(
+                "a Mamba-2 block or an FFN-only layer (nemotron-h.cpp:82-114), which ferrox \
+                 has no body for",
+            ),
+            "plamo2" => ZeroKvLayer::Unserved(
+                "a Mamba block (plamo2.cpp:218-219), which ferrox has no body for",
+            ),
+            "kimi-linear" => ZeroKvLayer::Unserved(
+                "a KDA block (kimi-linear.cpp:18), served by `crate::kimi_decoder` and not \
+                 the generic path",
+            ),
+            _ => ZeroKvLayer::Linear,
+        }
+    }
 }
 
 impl AttnShape {
@@ -188,14 +239,24 @@ impl AttnShape {
     /// take the attention-free branch while the loader (`:36-45`)
     /// would create a zero-wide Q, which is not a shape any converter
     /// writes.
-    pub fn from_counts(n_heads: usize, n_kv_heads: usize) -> Result<Self, String> {
+    pub fn from_counts(
+        n_heads: usize,
+        n_kv_heads: usize,
+        zero_kv: ZeroKvLayer,
+    ) -> Result<Self, String> {
         match (n_heads, n_kv_heads) {
             (0, 0) => Ok(AttnShape::Absent),
             (0, kv) => Err(format!(
                 "head_count 0 with head_count_kv {kv}: deci.cpp:107 would skip attention while \
                  :44 sizes a zero-wide Q projection"
             )),
-            (_, 0) => Ok(AttnShape::Linear),
+            (_, 0) => match zero_kv {
+                ZeroKvLayer::Linear => Ok(AttnShape::Linear),
+                ZeroKvLayer::ShortConv => Ok(AttnShape::ShortConv),
+                ZeroKvLayer::Unserved(what) => Err(format!(
+                    "head_count_kv 0 marks {what}; `layer_shapes::ZeroKvLayer` is the table"
+                )),
+            },
             (q, kv) if q % kv != 0 => Err(format!(
                 "head_count {q} is not a multiple of head_count_kv {kv}"
             )),
@@ -211,7 +272,7 @@ impl AttnShape {
     pub fn n_kv_heads(self) -> usize {
         match self {
             AttnShape::Gqa { n_kv_heads, .. } => n_kv_heads,
-            AttnShape::Linear | AttnShape::Absent => 0,
+            AttnShape::Linear | AttnShape::Absent | AttnShape::ShortConv => 0,
         }
     }
 
@@ -219,7 +280,30 @@ impl AttnShape {
     pub fn n_heads(self) -> usize {
         match self {
             AttnShape::Gqa { n_heads, .. } => n_heads,
-            AttnShape::Linear | AttnShape::Absent => 0,
+            AttnShape::Linear | AttnShape::Absent | AttnShape::ShortConv => 0,
+        }
+    }
+
+    /// The layer's cache as `(n_kv_heads, k_head_dim, v_head_dim)`, the
+    /// three numbers every `KvCache` / `PagedKvStore` constructor takes.
+    ///
+    /// A GQA layer's is its head geometry; the two attention-less
+    /// shapes write no history and get an empty cache; a short-conv
+    /// layer keeps its conv inputs as ONE row of `hidden_dim` per token
+    /// with no V (`crate::shortconv`). ONE function, because
+    /// `ModelConfig::new_kv_caches` and its three siblings each build
+    /// the caches and a fourth reading of the shape would be a fourth
+    /// place to disagree.
+    pub fn cache_geometry(
+        self,
+        head_dim: usize,
+        v_head_dim: usize,
+        hidden_dim: usize,
+    ) -> (usize, usize, usize) {
+        match self {
+            AttnShape::Gqa { n_kv_heads, .. } => (n_kv_heads, head_dim, v_head_dim),
+            AttnShape::Linear | AttnShape::Absent => (0, head_dim, v_head_dim),
+            AttnShape::ShortConv => (1, hidden_dim, 0),
         }
     }
 }
@@ -302,11 +386,13 @@ impl LayerShapes {
             ));
         }
         let mut shapes = Vec::with_capacity(n);
+        let zero_kv = ZeroKvLayer::for_arch(arch);
         for il in 0..n {
-            let attention = AttnShape::from_counts(heads[il] as usize, kv_heads[il] as usize)
-                .map_err(|why| {
-                    LoadError::UnsupportedFeature(arch.to_string(), format!("blk.{il}: {why}"))
-                })?;
+            let attention =
+                AttnShape::from_counts(heads[il] as usize, kv_heads[il] as usize, zero_kv)
+                    .map_err(|why| {
+                        LoadError::UnsupportedFeature(arch.to_string(), format!("blk.{il}: {why}"))
+                    })?;
             let ffn_dim = ffn.map_or(expert_ffn_dim, |f| f[il] as usize);
             if ffn_dim == 0 && attention != AttnShape::Absent {
                 // deci.cpp:147-149 `continue`s BEFORE the residual add
@@ -421,26 +507,39 @@ fn no_rows(cols: usize) -> WeightMatrix {
     WeightMatrix::F32(Tensor::new(Vec::new(), vec![0, cols]))
 }
 
-/// The attention weights of a [`AttnShape::Linear`] or
-/// [`AttnShape::Absent`] layer.
+/// The attention weights of a [`AttnShape::Linear`], [`AttnShape::
+/// Absent`] or [`AttnShape::ShortConv`] layer.
 ///
 /// Linear (`deci.cpp:36-40`): `attn_norm` and a `{n_embd, n_embd}`
 /// `attn_output`, nothing else. Absent (`:107-109`): nothing at all --
 /// no norm tensor exists for the layer, and `NormOp::None` is what the
-/// body applies before a block it then skips.
+/// body applies before a block it then skips. ShortConv (`lfm2.cpp:
+/// 70,80-82`): `attn_norm` and the three `shortconv.*` tensors
+/// (`crate::shortconv`).
 pub(crate) fn load_non_gqa_attention(
     shape: AttnShape,
     file: &impl TensorSource,
+    arch: &str,
     layer: usize,
     norm_sites: &NormSites,
     hidden_dim: usize,
 ) -> Result<AttnWeights, LoadError> {
+    let mut shortconv = None;
     let (norm_weight, o_proj) = match shape {
         AttnShape::Linear => (
             norm_sites.load_pre_norm(norm_sites.attn, file, Some(layer))?,
             load_weight_matrix(file, &format!("blk.{layer}.attn_output.weight"))?,
         ),
         AttnShape::Absent => (NormOp::None, no_rows(0)),
+        AttnShape::ShortConv => {
+            shortconv = Some(crate::shortconv::ShortConv::load(
+                file, arch, layer, hidden_dim,
+            )?);
+            (
+                norm_sites.load_pre_norm(norm_sites.attn, file, Some(layer))?,
+                no_rows(0),
+            )
+        }
         AttnShape::Gqa { .. } => unreachable!("a GQA layer loads its projections"),
     };
     if let AttnShape::Linear = shape {
@@ -478,6 +577,7 @@ pub(crate) fn load_non_gqa_attention(
         attn_sub_norm: None,
         o_scale: None,
         o_bias: None,
+        shortconv,
     })
 }
 
@@ -549,6 +649,16 @@ pub(crate) fn check_gqa_projection_widths(
 }
 
 impl ModelConfig {
+    /// Layer `il`'s cache geometry (`AttnShape::cache_geometry` at this
+    /// model's widths).
+    pub fn layer_cache_geometry(&self, il: usize) -> (usize, usize, usize) {
+        self.layer_shape(il).attention.cache_geometry(
+            self.head_dim,
+            self.v_head_dim(),
+            self.hidden_dim,
+        )
+    }
+
     /// Layer `il`'s shape. THE accessor: every layer body reads its head
     /// counts here and nowhere else.
     pub fn layer_shape(&self, il: usize) -> LayerShape {
@@ -573,11 +683,8 @@ impl ModelConfig {
     pub fn new_kv_caches(&self) -> Vec<KvCache> {
         (0..self.n_layers)
             .map(|il| {
-                KvCache::new_split(
-                    self.layer_shape(il).attention.n_kv_heads(),
-                    self.head_dim,
-                    self.v_head_dim(),
-                )
+                let (n_kv_heads, head_dim, v_head_dim) = self.layer_cache_geometry(il);
+                KvCache::new_split(n_kv_heads, head_dim, v_head_dim)
             })
             .collect()
     }
@@ -586,12 +693,8 @@ impl ModelConfig {
     pub fn new_kv_caches_with_capacity(&self, max_seq_len: usize) -> Vec<KvCache> {
         (0..self.n_layers)
             .map(|il| {
-                KvCache::with_capacity_split(
-                    self.layer_shape(il).attention.n_kv_heads(),
-                    self.head_dim,
-                    self.v_head_dim(),
-                    max_seq_len,
-                )
+                let (n_kv_heads, head_dim, v_head_dim) = self.layer_cache_geometry(il);
+                KvCache::with_capacity_split(n_kv_heads, head_dim, v_head_dim, max_seq_len)
             })
             .collect()
     }
@@ -605,10 +708,11 @@ impl ModelConfig {
     ) -> Result<Vec<KvCache>, ferrox_core::cache::KvPoolExhausted> {
         (0..self.n_layers)
             .map(|il| {
+                let (n_kv_heads, head_dim, v_head_dim) = self.layer_cache_geometry(il);
                 KvCache::with_pool_split(
-                    self.layer_shape(il).attention.n_kv_heads(),
-                    self.head_dim,
-                    self.v_head_dim(),
+                    n_kv_heads,
+                    head_dim,
+                    v_head_dim,
                     std::sync::Arc::clone(pool),
                     max_seq_len,
                 )
@@ -621,12 +725,13 @@ impl ModelConfig {
         SharedPagedKv::from_stores(
             (0..self.n_layers)
                 .map(|il| {
+                    let (n_kv_heads, head_dim, v_head_dim) = self.layer_cache_geometry(il);
                     PagedKvStore::new_split(
                         block_size,
                         blocks_per_layer,
-                        self.layer_shape(il).attention.n_kv_heads(),
-                        self.head_dim,
-                        self.v_head_dim(),
+                        n_kv_heads,
+                        head_dim,
+                        v_head_dim,
                     )
                 })
                 .collect(),
@@ -675,19 +780,47 @@ mod tests {
     /// The three-way branch, pinned to deci.cpp's conditions.
     #[test]
     fn the_two_zero_counts_are_two_different_layer_kinds() {
-        assert_eq!(AttnShape::from_counts(0, 0), Ok(AttnShape::Absent));
-        assert_eq!(AttnShape::from_counts(4, 0), Ok(AttnShape::Linear));
+        let deci = ZeroKvLayer::for_arch("deci");
+        assert_eq!(AttnShape::from_counts(0, 0, deci), Ok(AttnShape::Absent));
+        assert_eq!(AttnShape::from_counts(4, 0, deci), Ok(AttnShape::Linear));
         assert_eq!(
-            AttnShape::from_counts(4, 2),
+            AttnShape::from_counts(4, 2, deci),
             Ok(AttnShape::Gqa {
                 n_heads: 4,
                 n_kv_heads: 2
             })
         );
-        assert!(AttnShape::from_counts(0, 2).is_err());
-        assert!(AttnShape::from_counts(3, 2).is_err());
+        assert!(AttnShape::from_counts(0, 2, deci).is_err());
+        assert!(AttnShape::from_counts(3, 2, deci).is_err());
         assert_eq!(AttnShape::Linear.n_kv_heads(), 0);
         assert_eq!(AttnShape::Absent.n_heads(), 0);
+    }
+
+    /// The same two counts are a different block on LFM2 (lfm2.cpp:197)
+    /// and an unserved one on the Mamba hybrids: the architecture
+    /// decides, and the counts alone cannot.
+    #[test]
+    fn a_zero_kv_layer_means_what_the_architecture_says() {
+        let lfm2 = ZeroKvLayer::for_arch("lfm2");
+        assert_eq!(AttnShape::from_counts(4, 0, lfm2), Ok(AttnShape::ShortConv));
+        // GQA layers are GQA on every architecture.
+        assert!(matches!(
+            AttnShape::from_counts(4, 2, lfm2),
+            Ok(AttnShape::Gqa { .. })
+        ));
+        let err = AttnShape::from_counts(4, 0, ZeroKvLayer::for_arch("jamba")).unwrap_err();
+        assert!(err.contains("Mamba-2"), "{err}");
+        // The cache: one row of n_embd per token, no V.
+        assert_eq!(AttnShape::ShortConv.cache_geometry(6, 6, 24), (1, 24, 0));
+        assert_eq!(AttnShape::Linear.cache_geometry(6, 6, 24), (0, 6, 6));
+        assert_eq!(AttnShape::ShortConv.n_kv_heads(), 0);
+        let err = LayerShapes::resolve("jamba", &[4, 4], &[2, 0], None, 16).unwrap_err();
+        assert!(err.to_string().contains("Mamba-2"), "{err}");
+        let s = LayerShapes::resolve("lfm2", &[4, 4], &[0, 2], None, 16).unwrap();
+        let LayerShapes::PerLayer(v) = s else {
+            panic!("per layer");
+        };
+        assert_eq!(v[0].attention, AttnShape::ShortConv);
     }
 
     /// Equal arrays are the uniform model, for ANY architecture: the
@@ -794,6 +927,7 @@ mod tests {
             attn_sub_norm: None,
             o_scale: None,
             o_bias: None,
+            shortconv: None,
         };
         assert!(
             check_gqa_projection_widths(0, shape, head_dim, head_dim, hidden, &build(24, 12))

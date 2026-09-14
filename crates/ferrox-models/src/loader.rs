@@ -776,6 +776,27 @@ impl ModelConfig {
             ));
         }
 
+        // A window on a short-conv architecture: `lfm2.cpp:24-29`
+        // honours it on the ATTENTION layers alone (`is_swa_impl[il] =
+        // !is_recr_impl[il]`), a per-layer answer `crate::swa_layers`
+        // has no variant for, and one that would also arm eviction
+        // against the history the conv indexes by row
+        // (`crate::shortconv`). No published export writes the key.
+        if let (Some(w), true) = (
+            sliding_window,
+            crate::shortconv::is_shortconv_architecture(&arch),
+        ) {
+            return Err(LoadError::UnsupportedFeature(
+                arch.clone(),
+                format!(
+                    "`{arch}.attention.sliding_window` {w}: lfm2.cpp:24-29 windows the attention \
+                     layers and not the conv layers, which `swa_layers` cannot yet spell, and a \
+                     window on a conv layer would evict the history its convolution reads \
+                     (`crate::shortconv`); no published LFM2 export writes the key"
+                ),
+            ));
+        }
+
         // Three graphs rope their SLIDING layers with the scaling
         // switched off -- freq_scale = 1, ext_factor = 0, attn_factor =
         // 1 -- while the full-attention layers use the model's:
@@ -2657,6 +2678,7 @@ impl Decoder {
                             l,
                             config.hidden_dim,
                         )?,
+                        shortconv: None,
                     };
                     crate::layer_shapes::check_gqa_projection_widths(
                         l,
@@ -2671,6 +2693,7 @@ impl Decoder {
                 other => crate::layer_shapes::load_non_gqa_attention(
                     other,
                     &file,
+                    &arch,
                     l,
                     &norm_sites,
                     config.hidden_dim,

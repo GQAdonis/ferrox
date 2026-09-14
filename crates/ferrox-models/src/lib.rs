@@ -96,6 +96,7 @@ pub(crate) mod sampler_chain;
 pub mod sampler_order;
 pub mod sampling;
 pub mod scalar_multipliers;
+pub mod shortconv;
 pub mod skip_stream;
 pub mod speculative;
 pub mod sub_norms;

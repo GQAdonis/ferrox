@@ -654,13 +654,15 @@ mod tests {
             ("qwen35.rope.freq_base", 10000.0f32),
         ];
         let bytes = build_gguf(arch, &kv, &fkv, &tensors);
+        // A per-process counter, not the clock: two tests in this
+        // module build a fixture inside the same clock tick often
+        // enough that one read the other's file (seen once in a full
+        // parallel run, 2026-09-14).
+        static FIXTURE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "ferrox_hybrid_gdn_test_{}_{}.gguf",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::write(&path, &bytes).unwrap();
         let file = GgufFile::open(&path).expect("synthetic hybrid GGUF must parse");

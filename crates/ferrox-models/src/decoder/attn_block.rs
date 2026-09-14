@@ -89,6 +89,10 @@ impl Decoder {
             // deci.cpp:115-118: `attn_norm` then `wo`, nothing else.
             AttnShape::Linear => return Some(layer.attn.o_proj.apply(normed)),
             AttnShape::Absent => return None,
+            // lfm2.cpp:197: the short convolution, on this row's cache.
+            AttnShape::ShortConv => {
+                return Some(self.shortconv_block(layer_idx, layer, normed, 1, kv))
+            }
         };
 
         let (mut q, mut k, mut v) = {

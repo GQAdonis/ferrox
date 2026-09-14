@@ -131,6 +131,17 @@ pub const ATTN_NORM_2_FEEDS_ATTENTION: &[&str] = &["falcon"];
 /// ([`NormSites::function`]), so `bloom`'s is the biased LayerNorm.
 pub const EMBEDDING_NORM_ARCHITECTURES: &[&str] = &["bloom"];
 
+/// Architectures whose OUTPUT norm is stored under the embedding-norm
+/// NAME: `token_embd_norm.weight` is `LLM_TENSOR_OUTPUT_NORM_LFM2`
+/// (`llama-arch.cpp:384`, "fix for wrong tensor name"), created at
+/// `lfm2.cpp:36` as `output_norm` and applied at `:212` after the last
+/// layer; nothing norms the embeddings (`:191`). The same name is
+/// `bloom`'s embedding norm ([`EMBEDDING_NORM_ARCHITECTURES`]), one
+/// tensor name feeding two different sites, decided by architecture --
+/// the `attn_output_norm` case again. `lfm2moe` shares the loader line
+/// (`lfm2moe.cpp:31`).
+pub const OUTPUT_NORM_UNDER_EMBEDDING_NAME: &[&str] = &["lfm2", "lfm2moe"];
+
 /// A norm site whose weight the file stores.
 ///
 /// `names` are base names tried in order; each is looked up as
@@ -280,7 +291,11 @@ impl NormSites {
             ffn: Some(StoredNorm::required(&["ffn_norm"])),
             post_attn: Some(StoredNorm::optional(&["post_attention_norm"])),
             post_ffn: Some(StoredNorm::optional(&["post_ffw_norm"])),
-            output: StoredNorm::required(&["output_norm"]),
+            output: if OUTPUT_NORM_UNDER_EMBEDDING_NAME.contains(&arch) {
+                StoredNorm::required(&["token_embd_norm"])
+            } else {
+                StoredNorm::required(&["output_norm"])
+            },
             embedding: EMBEDDING_NORM_ARCHITECTURES
                 .contains(&arch)
                 .then_some(StoredNorm::required(&["token_embd_norm"])),
@@ -404,6 +419,24 @@ mod tests {
             NormSites::for_arch("bloom").embedding,
             Some(StoredNorm::required(&["token_embd_norm"]))
         );
+    }
+
+    /// `token_embd_norm` is bloom's EMBEDDING norm and LFM2's OUTPUT
+    /// norm (llama-arch.cpp:384); each row reads it at its own site and
+    /// not the other's.
+    #[test]
+    fn token_embd_norm_is_the_output_norm_on_lfm2_alone() {
+        let s = NormSites::for_arch("lfm2");
+        assert_eq!(s.output, StoredNorm::required(&["token_embd_norm"]));
+        assert_eq!(s.embedding, None);
+        let b = NormSites::for_arch("bloom");
+        assert_eq!(b.output, StoredNorm::required(&["output_norm"]));
+        for arch in OUTPUT_NORM_UNDER_EMBEDDING_NAME {
+            assert!(
+                !EMBEDDING_NORM_ARCHITECTURES.contains(arch),
+                "{arch}: one tensor cannot feed both sites"
+            );
+        }
     }
 
     /// `attn_output_norm` feeds a DIFFERENT site on the two rows that

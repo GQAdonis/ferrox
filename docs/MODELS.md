@@ -78,6 +78,7 @@ OLMoE (1.11×) and Gemma-3-1B (1.18×) on Metal.
 | gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal stops with an error, because no Metal kernel implements attention sinks. The paged-KV decode path runs it: all three attention arms are bit-identical to their contiguous twins |
 | Llama 4 | **Will not load**, with the reason stated: `llama4 MoE + non-GQA attn` |
 | MiniMax | `minimax-m2` (MiniMax-M2) **runs** on the generic path since 2026-09-14: plain GQA + whole-vector QK norm + partial NEOX RoPE + a sigmoid MoE with `exp_probs_b`, KL 3.4e-15 against libllama on the fixture that had said it was a fixture away (`tests/minimax_m2_graphs.rs`). `minimax-m3` **will not load**: it needs MiniMax Sparse Attention (a per-layer indexer driving its own MSA KV cache), of which ferrox has only the block-selection rule |
+| LFM2 (`lfm2`: LFM2-350M / 700M / 1.2B / 2.6B, LFM2-VL's text tower; `lfm2moe`: LFM2-8B-A1B, 24B-A2B) | **Generic path, audited 2026-09-14** (`tests/lfm2_graphs.rs`, KL 3.2e-12 on the split, fused-QKV and separate-`output` fixtures, 6.0e-13 on the MoE, contiguous, paged and multi-seq). The first hybrid row: `lfm2.cpp:9-11` marks a layer recurrent when `head_count_kv` is 0, and its short convolution (`ferrox_models::shortconv`) runs at the attention site with its state kept as the layer's KV history. `lfm2moe` is the same graph with leading dense layers and a sigmoid MoE with `exp_probs_b`; a file declaring `attention.sliding_window` is refused by name (no export writes it) |
 | Hybrid GDN / Qwen3.5 | Scaffold only |
 | Kimi K3 / GLM-5.2 / DeepSeek V4 | Loaders and primitives only. Nothing has been run end to end on a real checkpoint |
 | Vision | Finds an mmproj file and warns about it. An `image_url` in a request returns an error |
@@ -1110,7 +1111,9 @@ generic path, and `laguna` and `step35` with them since they closed;
 its layers; `gemma4` and `gemma4-assistant` on a dedicated engine; and
 the seven hybrid recurrent rows (`jamba`, `lfm2`, `lfm2moe`,
 `nemotron-h`, `plamo2`, `granite-hybrid`, `kimi-linear`), where
-`n_head_kv(i) == 0` means "this layer is recurrent". Three things the
+`n_head_kv(i) == 0` means "this layer is recurrent" -- and since
+2026-09-14 `layer_shapes::ZeroKvLayer` says WHICH recurrent block, with
+`lfm2`'s short convolution served (`ferrox_models::shortconv`). Three things the
 scan corrected: `n_rot(il)` is NOT an array upstream
 (`llama-hparams.cpp:85-91` is `is_swa(il) ? n_rot_swa : n_rot_full`),
 so `step35`'s and `laguna`'s "per-layer rotary width" is a two-valued
@@ -1201,6 +1204,7 @@ name, as libllama refuses it (`wrong number of tensors; expected 21, got
 | A second rotary width on the sliding layers (`n_rot(il)`: `rope.dimension_count_swa`, or `step35`'s halved full width) | CLOSED (`ModelConfig::rope_dim_swa`, `ferrox_models::swa_geometry`): `step35` and the Laguna-XS.2 shape run on it; the two `_swa` HEAD-width keys stay refused by name, and two widths with per-band divisors are refused for any architecture but `step35` |
 | An ungated or non-SwiGLU FFN | CLOSED for the ungated ReLU-squared form (`FfnActivation::ReluSqr`), the gated ReLU form (`FfnActivation::Reglu`) and xIELU (`FfnActivation::Xielu`): `arcee`, `smallthinker` and `apertus` run on them, and `plm` on the MLA engine (`MlaDenseFfn::act`) |
 | A per-position attention temperature | CLOSED (`ferrox_models::attn_temperature`): `mistral3` runs on it; `deepseek2` / `mistral4` (Mistral-Large-3) refuse it by name on the MLA engine and `llama4` needs a per-layer gate on it beside its chunked attention |
+| A recurrent block at the attention site (`head_count_kv 0`) | CLOSED for the short convolution (`ferrox_models::shortconv`, `layer_shapes::AttnShape::ShortConv`, the state as the layer's KV history on all three backings): `lfm2` and `lfm2moe` run on it. The Mamba-2 hybrids (`jamba`, `granite-hybrid`, `falcon-h1`, `nemotron-h`, `plamo2`) name their block in `layer_shapes::ZeroKvLayer` and refuse |
 | Something structurally new | `grovemoe` (a second expert bank -- and, read against `modeling_grove_moe.py` on 2026-09-12, llama.cpp's graph feeds the chunk experts the routed experts' OUTPUT and gathers their weights at the CHUNK index where the reference does neither, so there is no one graph to match; its verdict says so); `plm` (MLA attention on a dense model) was here and is CLOSED on the MLA engine (`ferrox_models::mla_arch`); `arctic` (a parallel dense + MoE layer) was here and is CLOSED (`ferrox_models::parallel_dense_ffn`); `mellum` was here on "two per-layer RoPE variants", which is the Olmo-3 rule refused by name, and is CLOSED; `mistral3` was here on the temperature and is CLOSED; `nanbeige` was here on running the same layers more than once and is CLOSED (`ferrox_models::layer_loops`) |
 
 **Unknown (1).** `phi4` is the only row left here. It is not in

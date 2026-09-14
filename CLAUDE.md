@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **76** architectures run with
+Honest position, re-audited 2026-09-14. **78** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -900,6 +900,40 @@ through libllama took a minute and matched at KL 3.4e-15 on the first
 try (`tests/minimax_m2_graphs.rs`). A verdict that names its own
 closing evidence and does not go and get it is a refusal that could
 have been a row.
+
+`lfm2` (LFM2-350M / 700M / 1.2B / 2.6B) and `lfm2moe` (LFM2-8B-A1B)
+closed the same day as the FIRST hybrid rows, and the lesson is where
+they closed: not on the hybrid
+engine that had refused it for a year but on the generic path.
+`lfm2.cpp:192-208` is the generic layer -- `attn_norm`, a block, the
+residual add, `ffn_norm`, the FFN -- with a short convolution where
+attention would be on the layers whose `head_count_kv` is 0 (`:9-11`),
+so it is a THIRD `AttnShape` beside deci's two (`layer_shapes::
+AttnShape::ShortConv`, `ferrox-models/src/shortconv.rs`) rather than
+a second engine. Reach measured first: `grep -l shortconv` over the
+140 graphs is `lfm2.cpp` and `lfm2moe.cpp`, ONE graph (`models.h:
+1899`); the Mamba-2 hybrids share only the rule "zero KV heads means
+recurrent", and `layer_shapes::ZeroKvLayer` is that rule as a table --
+the same two counts had been deci's `Linear` for every architecture,
+so a Jamba file would have loaded its Mamba layers as `wo`-only
+attention and failed on a missing tensor. The state is the layer's KV
+HISTORY: one `n_embd` row of `b * x` per token with no V
+(`AttnShape::cache_geometry`), read back as the last `l_cache` rows,
+where llama.cpp keeps the `l_cache - 1` it needs (`n_embd_r()`).
+Keeping the history is what lets the layer truncate, page, snapshot
+and share a prefix through the same code every attention layer uses;
+the paged arm reads the window through the block table and a test
+straddles a block boundary with it. `token_embd_norm.weight` is its
+OUTPUT norm (`llama-arch.cpp:384`, "fix for wrong tensor name") and
+`bloom`'s EMBEDDING norm -- the `attn_output_norm` case again, one row
+in `norm_sites`. KL 3.2e-12 on the split, fused-QKV and
+separate-`output` fixtures (`tests/lfm2_graphs.rs`); reversing the
+taps or dropping the state turns every golden red; `lfm2moe` is the
+same graph with `leading_dense_block_count` dense layers and a sigmoid
+MoE with `exp_probs_b` REQUIRED on the rest, KL 6.0e-13, its
+`expert_weights_scale` dead metadata as `mimo2`'s. A window stays
+refused by name: `lfm2.cpp:24-29` windows the attention layers ALONE,
+which `swa_layers` cannot spell, and no export writes the key.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

@@ -53,6 +53,26 @@ is faster.
   and is the only piece ported. Neither is blocked on MTP draft heads,
   which no MiniMax GGUF can carry: `gguf-py`'s tensor lists for both
   have no `NEXTN_*` entry, so the writer physically cannot emit one.
+- **LFM2** (`lfm2`: LFM2-350M / 700M / 1.2B / 2.6B; `lfm2moe`:
+  LFM2-8B-A1B), the first hybrid rows on the generic path, audited
+  against libllama on 2026-09-14 (`tests/lfm2_graphs.rs`, KL 3.2e-12
+  on three dense fixtures, 6.0e-13 on the MoE). `lfm2.cpp:
+  9-11` marks a layer recurrent when its `head_count_kv` is 0, and
+  `:192-208` runs one residual topology for both kinds, so the short
+  convolution is a third answer to "what is this layer's attention"
+  (`layer_shapes::AttnShape::ShortConv`, `ferrox_models::shortconv`)
+  rather than a second engine: `attn_norm`, `in_proj` split into `b,
+  c, x`, a causal depthwise conv of width `shortconv.l_cache` over
+  `b * x` with the previous inputs as the state, `c *` the result,
+  `out_proj`. The state is the layer's KV history (one `n_embd` row
+  per token, no V) on all three backings, which is what lets it
+  truncate, page and snapshot like every other layer. The attention
+  layers are per-head RMS QK norm + NEOX GQA; the final norm is stored
+  as `token_embd_norm` (`norm_sites::OUTPUT_NORM_UNDER_EMBEDDING_NAME`).
+  Every fused Metal launch refuses the model. `lfm2moe` is the same
+  graph with `leading_dense_block_count` dense layers and a sigmoid
+  MoE with `exp_probs_b` REQUIRED on the rest; the Mamba-2 hybrids
+  name their block (`layer_shapes::ZeroKvLayer`) and refuse.
 - **OLMo-2 and EXAONE-4**, audited against libllama on 2026-09-10 as
   ONE residual topology rather than two: neither has an `attn_norm` or
   an `ffn_norm` tensor, both sublayers read the raw residual, and each

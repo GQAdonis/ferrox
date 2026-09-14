@@ -1039,6 +1039,29 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // by its hparams. Its refusal had said "a fixture away" for a week
     // while the fixture sat in `tests/fixtures/`.
     "minimax-m2",
+    // tests/lfm2_graphs.rs: `lfm2` (LFM2-350M / 700M / 1.2B / 2.6B), the
+    // first HYBRID row on the generic path. `lfm2.cpp:9-11` marks a
+    // layer recurrent when `n_head_kv(il) == 0`, and `:192-208` is ONE
+    // residual topology for both kinds: `attn_norm`, the short
+    // convolution (`crate::shortconv`, `AttnShape::ShortConv`) or GQA,
+    // the residual add, `ffn_norm`, SwiGLU. The attention layers have a
+    // PER-HEAD RMS QK norm (`{n_embd_head_k}`, :74-75), NEOX RoPE
+    // (llama-model.cpp:2666), a fused or split QKV; the final norm is
+    // stored as `token_embd_norm` (`norm_sites::
+    // OUTPUT_NORM_UNDER_EMBEDDING_NAME`); `output` tied when absent.
+    // Four fixtures: split, the converter's fused `attn_qkv`, a separate
+    // `output.weight`; the fourth declares a window and is REFUSED by
+    // name (lfm2.cpp:24-29 windows the attention layers alone).
+    "lfm2",
+    // tests/lfm2_graphs.rs: `lfm2moe` (LFM2-8B-A1B, LFM2-24B-A2B) is
+    // `lfm2`'s graph (`models.h:1899`) with `leading_dense_block_count`
+    // dense layers and a sigmoid MoE on the rest, `exp_probs_b` REQUIRED
+    // (`lfm2moe.cpp:8,38-47`), `norm_w = true` (lfm2.cpp:118); the
+    // gating function comes from the key, which the converter writes
+    // as SIGMOID (`conversion/lfm2.py:109`). `expert_weights_scale` is
+    // read by nothing in its hparams (the fixture declares 2.5 and the
+    // golden is unscaled).
+    "lfm2moe",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -2368,8 +2391,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             ("plamo2", Neox),
             ("granitehybrid", Norm),
             ("granite-hybrid", Norm),
-            ("lfm2", Neox),
-            ("lfm2moe", Neox),
             ("nemotron_h", Neox),
             ("nemotron_h_moe", Neox),
             ("qwen3next", Neox),
@@ -2391,6 +2412,23 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                     reason: "hybrid attn+SSM/delta-net engine not yet on the serve path",
                 },
                 qk,
+            ));
+        }
+        // `lfm2` left the hybrid group on 2026-09-14: its recurrent
+        // block is a short convolution at the attention site
+        // (`crate::shortconv`), served on the generic path with a
+        // per-head QK norm (`lfm2.cpp:74-75`) and NEOX RoPE
+        // (llama-model.cpp:2666). `lfm2moe` shares its graph
+        // (`models.h:1899`) and followed on the same seam.
+        for n in ["lfm2", "lfm2moe"] {
+            v.push(prof(
+                n,
+                TextGeneration,
+                DecoderFamily::Hybrid,
+                MemoryKind::Hybrid,
+                Neox,
+                ArchPath::GenericGqa { rope: Neox },
+                PerHead,
             ));
         }
         for n in ["mamba", "mamba2", "rwkv6", "rwkv6qwen2", "rwkv7", "arwkv7"] {

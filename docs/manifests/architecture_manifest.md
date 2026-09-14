@@ -105,13 +105,13 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `plamo2` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `granitehybrid` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `granite-hybrid` | TextGeneration | Hybrid | Hybrid | dedicated |
-| `lfm2` | TextGeneration | Hybrid | Hybrid | dedicated |
-| `lfm2moe` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `nemotron_h` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `nemotron_h_moe` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `qwen3next` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `qwen35` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `qwen35moe` | TextGeneration | Hybrid | Hybrid | dedicated |
+| `lfm2` | TextGeneration | Hybrid | Hybrid | generic-gqa |
+| `lfm2moe` | TextGeneration | Hybrid | Hybrid | generic-gqa |
 | `mamba` | TextGeneration | Recurrent | Recurrent | dedicated |
 | `mamba2` | TextGeneration | Recurrent | Recurrent | dedicated |
 | `rwkv6` | TextGeneration | Recurrent | Recurrent | dedicated |

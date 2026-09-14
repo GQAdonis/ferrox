@@ -17,6 +17,26 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`lfm2` and `lfm2moe` run: LFM2-350M / 700M / 1.2B / 2.6B and
+  LFM2-8B-A1B, the first hybrid rows, on the generic path.** `lfm2.cpp:192-208` is the generic layer with a
+  short convolution where attention would be on the layers whose
+  `head_count_kv` is 0, so it is a third `layer_shapes::AttnShape`
+  (`ShortConv`) served by `ferrox_models::shortconv` and
+  `Decoder::shortconv_block`, with the conv state kept as the layer's
+  KV history (one `n_embd` row per token, no V; `AttnShape::
+  cache_geometry`) on the contiguous, paged and multi-seq backings.
+  `layer_shapes::ZeroKvLayer` says what a zero-KV layer IS per
+  architecture (deci's `wo`-only block, LFM2's conv, or a Mamba-2 /
+  KDA block refused by name), where every architecture had been read
+  as deci. `norm_sites::OUTPUT_NORM_UNDER_EMBEDDING_NAME`: LFM2's
+  output norm is stored as `token_embd_norm` (llama-arch.cpp:384).
+  `MultiSeqKv::step` is the one place the batched path picks a
+  sequence's cache. KL 3.2e-12 on three fixtures
+  (`tests/lfm2_graphs.rs`, `scripts/make_lfm2_fixture.py`); a window
+  is refused by name (`lfm2.cpp:24-29` windows the attention layers
+  alone). `lfm2moe` is the same graph (`models.h:1899`) with leading
+  dense layers and a sigmoid MoE with `exp_probs_b` required, KL
+  6.0e-13. 78 audited.
 - **`minimax-m2` runs: MiniMax-M2.** No code: the row's refusal had
   said "unaudited, not unimplemented, a fixture away" while
   `tests/fixtures/minimax_m2_tiny.gguf` sat in the tree; its libllama

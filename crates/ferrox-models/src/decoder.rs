@@ -20,6 +20,7 @@ mod lm_head;
 mod qk_norm;
 mod qkv_bias;
 mod rope;
+mod shortconv_block;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -157,6 +158,13 @@ pub struct AttnWeights {
     /// The fused Metal launches refuse a layer that has one through
     /// the destructure in `metal_attn_view`.
     pub o_bias: Option<Vec<f32>>,
+    /// LFM2's short convolution, `Some` on exactly the layers whose
+    /// shape is `AttnShape::ShortConv` (`crate::shortconv`); the four
+    /// projections above are empty on such a layer. The host bodies
+    /// branch on the SHAPE and reach this field through it; the fused
+    /// Metal launches refuse the model (a short-conv model is never
+    /// uniform) and the layer (the destructure in `metal_attn_view`).
+    pub shortconv: Option<crate::shortconv::ShortConv>,
 }
 
 /// How a layer's routed experts are held. `Resident` is the original
@@ -658,6 +666,23 @@ impl MultiSeqKv<'_> {
             MultiSeqKv::Paged { caches, .. } => caches[seq].len(),
         }
     }
+
+    /// Sequence `b`'s layer-`l` cache as the one-row step the attention
+    /// and short-conv bodies take. The only place this enum's arms are
+    /// matched for a cache, so paging changes where rows live and
+    /// nothing else.
+    fn step(&mut self, b: usize, l: usize) -> KvStep<'_> {
+        match self {
+            // `Batched`, not `Decode`: the CUDA resident per-layer KV
+            // holds ONE sequence's history, and this path never seeds
+            // it. See `KvStep::Batched`.
+            MultiSeqKv::Contiguous(caches) => KvStep::Batched(&mut caches[b][l]),
+            MultiSeqKv::Paged { caches, stores } => KvStep::Paged {
+                cache: &mut caches[b][l],
+                stores,
+            },
+        }
+    }
 }
 
 impl Decoder {
@@ -774,6 +799,7 @@ impl Decoder {
                 attn_sub_norm: None,
                 o_scale: None,
                 o_bias: None,
+                shortconv: None,
             };
 
             // Leading dense layers (see ModelConfig::layer_is_dense's
@@ -1223,15 +1249,18 @@ impl Decoder {
             attn_sub_norm,
             o_scale,
             o_bias,
+            shortconv,
         } = &layer.attn;
         // No Metal attention kernel gates, sinks, norms between the V
-        // sum and `wo`, scales after it, or adds a bias to it; a layer
-        // with any of the five runs on the host.
+        // sum and `wo`, scales after it, adds a bias to it, or runs a
+        // convolution instead; a layer with any of the six runs on the
+        // host.
         if output_gate.is_some()
             || sinks.is_some()
             || attn_sub_norm.is_some()
             || o_scale.is_some()
             || o_bias.is_some()
+            || shortconv.is_some()
         {
             return None;
         }
@@ -4395,6 +4424,19 @@ impl Decoder {
                         residual_add(&mut hidden_batch, &projected, self.config.residual_scale);
                         break 'attention;
                     }
+                    // lfm2.cpp:197: the rows are consecutive positions of
+                    // one sequence, on this layer's cache.
+                    crate::layer_shapes::AttnShape::ShortConv => {
+                        let out = self.shortconv_block(
+                            l,
+                            layer,
+                            &normed_batch,
+                            batch_size,
+                            KvStep::Batched(cache),
+                        );
+                        residual_add(&mut hidden_batch, &out, self.config.residual_scale);
+                        break 'attention;
+                    }
                     crate::layer_shapes::AttnShape::Gqa { .. } => {}
                 }
 
@@ -4740,17 +4782,7 @@ impl Decoder {
         v: &[f32],
         q: &[f32],
     ) -> Vec<f32> {
-        let step = match kv {
-            // `Batched`, not `Decode`: the CUDA resident per-layer KV
-            // holds ONE sequence's history, and this path never seeds
-            // it. See `KvStep::Batched`.
-            MultiSeqKv::Contiguous(caches) => KvStep::Batched(&mut caches[b][l]),
-            MultiSeqKv::Paged { caches, stores } => KvStep::Paged {
-                cache: &mut caches[b][l],
-                stores,
-            },
-        };
-        self.push_and_attend_row(step, l, layer, k, v, q)
+        self.push_and_attend_row(kv.step(b, l), l, layer, k, v, q)
     }
 
     /// The body of [`Self::forward_multi_seq_kv`], already running on a
@@ -4804,6 +4836,23 @@ impl Decoder {
                     crate::layer_shapes::AttnShape::Linear => {
                         let projected = layer.attn.o_proj.apply_batch(&normed_batch, batch_size);
                         residual_add(&mut hidden_batch, &projected, self.config.residual_scale);
+                        break 'attention;
+                    }
+                    // lfm2.cpp:197: each row is ONE position of its own
+                    // sequence, so each runs on its own cache.
+                    crate::layer_shapes::AttnShape::ShortConv => {
+                        let mut out = Vec::with_capacity(batch_size * hidden_dim);
+                        for b in 0..batch_size {
+                            let step = kv.step(b, l);
+                            out.extend(self.shortconv_block(
+                                l,
+                                layer,
+                                &normed_batch[b * hidden_dim..(b + 1) * hidden_dim],
+                                1,
+                                step,
+                            ));
+                        }
+                        residual_add(&mut hidden_batch, &out, self.config.residual_scale);
                         break 'attention;
                     }
                     crate::layer_shapes::AttnShape::Gqa { .. } => {}

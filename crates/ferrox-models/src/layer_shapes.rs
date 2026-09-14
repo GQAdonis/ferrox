@@ -138,9 +138,16 @@ pub const PER_LAYER_SHAPE_ARCHS: &[(&str, &str)] = &[
         "hybrid: n_head_kv(il) == 0 marks a recurrent layer (lfm2moe.cpp:13,63)",
     ),
     (
-        "nemotron-h",
-        "hybrid: n_head_kv(i) == 0 && n_ff(i) == 0 marks a recurrent layer \
-         (nemotron-h.cpp:13,82-114,149,189)",
+        "nemotron_h",
+        "generic. nemotron-h.cpp:9-11 (hparams), :53-98 (loader) and :146-153 (graph): \
+         n_head_kv(i) == 0 && n_ff(i) == 0 marks a Mamba-2 layer, n_ff(i) == 0 alone an \
+         attention layer, the rest an FFN-only layer; one block per layer \
+         (`BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT`), served since 2026-09-14",
+    ),
+    (
+        "nemotron_h_moe",
+        "nemotron-h.cpp:9-11, the same rule; its latent ungated ReLU-squared MoE (:79-90) is \
+         not served yet",
     ),
     (
         "plamo2",
@@ -199,6 +206,17 @@ pub enum AttnShape {
     Mamba2,
 }
 
+/// Architectures whose graph ADDS a block's output to the residual on a
+/// layer with `feed_forward_length 0`, so "attention with no FFN" and
+/// "Mamba-2 with no FFN" are layers rather than a defect.
+///
+/// `nemotron-h.cpp:157` adds `cur` for every kind of layer. deci is the
+/// other reading: `deci.cpp:147-149` `continue`s BEFORE the add, so its
+/// attention output is DISCARDED, and `LayerShapes::resolve` refuses
+/// that combination for every architecture not listed here rather than
+/// pin a dropped branch as the reference.
+pub const BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT: &[&str] = &["nemotron_h", "nemotron_h_moe"];
+
 /// What `head_count_kv == 0` with `head_count > 0` MEANS for an
 /// architecture, because two graphs spell two different blocks with the
 /// same two counts and the counts alone cannot tell them apart.
@@ -210,6 +228,12 @@ pub enum ZeroKvLayer {
     ShortConv,
     /// `granite-hybrid.cpp:163`: the Mamba-2 block (`crate::mamba2`).
     Mamba2,
+    /// `nemotron-h.cpp:9-11`: the Mamba-2 block when the layer's FFN
+    /// width is ALSO zero, and an FFN-only layer (no attention block at
+    /// all, [`AttnShape::Absent`]) when it is not -- every Nemotron-H
+    /// layer is one block, and `feed_forward_length` is the second
+    /// array that says which.
+    Mamba2UnlessFfn,
     /// A recurrent block ferrox has no body for; the reason names it.
     Unserved(&'static str),
 }
@@ -244,13 +268,11 @@ impl ZeroKvLayer {
                  does not have",
             ),
             // `nemotron-h.cpp:9-11,143-152`: a layer is ONE of Mamba-2,
-            // attention, or FFN, with one residual add; the generic
-            // layer runs a block AND an FFN.
-            "nemotron-h" | "nemotron_h" | "nemotron_h_moe" => ZeroKvLayer::Unserved(
-                "a Mamba-2 block on a layer with NO FFN (nemotron-h.cpp:9-11: recurrent iff \
-                 head_count_kv == 0 && feed_forward_length == 0), a one-block-per-layer \
-                 topology the generic layer does not have",
-            ),
+            // attention, or FFN, with one residual add. On the generic
+            // layer that is a block with `ffn_dim 0`
+            // ([`BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT`]) or an FFN with no
+            // block.
+            "nemotron_h" | "nemotron_h_moe" => ZeroKvLayer::Mamba2UnlessFfn,
             "plamo2" => ZeroKvLayer::Unserved(
                 "a Mamba-1 block (plamo2.cpp:218-219), which ferrox has no body for",
             ),
@@ -270,9 +292,13 @@ impl AttnShape {
     /// take the attention-free branch while the loader (`:36-45`)
     /// would create a zero-wide Q, which is not a shape any converter
     /// writes.
+    ///
+    /// `ffn_dim` is this layer's FFN width, which one rule
+    /// ([`ZeroKvLayer::Mamba2UnlessFfn`]) reads.
     pub fn from_counts(
         n_heads: usize,
         n_kv_heads: usize,
+        ffn_dim: usize,
         zero_kv: ZeroKvLayer,
     ) -> Result<Self, String> {
         match (n_heads, n_kv_heads) {
@@ -285,6 +311,10 @@ impl AttnShape {
                 ZeroKvLayer::Linear => Ok(AttnShape::Linear),
                 ZeroKvLayer::ShortConv => Ok(AttnShape::ShortConv),
                 ZeroKvLayer::Mamba2 => Ok(AttnShape::Mamba2),
+                // nemotron-h.cpp:9-11: `n_head_kv == 0 && n_ff == 0`.
+                ZeroKvLayer::Mamba2UnlessFfn if ffn_dim == 0 => Ok(AttnShape::Mamba2),
+                // :152-153: the FFN alone, under `attn_norm` (:145).
+                ZeroKvLayer::Mamba2UnlessFfn => Ok(AttnShape::Absent),
                 ZeroKvLayer::Unserved(what) => Err(format!(
                     "head_count_kv 0 marks {what}; `layer_shapes::ZeroKvLayer` is the table"
                 )),
@@ -427,14 +457,15 @@ impl LayerShapes {
         }
         let mut shapes = Vec::with_capacity(n);
         let zero_kv = ZeroKvLayer::for_arch(arch);
+        let keeps_output = BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT.contains(&arch);
         for il in 0..n {
+            let ffn_dim = ffn.map_or(expert_ffn_dim, |f| f[il] as usize);
             let attention =
-                AttnShape::from_counts(heads[il] as usize, kv_heads[il] as usize, zero_kv)
+                AttnShape::from_counts(heads[il] as usize, kv_heads[il] as usize, ffn_dim, zero_kv)
                     .map_err(|why| {
                         LoadError::UnsupportedFeature(arch.to_string(), format!("blk.{il}: {why}"))
                     })?;
-            let ffn_dim = ffn.map_or(expert_ffn_dim, |f| f[il] as usize);
-            if ffn_dim == 0 && attention != AttnShape::Absent {
+            if ffn_dim == 0 && attention != AttnShape::Absent && !keeps_output {
                 // deci.cpp:147-149 `continue`s BEFORE the residual add
                 // at :150-153, so the attention output computed at
                 // :115-137 is discarded and `inpL` is left untouched.
@@ -839,17 +870,23 @@ mod tests {
     #[test]
     fn the_two_zero_counts_are_two_different_layer_kinds() {
         let deci = ZeroKvLayer::for_arch("deci");
-        assert_eq!(AttnShape::from_counts(0, 0, deci), Ok(AttnShape::Absent));
-        assert_eq!(AttnShape::from_counts(4, 0, deci), Ok(AttnShape::Linear));
         assert_eq!(
-            AttnShape::from_counts(4, 2, deci),
+            AttnShape::from_counts(0, 0, 16, deci),
+            Ok(AttnShape::Absent)
+        );
+        assert_eq!(
+            AttnShape::from_counts(4, 0, 16, deci),
+            Ok(AttnShape::Linear)
+        );
+        assert_eq!(
+            AttnShape::from_counts(4, 2, 16, deci),
             Ok(AttnShape::Gqa {
                 n_heads: 4,
                 n_kv_heads: 2
             })
         );
-        assert!(AttnShape::from_counts(0, 2, deci).is_err());
-        assert!(AttnShape::from_counts(3, 2, deci).is_err());
+        assert!(AttnShape::from_counts(0, 2, 16, deci).is_err());
+        assert!(AttnShape::from_counts(3, 2, 16, deci).is_err());
         assert_eq!(AttnShape::Linear.n_kv_heads(), 0);
         assert_eq!(AttnShape::Absent.n_heads(), 0);
     }
@@ -860,21 +897,48 @@ mod tests {
     #[test]
     fn a_zero_kv_layer_means_what_the_architecture_says() {
         let lfm2 = ZeroKvLayer::for_arch("lfm2");
-        assert_eq!(AttnShape::from_counts(4, 0, lfm2), Ok(AttnShape::ShortConv));
+        assert_eq!(
+            AttnShape::from_counts(4, 0, 16, lfm2),
+            Ok(AttnShape::ShortConv)
+        );
         // GQA layers are GQA on every architecture.
         assert!(matches!(
-            AttnShape::from_counts(4, 2, lfm2),
+            AttnShape::from_counts(4, 2, 16, lfm2),
             Ok(AttnShape::Gqa { .. })
         ));
-        let err = AttnShape::from_counts(4, 0, ZeroKvLayer::for_arch("jamba")).unwrap_err();
+        let err = AttnShape::from_counts(4, 0, 16, ZeroKvLayer::for_arch("jamba")).unwrap_err();
         assert!(err.contains("Mamba-1"), "{err}");
         // The cache: one row of n_embd per token, no V.
         assert_eq!(AttnShape::ShortConv.cache_geometry(6, 6, 24), (1, 24, 0));
         // Mamba-2: no rows at all, the state rides beside the cache.
         assert_eq!(
-            AttnShape::from_counts(4, 0, ZeroKvLayer::for_arch("granitehybrid")),
+            AttnShape::from_counts(4, 0, 16, ZeroKvLayer::for_arch("granitehybrid")),
             Ok(AttnShape::Mamba2)
         );
+        // nemotron-h.cpp:9-11: the FFN width is the second array.
+        let nh = ZeroKvLayer::for_arch("nemotron_h");
+        assert_eq!(AttnShape::from_counts(4, 0, 0, nh), Ok(AttnShape::Mamba2));
+        assert_eq!(AttnShape::from_counts(4, 0, 40, nh), Ok(AttnShape::Absent));
+        // Attention with no FFN: refused as deci's discarded branch,
+        // served as Nemotron-H's one-block layer.
+        assert!(LayerShapes::resolve("deci", &[4, 4], &[2, 2], Some(&[16, 0]), 16).is_err());
+        let s = LayerShapes::resolve("nemotron_h", &[4, 4, 4], &[0, 2, 0], Some(&[0, 0, 40]), 16)
+            .unwrap();
+        let LayerShapes::PerLayer(v) = s else {
+            panic!("per layer");
+        };
+        assert_eq!(
+            v.iter().map(|l| l.attention).collect::<Vec<_>>(),
+            [
+                AttnShape::Mamba2,
+                AttnShape::Gqa {
+                    n_heads: 4,
+                    n_kv_heads: 2
+                },
+                AttnShape::Absent
+            ]
+        );
+        assert_eq!(v.iter().map(|l| l.ffn_dim).collect::<Vec<_>>(), [0, 0, 40]);
         assert_eq!(AttnShape::Mamba2.cache_geometry(6, 6, 24), (0, 6, 6));
         assert!(AttnShape::Mamba2.is_recurrent() && !AttnShape::ShortConv.is_recurrent());
         assert_eq!(AttnShape::Linear.cache_geometry(6, 6, 24), (0, 6, 6));
@@ -1031,6 +1095,7 @@ mod tests {
                 "plamo3",
                 "laguna",
                 "step35",
+                "nemotron_h",
                 "granitehybrid",
                 "granite-hybrid"
             ]

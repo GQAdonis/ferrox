@@ -142,6 +142,16 @@ pub const EMBEDDING_NORM_ARCHITECTURES: &[&str] = &["bloom"];
 /// (`lfm2moe.cpp:31`).
 pub const OUTPUT_NORM_UNDER_EMBEDDING_NAME: &[&str] = &["lfm2", "lfm2moe"];
 
+/// Architectures with ONE norm per layer, `attn_norm`, whatever the
+/// layer's block is: `nemotron-h.cpp:52` ("all blocks use the attn
+/// norm"), `:145`. Every Nemotron-H layer is a single block with a
+/// single residual add (`layer_shapes::BLOCK_WITHOUT_FFN_KEEPS_ITS_
+/// OUTPUT`), so a layer reads EITHER the attention slot (a Mamba-2 or
+/// attention layer, `ffn_dim 0`) OR the FFN slot (an FFN-only layer,
+/// `AttnShape::Absent`), never both, and pointing the FFN slot at
+/// `attn_norm` is exact.
+pub const ONE_NORM_PER_LAYER: &[&str] = &["nemotron_h", "nemotron_h_moe"];
+
 /// A norm site whose weight the file stores.
 ///
 /// `names` are base names tried in order; each is looked up as
@@ -311,6 +321,9 @@ impl NormSites {
         if PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM.contains(&arch) {
             sites.ffn = Some(StoredNorm::required(&["attn_output_norm"]));
         }
+        if ONE_NORM_PER_LAYER.contains(&arch) {
+            sites.ffn = Some(StoredNorm::required(&["attn_norm"]));
+        }
         if POST_NORMS_UNDER_GROK_NAMES.contains(&arch) {
             sites.post_attn = Some(StoredNorm::required(&["attn_output_norm"]));
             sites.post_ffn = Some(StoredNorm::required(&[
@@ -419,6 +432,15 @@ mod tests {
             NormSites::for_arch("bloom").embedding,
             Some(StoredNorm::required(&["token_embd_norm"]))
         );
+    }
+
+    /// Nemotron-H's FFN-only layer norms with `attn_norm`
+    /// (nemotron-h.cpp:52,145).
+    #[test]
+    fn nemotron_h_has_one_norm_per_layer() {
+        let s = NormSites::for_arch("nemotron_h");
+        assert_eq!(s.attn, Some(StoredNorm::required(&["attn_norm"])));
+        assert_eq!(s.ffn, Some(StoredNorm::required(&["attn_norm"])));
     }
 
     /// `token_embd_norm` is bloom's EMBEDDING norm and LFM2's OUTPUT

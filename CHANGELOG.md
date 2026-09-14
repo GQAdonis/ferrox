@@ -17,6 +17,16 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`nemotron_h` runs: Nemotron-H 8B / 47B / 56B, Nemotron-3 Nano
+  dense.** One block per layer on the Mamba-2 seam:
+  `layer_shapes::ZeroKvLayer::Mamba2UnlessFfn` reads both per-layer
+  arrays, `BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT` admits a block with no
+  FFN (deci's is discarded and stays refused), `norm_sites::
+  ONE_NORM_PER_LAYER` norms the FFN-only layer with `attn_norm`,
+  `rope_layers` answers `Never` (no `ggml_rope_ext` in the graph),
+  optional `attn_output.bias` / FFN biases, ungated ReLU-squared FFN.
+  KL 2.0e-13 / 1.4e-12 / 7.5e-14 (`tests/nemotron_h_graphs.rs`,
+  `scripts/make_nemotron_h_fixture.py`). 82 audited.
 - **`granitehybrid` runs: Granite 4.0 (H-Micro, H-Tiny, H-Small), the
   first Mamba-2 row, on the generic path.** `ferrox_core::mamba2` is
   ggml's `ssm_conv` and `ssm_scan` steps; `ferrox_models::mamba2` is

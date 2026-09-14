@@ -213,6 +213,9 @@ pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> Rop
         // position table is added to the embeddings instead
         // (`crate::position_embd`).
         "gpt2" | "starcoder" => RopeLayers::Never,
+        // `nemotron-h.cpp:181-193` builds its attention with no
+        // `ggml_rope_ext` at all: the Mamba-2 layers carry position.
+        "nemotron_h" | "nemotron_h_moe" => RopeLayers::Never,
         // The ALiBi graphs (`crate::alibi`): `bloom`, `refact`, `mpt`,
         // `jais`, and `baichuan` at 40 layers ONLY (`baichuan.cpp:11-14`;
         // the 7B rotates). One table decides both the bias and the

@@ -93,6 +93,18 @@ is faster.
   without it (measured). `nemotron-h` (one block per layer),
   `falcon-h1` (attention and Mamba-2 in parallel), `jamba` and `plamo2`
   (Mamba-1) name what they still need (`layer_shapes::ZeroKvLayer`).
+- **Nemotron-H** (`nemotron_h`: Nemotron-H 8B / 47B / 56B, Nemotron-3
+  Nano dense), audited against libllama on 2026-09-14
+  (`tests/nemotron_h_graphs.rs`, KL 2.0e-13 / 1.4e-12 / 7.5e-14). The
+  one-block-per-layer hybrid: `nemotron-h.cpp:143-158` runs every layer
+  as Mamba-2, attention (no RoPE, `RopeLayers::Never`) or an ungated
+  ReLU-squared FFN under one `attn_norm` with one residual add. On the
+  generic layer that is a block with `ffn_dim 0` whose output IS added
+  (`layer_shapes::BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT`; deci's is
+  discarded), or an FFN with no block whose pre-norm is `attn_norm`
+  (`norm_sites::ONE_NORM_PER_LAYER`); `ZeroKvLayer::Mamba2UnlessFfn`
+  reads the two arrays. `nemotron_h_moe` (Nemotron-3 Nano 30B-A3B)
+  needs its latent ungated MoE and stays refused by name.
 - **openPangu-Embedded** (`pangu-embedded`: 1B / 7B), audited against
   libllama on 2026-09-14 (`tests/pangu_embedded_graphs.rs`, KL 1.5e-13).
   A decoder LLM ("Embedded" as in edge devices) that had been filed as

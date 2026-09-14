@@ -175,7 +175,7 @@ mod tests {
             "deepseek",
             "grovemoe",
             "gemma4",
-            "nemotron-h",
+            "nemotron_h_moe",
             "llama4",
             "cohere2moe",
         ] {

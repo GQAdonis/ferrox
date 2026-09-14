@@ -1081,6 +1081,14 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // shape), NoPE MoE with the shared expert.
     "granitehybrid",
     "granite-hybrid",
+    // tests/nemotron_h_graphs.rs: `nemotron_h` (Nemotron-H 8B / 47B /
+    // 56B, Nemotron-3 Nano dense). Every layer ONE block -- Mamba-2
+    // (`n_head_kv == 0 && n_ff == 0`), attention (`n_ff == 0`, no RoPE,
+    // optional `attn_output.bias`) or the ungated ReLU-squared FFN
+    // (optional biases) -- under `attn_norm` with one residual add
+    // (`nemotron-h.cpp:9-11,143-158`). Three fixtures: plain, the three
+    // optional biases, a separate `output.weight`.
+    "nemotron_h",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1799,6 +1807,26 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 WholeVector,
             ));
         }
+        // Nemotron-H (`nemotron_h`: Nemotron-H 8B / 47B / 56B, Nemotron-3
+        // Nano dense). One block per layer -- Mamba-2, attention or an
+        // ungated ReLU-squared FFN -- under ONE `attn_norm` and one
+        // residual add (`nemotron-h.cpp:143-158`; `layer_shapes::
+        // BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT`, `ZeroKvLayer::
+        // Mamba2UnlessFfn`, `norm_sites::ONE_NORM_PER_LAYER`). Its
+        // attention never calls `ggml_rope_ext` (`:181-193`): the NEOX
+        // group entry (llama-model.cpp:2671) is a filler and
+        // `rope_layers` answers `Never`. Audited on
+        // tests/nemotron_h_graphs.rs. `nemotron_h_moe` stays above for
+        // its latent ungated MoE.
+        v.push(prof(
+            "nemotron_h",
+            TextGeneration,
+            DecoderFamily::Hybrid,
+            MemoryKind::Hybrid,
+            Neox,
+            ArchPath::GenericGqa { rope: Neox },
+            WholeVector,
+        ));
         // OLMo-1 was NEW CODE in `NORM_ROPE_TRIAGED` on its
         // non-parametric LayerNorm, which `crate::norm::NormOp` now
         // implements (`tests/olmo_graphs.rs`). NORM RoPE:
@@ -2437,7 +2465,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             ("jamba", Neox),
             ("falcon-h1", Neox),
             ("plamo2", Neox),
-            ("nemotron_h", Neox),
             ("nemotron_h_moe", Neox),
             ("qwen3next", Neox),
             ("qwen35", Neox),
@@ -2823,16 +2850,17 @@ pub fn uses_geglu(arch: &str) -> bool {
 ///
 /// Five graphs pass `LLM_FFN_RELU_SQR` upstream -- measured, by
 /// grepping `src/models/*.cpp`: `arcee`, `plm`, `nemotron`, `jais2`,
-/// `nemotron-h`. Only `arcee` reaches the generic path with nothing
-/// else in the way: `plm` is MLA attention and runs on the MLA engine
-/// (`crate::mla_arch` reads the same fact from its own table, and
-/// `mla_arch_and_this_table_agree_about_plm` pins that they agree),
-/// `nemotron` and `jais2` are in the biased-LayerNorm group
-/// (`WEIGHTED_LAYER_NORM`), `nemotron-h` is a hybrid recurrent model.
-/// They are listed so that closing one of them finds its FFN already
-/// implemented and named here.
+/// `nemotron-h` (the GGUF string is `nemotron_h`; the MoE sibling's
+/// dense shared expert and its experts pass it too, `:190,227`). All
+/// five serve it: `plm` on the MLA engine (`crate::mla_arch` reads the
+/// same fact from its own table, and
+/// `mla_arch_and_this_table_agree_about_plm` pins that they agree), the
+/// rest on the generic path.
 pub fn uses_relu_sqr(arch: &str) -> bool {
-    matches!(arch, "arcee" | "plm" | "nemotron" | "jais2" | "nemotron-h")
+    matches!(
+        arch,
+        "arcee" | "plm" | "nemotron" | "jais2" | "nemotron_h" | "nemotron_h_moe"
+    )
 }
 
 /// Architectures whose FFN is the UNGATED GELU MLP:

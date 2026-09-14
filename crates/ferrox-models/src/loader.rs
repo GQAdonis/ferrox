@@ -3623,7 +3623,7 @@ mod tests {
                 .ffn_activation,
             FfnActivation::ReluSqr
         );
-        for shared in ["plm", "nemotron", "jais2", "nemotron-h"] {
+        for shared in ["plm", "nemotron", "jais2", "nemotron_h"] {
             assert!(crate::capability::uses_relu_sqr(shared), "{shared}");
         }
         assert!(!crate::capability::uses_relu_sqr("llama"));

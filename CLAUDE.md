@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **81** architectures run with
+Honest position, re-audited 2026-09-14. **82** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -983,6 +983,27 @@ the state every token or dropping the `exp` from the decay turns five
 tests red. `nemotron-h` (one block per layer), `falcon-h1` (attention
 and Mamba-2 in PARALLEL), `jamba` and `plamo2` (Mamba-1) each name
 what they still need in `layer_shapes::ZeroKvLayer`.
+
+`nemotron_h` (Nemotron-H 8B / 47B / 56B, Nemotron-3 Nano dense) closed
+the same day on that seam, and what it added is two table rows and no
+arithmetic: `nemotron-h.cpp:143-158` runs every layer as ONE block --
+Mamba-2 where both arrays are zero (`:9-11`), attention where only the
+FFN width is, the ungated ReLU-squared FFN otherwise -- under ONE
+`attn_norm` with ONE residual add. On the generic layer that is "a
+block with `ffn_dim 0`", which `LayerShapes::resolve` had REFUSED for
+every architecture because deci DISCARDS such a block's output
+(`deci.cpp:147-149`) and Nemotron-H adds it (`:157`): one reading per
+graph, `BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT`. And "an FFN with no
+block", whose pre-norm is `attn_norm` because the graph has one norm
+per layer (`norm_sites::ONE_NORM_PER_LAYER`; exact, because a layer
+reads one slot or the other and never both). `ZeroKvLayer::
+Mamba2UnlessFfn` is the rule that reads the second array. Its
+attention never calls `ggml_rope_ext` (`:181-193`), so the NEOX group
+entry is a filler and `rope_layers` answers `Never`. KL 2.0e-13 /
+1.4e-12 / 7.5e-14 (`tests/nemotron_h_graphs.rs`); pointing the FFN
+slot at `ffn_norm` turns every test red. `nemotron_h_moe`
+(Nemotron-3 Nano 30B-A3B) needs its latent ungated ReLU-squared MoE
+(`:79-90,163-190`) and says so.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

@@ -198,6 +198,29 @@ is faster.
   `tests/position_embd_graphs.rs`: KL 1.9e-7 each at the f16 GELU-table
   line; dropping the table or rotating the layers diverges by more
   than 1.
+- **ALiBi, and with it Refact (`refact`), BLOOM (`bloom`), MPT (`mpt`),
+  Jais (`jais`) and Baichuan-13B.** `ferrox_core::alibi::slopes` is
+  llama.cpp's per-head slope formula (`ggml-cpu/ops.cpp:5489-5508`), and
+  the three host attention kernels (row, paged, batched prefill) take
+  the slopes as an additive `slope_h * (p_key - p_query)` on every
+  score after the scale and the softcap, where `ggml_soft_max_ext` adds
+  `slope * mask`; `ferrox_models::alibi` is the table of the five
+  graphs and where each gets `f_max_alibi_bias` (the literal 8 for
+  `bloom` / `refact`, the literal at 40 layers only for `baichuan`,
+  `attention.max_alibi_bias` for `mpt` / `jais`), and
+  `rope_layers::RopeLayers::Never` is derived from the same table so
+  the bias and the absence of rotation cannot disagree about a layer
+  count. Every fused Metal launch and the CUDA resident attention
+  refuse a model with a bias. On the way: `bloom`'s `token_embd_norm`
+  (`norm_sites::EMBEDDING_NORM_ARCHITECTURES`, the one decoder of 140
+  that norms its embeddings), `jais`'s `1/d` attention scale
+  (`jais.cpp:83`, the one graph that passes a literal `kq_scale` other
+  than `1/sqrt(d)`), `mpt`'s `clamp_kqv` and optional `position_embd`,
+  `mpt`'s whole-vector LayerNorm QK norm refused by name.
+  `tests/alibi_graphs.rs`: KL 6.4e-13 (refact), 8.3e-8 (bloom, GELU
+  table), 3.6e-7 / 1.6e-7 (mpt with clamp, mpt with a position table),
+  7.4e-13 (jais), 1.1e-12 (Baichuan-13B, 40 layers); dropping the
+  slopes, rotating on top, or the wrong slope table each diverge.
 - **The LayerNorm with a bias, and with it Orion-14B (`orion`) and
   Nemotron-4 / Minitron (`nemotron`).** `NormOp::LayerNormBias` is
   `build_norm(x, w, b, LLM_NORM)`, the variant the eight-row

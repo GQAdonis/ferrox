@@ -447,6 +447,14 @@ pub struct ModelConfig {
     /// that mean none. Applied in `Decoder::attn_out_to_residual_rows`;
     /// the fused Metal launches refuse a model that has one.
     pub attn_value_scale: Option<f32>,
+    /// llama.cpp's `f_max_alibi_bias` when it is positive: the model
+    /// positions by ALiBi and rotates nothing (`crate::alibi` for which
+    /// graphs and where each gets the number; `ferrox_core::alibi` for
+    /// the per-head slopes, which `Decoder::alibi_slopes` holds). `None`
+    /// for every other model. The fused Metal launches and the CUDA
+    /// resident attention refuse a model that has one: their kernels
+    /// add no per-key bias.
+    pub alibi_max_bias: Option<f32>,
     /// Nanbeige's `num_loops`: `Some` when the model's logical layers
     /// are several passes over its physical ones (`nanbeige.cpp:19-31`).
     /// [`Self::n_layers`] is then the LOGICAL count, `Decoder::layers`
@@ -978,6 +986,7 @@ pub fn glm_5_2() -> ModelConfig {
         parallel_residual: false,
         learned_positions: false,
         attn_value_scale: None,
+        alibi_max_bias: None,
         layer_loops: None,
         skip_stream: false,
         logit_multiplier: None,
@@ -1072,6 +1081,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         parallel_residual: false,
         learned_positions: false,
         attn_value_scale: None,
+        alibi_max_bias: None,
         layer_loops: None,
         skip_stream: false,
         logit_multiplier: None,
@@ -1198,6 +1208,7 @@ pub fn kimi_k3() -> ModelConfig {
         parallel_residual: false,
         learned_positions: false,
         attn_value_scale: None,
+        alibi_max_bias: None,
         layer_loops: None,
         skip_stream: false,
         logit_multiplier: None,
@@ -1270,6 +1281,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         parallel_residual: false,
         learned_positions: false,
         attn_value_scale: None,
+        alibi_max_bias: None,
         layer_loops: None,
         skip_stream: false,
         logit_multiplier: None,
@@ -1337,6 +1349,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         parallel_residual: false,
         learned_positions: false,
         attn_value_scale: None,
+        alibi_max_bias: None,
         layer_loops: None,
         skip_stream: false,
         logit_multiplier: None,
@@ -1407,6 +1420,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         parallel_residual: false,
         learned_positions: false,
         attn_value_scale: None,
+        alibi_max_bias: None,
         layer_loops: None,
         skip_stream: false,
         logit_multiplier: None,

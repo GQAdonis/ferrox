@@ -266,7 +266,12 @@ impl Decoder {
         // a layer with sinks, or a model whose V width differs
         // (`crate::kv_head_dims`) takes the host kernel.
         let cuda_resident_layer = match &kv {
-            KvStep::Decode(_) if window.is_none() && sinks.is_none() && v_head_dim == head_dim => {
+            KvStep::Decode(_)
+                if window.is_none()
+                    && sinks.is_none()
+                    && v_head_dim == head_dim
+                    && self.alibi_slopes.is_none() =>
+            {
                 Some(layer_idx)
             }
             KvStep::Decode(_) | KvStep::Batched(_) | KvStep::Paged { .. } => None,
@@ -301,6 +306,7 @@ impl Decoder {
                         window,
                         sinks,
                         softcap,
+                        self.alibi_slopes.as_deref(),
                     ),
                 };
                 // AFTER the read, never inside `push`: the rows this
@@ -337,6 +343,7 @@ impl Decoder {
                     window,
                     sinks,
                     softcap,
+                    self.alibi_slopes.as_deref(),
                 )
             }
         }

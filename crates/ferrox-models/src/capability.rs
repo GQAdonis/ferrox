@@ -1012,6 +1012,22 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // `rope_layers::RopeLayers::Never`).
     "gpt2",
     "starcoder",
+    // tests/alibi_graphs.rs: the four ALiBi rows (`crate::alibi`), no
+    // rotation (`rope_layers::RopeLayers::Never`), the bias `slope_h *
+    // (p_key - p_query)` on every score. `refact.cpp:12` (the literal 8;
+    // RMSNorm, split Q/K/V, SwiGLU, multi-query), `bloom.cpp:18` (the
+    // literal; the biased LayerNorm on the embeddings and every site, a
+    // fused `attn_qkv` with bias, the required projection biases, the
+    // ungated GELU), `mpt.cpp:6` (`attention.max_alibi_bias`; the
+    // weighted LayerNorm, its biases and `position_embd` optional, the
+    // ungated GELU, `clamp_kqv`), `jais.cpp:5` (the key; the biased
+    // LayerNorm, the required projection biases with `ffn_gate.bias`,
+    // SwiGLU). Baichuan-13B is the same seam on a row that was audited
+    // for the 7B: `baichuan.cpp:11-14` at 40 layers.
+    "refact",
+    "bloom",
+    "mpt",
+    "jais",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1136,7 +1152,7 @@ pub fn uses_non_parametric_rms_norm(arch: &str) -> bool {
 /// (`crate::scalar_multipliers`); `tests/command_r_graphs.rs`. The
 /// third is `cohere2` (Command-R7B), the same graph with a window
 /// (`cohere2.cpp:78,147`); `tests/cohere2_graphs.rs`.
-pub const WEIGHTED_LAYER_NORM: &[&str] = &["dbrx", "command-r", "cohere2"];
+pub const WEIGHTED_LAYER_NORM: &[&str] = &["dbrx", "command-r", "cohere2", "mpt"];
 
 /// Does this architecture normalise with a weighted LayerNorm?
 /// See [`WEIGHTED_LAYER_NORM`].
@@ -1201,6 +1217,8 @@ pub const BIASED_LAYER_NORM: &[&str] = &[
     "phi2",
     "gpt2",
     "starcoder",
+    "bloom",
+    "jais",
 ];
 
 /// See [`BIASED_LAYER_NORM`].
@@ -1823,6 +1841,24 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // and NORM for `starcoder`, and neither graph calls `ggml_rope`.
         v.push(gqa_norm("gpt2"));
         v.push(gqa_norm("starcoder"));
+        // The ALiBi rows (`crate::alibi`; tests/alibi_graphs.rs): no
+        // rotation, the bias added to every score. The layout is a
+        // filler nothing reads. `refact` (Refact-1.6B): RMSNorm, split
+        // Q/K/V, SwiGLU, multi-query, the literal 8. `bloom` (BLOOM):
+        // the biased LayerNorm on the embeddings too
+        // (`norm_sites::EMBEDDING_NORM_ARCHITECTURES`), fused `attn_qkv`
+        // with bias, the required projection biases, the ungated GELU,
+        // the literal 8. `mpt` (MPT-7B / 30B): the weighted LayerNorm
+        // (its biases are all optional and MPT has none), fused
+        // `attn_qkv`, optional projection biases, the ungated GELU,
+        // `attention.max_alibi_bias` from the key with `clamp_kqv` and
+        // an optional `position_embd`. `jais` (Jais-13B / 30B): the
+        // biased LayerNorm, fused `attn_qkv` with bias, the required
+        // projection biases INCLUDING `ffn_gate.bias`, SwiGLU, the key.
+        v.push(gqa_norm("refact"));
+        v.push(gqa_norm("bloom"));
+        v.push(gqa_norm("mpt"));
+        v.push(gqa_norm("jais"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -1974,102 +2010,19 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         for (n, class, blocker) in NEOX_ROPE_TRIAGED {
             v.push(gqa_neox(n).triaged(*class, blocker));
         }
-        // --- No RoPE at all: refused, not rotated ------------------
+        // --- No RoPE at all -------------------------------------------
         //
         // `llama_model_rope_type` opens with a `LLAMA_ROPE_TYPE_NONE`
-        // group, and these five sat on ferrox's NEOX list instead. The
-        // generic decoder rotates every Q/K head of every layer, so each
-        // of them loaded, ran at full speed, and answered fluently from
-        // positions the checkpoint never encodes that way, the same
-        // silent failure the 24-arch RoPE audit found, one level worse,
-        // because here the right answer is *no rotation*.
-        //
-        // Worse still for a metadata gate: `bloom` and `refact` hardcode
-        // `f_max_alibi_bias = 8.0f` in `load_arch_hparams` and carry no
-        // key at all, so `unsupported_feature_keys` could never have seen
-        // them. Only the registry can. `tests/rope_layout.rs`'s
-        // `LLAMA_NO_ROPE` pins the group so a later edit cannot quietly
-        // put one back on a rotating path.
-        for (n, reason) in [
-            // `gpt2` was HERE; audited now (tests/position_embd_graphs.rs):
-            // its learned table is `crate::position_embd` and it rotates
-            // nothing (`rope_layers::RopeLayers::Never`).
-            (
-                "mpt",
-                "ALiBi attention bias (src/models/mpt.cpp:6), plus an optional \
-                 learned `position_embd` and an optional QKV clamp; the generic \
-                 decoder implements none of the three and applies RoPE instead",
-            ),
-            (
-                "refact",
-                "ALiBi attention bias, hardcoded `f_max_alibi_bias = 8.0f` with no \
-                 GGUF key to detect it (src/models/refact.cpp:12); the generic \
-                 decoder applies RoPE instead",
-            ),
-            (
-                "bloom",
-                "ALiBi attention bias, hardcoded `f_max_alibi_bias = 8.0f` with no \
-                 GGUF key (src/models/bloom.cpp:18), plus a `token_embd_norm` the \
-                 generic decoder never applies; RoPE is applied instead",
-            ),
-            (
-                "jais",
-                "ALiBi attention bias (src/models/jais.cpp:5); the generic decoder \
-                 applies RoPE instead",
-            ),
-        ] {
-            v.push(prof(
-                n,
-                TextGeneration,
-                StandardGqa,
-                KvGqa,
-                // No layout is right here. `Norm` is the struct's least
-                // surprising filler and nothing reads it: the load
-                // refuses in `ModelConfig::from_gguf` before any graph
-                // asks. `rope_layout_matches_llama_cpp` skips
-                // non-generic paths for exactly this reason.
-                Norm,
-                ArchPath::DedicatedOnly { reason },
-                WholeVector,
-            ));
-        }
-        // --- Required bias tensors the generic decoder has no slot for
-        //
-        // Found by transcribing every `create_tensor(tn(..., "bias"), ...)`
-        // llama.cpp's per-architecture loaders create with flag `0`
-        // (REQUIRED, as opposed to `TENSOR_NOT_REQUIRED`). Required means
-        // every real checkpoint of that architecture carries it, so this
-        // is not a "some files might" gate.
-        //
-        // `AttnWeights` carries exactly three of them -- `attn_q.bias`,
-        // `attn_k.bias`, `attn_v.bias` -- and `GptOssWeights` carries
-        // gpt-oss's `attn_output.bias` and `ffn_gate_inp.bias`. Nothing
-        // else has anywhere to go:
-        //
-        // - `attn_output.bias`, `ffn_{up,down,gate}.bias` and the
-        //   `output.bias` on the LM head are read by no loader path, so
-        //   they are simply dropped: the projection runs unbiased.
-        // - `attn_norm.bias` / `ffn_norm.bias` / `output_norm.bias` are
-        //   the marker of a real LayerNorm. The generic decoder only has
-        //   `rms_norm(x, w, eps)` -- no mean subtraction and no bias --
-        //   so it computes a different normalisation at every layer.
-        // - `attn_qkv.bias` is the *fused* spelling, and it IS applied
-        //   now: `qkv_fused::load_fused_or_split_qkv` resolves the
-        //   projections and their biases from one decision about which
-        //   spelling the file uses, and slices the fused bias by the
-        //   same spans as the fused weight. Until 2026-09-10 it did not,
-        //   and that is what refused `qwen` and `chatglm`; both are
-        //   audited now. `tests/attn_bias.rs`'s
-        //   `GENERIC_DECODER_APPLIES` carries the name, so a row whose
-        //   ONLY missing bias is this one no longer counts as dropped.
-        //   `starcoder` and `bloom` still require five more each.
-        //
-        // The "LayerNorm-with-bias group" of `tests/attn_bias.rs` is
-        // EMPTY: `nemotron` / `orion` closed on `NormOp::LayerNormBias`,
-        // `codeshell` / `jais2` / `starcoder2` on `crate::proj_bias`,
-        // `stablelm` once its two other shapes had a refusal each,
-        // `phimoe` on `NormOp::RmsBias`, and `starcoder` last, on
-        // `crate::position_embd` (tests/position_embd_graphs.rs).
+        // group, and five of its rows sat on ferrox's NEOX list once:
+        // each loaded, ran at full speed, and answered fluently from
+        // positions the checkpoint never encodes that way. They were
+        // refused by name here until the position they DO encode was
+        // served: `gpt2`'s learned table (`crate::position_embd`) and
+        // the ALiBi bias of `mpt`, `refact`, `bloom` and `jais`
+        // (`crate::alibi`, whose table also carries Baichuan-13B), with
+        // `rope_layers::RopeLayers::Never` as the other half of each.
+        // `tests/rope_layout.rs`'s `LLAMA_NO_ROPE` pins that a row of
+        // that group reaches the generic path ONLY under `Never`.
         v.push(prof(
             "qwen3",
             TextGeneration,
@@ -2830,7 +2783,15 @@ pub fn uses_relu_sqr(arch: &str) -> bool {
 pub fn uses_gelu_ungated(arch: &str) -> bool {
     matches!(
         arch,
-        "starcoder2" | "codeshell" | "gptneox" | "falcon" | "phi2" | "gpt2" | "starcoder"
+        "starcoder2"
+            | "codeshell"
+            | "gptneox"
+            | "falcon"
+            | "phi2"
+            | "gpt2"
+            | "starcoder"
+            | "bloom"
+            | "mpt"
     )
 }
 
@@ -3079,6 +3040,12 @@ pub fn embeddings_scaled_by_sqrt_n_embd(arch: &str, family: DecoderFamily) -> bo
 ///
 /// `hidden_dim / n_heads` is integer division on purpose: llama.cpp
 /// divides two `uint32_t` and only then converts to float.
+///
+/// `jais` is the one other graph with a literal: `jais.cpp:81-83`
+/// passes `kq_scale = 1.0f / float(n_embd_head)` -- `1/d`, not
+/// `1/sqrt(d)` (Jais's muP attention) -- to `build_attn` on every layer.
+/// Measured: `grep -n "1.0f/float(n_embd_head)" src/models/*.cpp` over
+/// all 140 graphs is that one file.
 pub fn attention_scale_override(
     arch: &str,
     n_layers: usize,
@@ -3095,7 +3062,13 @@ pub fn attention_scale_override(
         "gemma3" => n_layers == 62,
         _ => false,
     };
-    if !is_27b || n_heads == 0 || head_dim == 0 {
+    if head_dim == 0 {
+        return None;
+    }
+    if arch == "jais" {
+        return Some(1.0 / head_dim as f32);
+    }
+    if !is_27b || n_heads == 0 {
         return None;
     }
     let scale = 1.0 / ((hidden_dim / n_heads) as f32).sqrt();
@@ -3348,11 +3321,15 @@ mod audit_tests {
             crate::rope_layers::rope_layers("gpt2", 12, false),
             crate::rope_layers::RopeLayers::Never
         );
+        // The four ALiBi rows followed `gpt2` the same way
+        // (`crate::alibi`, tests/alibi_graphs.rs): audited, and under
+        // `Never`.
         for name in ["mpt", "refact", "bloom", "jais"] {
-            assert!(
-                !is_audited_generic(name),
-                "`{name}` was found computing ALiBi or learned position embeddings as \
-                 though it were RoPE; it cannot be on the audited list"
+            assert!(is_audited_generic(name));
+            assert_eq!(
+                crate::rope_layers::rope_layers(name, 24, false),
+                crate::rope_layers::RopeLayers::Never,
+                "`{name}` positions by ALiBi and must rotate nothing"
             );
         }
     }

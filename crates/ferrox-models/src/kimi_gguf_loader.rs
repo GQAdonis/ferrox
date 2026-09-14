@@ -978,6 +978,7 @@ mod tests {
             parallel_residual: false,
             learned_positions: false,
             attn_value_scale: None,
+            alibi_max_bias: None,
             layer_loops: None,
             skip_stream: false,
             logit_multiplier: None,

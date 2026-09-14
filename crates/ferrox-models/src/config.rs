@@ -469,6 +469,13 @@ pub struct ModelConfig {
     /// [`crate::skip_stream`]; the fused Metal launches refuse a model
     /// that has one.
     pub skip_stream: bool,
+    /// Every attention layer ALSO runs a Mamba-2 block on the same
+    /// normed input, the two outputs summed (`falcon-h1.cpp:137-161`;
+    /// `crate::mamba2::PARALLEL_WITH_ATTENTION`). The layer's cache
+    /// holds the attention rows AND the block's `RecurrentState`, so
+    /// [`Self::has_recurrent_layers`] is true and the fused Metal
+    /// launches refuse the model.
+    pub parallel_ssm: bool,
     /// RoPE base used on SWA layers (Gemma 3: defaults to `10000` when
     /// the GGUF omits `rope.freq_base_swa`; full-attn layers keep
     /// [`Self::rope_theta`]).
@@ -989,6 +996,7 @@ pub fn glm_5_2() -> ModelConfig {
         alibi_max_bias: None,
         layer_loops: None,
         skip_stream: false,
+        parallel_ssm: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1084,6 +1092,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         alibi_max_bias: None,
         layer_loops: None,
         skip_stream: false,
+        parallel_ssm: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1211,6 +1220,7 @@ pub fn kimi_k3() -> ModelConfig {
         alibi_max_bias: None,
         layer_loops: None,
         skip_stream: false,
+        parallel_ssm: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1284,6 +1294,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         alibi_max_bias: None,
         layer_loops: None,
         skip_stream: false,
+        parallel_ssm: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1352,6 +1363,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         alibi_max_bias: None,
         layer_loops: None,
         skip_stream: false,
+        parallel_ssm: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1423,6 +1435,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         alibi_max_bias: None,
         layer_loops: None,
         skip_stream: false,
+        parallel_ssm: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,

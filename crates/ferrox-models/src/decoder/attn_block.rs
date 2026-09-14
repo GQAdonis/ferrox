@@ -18,6 +18,7 @@
 use ferrox_core::attention::causal_gqa_attention_row;
 use ferrox_core::cache::{KvCache, PagedKvCache, SharedPagedKv};
 use ferrox_core::matmul::rms_norm;
+use ferrox_core::recurrent_state::RecurrentState;
 
 use super::{Decoder, LayerWeights};
 use crate::layer_shapes::AttnShape;
@@ -51,6 +52,17 @@ pub(crate) enum KvStep<'a> {
     },
 }
 
+impl KvStep<'_> {
+    /// The sequence's recurrent-state slot for this layer, whichever
+    /// backing holds it (`ferrox_core::recurrent_state`).
+    pub(crate) fn recurrent_slot(&mut self) -> &mut Option<RecurrentState> {
+        match self {
+            KvStep::Decode(cache) | KvStep::Batched(cache) => &mut cache.recurrent,
+            KvStep::Paged { cache, .. } => &mut cache.recurrent,
+        }
+    }
+}
+
 impl Decoder {
     /// One layer's attention block for ONE row: QKV projection, the
     /// three QKV biases, the two QK norms, RoPE's `mscale`, per-head
@@ -78,7 +90,7 @@ impl Decoder {
         layer: &LayerWeights,
         normed: &[f32],
         pos: usize,
-        kv: KvStep<'_>,
+        mut kv: KvStep<'_>,
     ) -> Option<Vec<f32>> {
         let head_dim = self.config.head_dim;
         let (n_heads, n_kv_heads) = match self.config.layer_shape(layer_idx).attention {
@@ -144,8 +156,13 @@ impl Decoder {
         self.apply_attention_scale(&mut q);
         self.apply_attn_temperature(&mut q, q_width, |_| pos);
 
+        // falcon-h1.cpp:156-160: the parallel Mamba-2 block on the same
+        // normed row, summed into the attention branch.
+        let ssm = self.parallel_ssm_rows(layer_idx, layer, normed, 1, kv.recurrent_slot());
         let mut attn_out = self.push_and_attend_row(kv, layer_idx, layer, &k, &v, &q);
-        Some(self.attn_out_to_residual_rows(layer, normed, &mut attn_out, 1))
+        let mut projected = self.attn_out_to_residual_rows(layer, normed, &mut attn_out, 1);
+        Self::add_parallel_ssm(&mut projected, ssm);
+        Some(projected)
     }
 
     /// Everything between the softmax-weighted V sum and the residual

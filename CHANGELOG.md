@@ -17,6 +17,16 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`falcon-h1` runs: Falcon-H1 0.5B to 34B.** The Mamba-2 block in
+  parallel with attention on every layer (`falcon-h1.cpp:137-161`):
+  `mamba2::PARALLEL_WITH_ATTENTION`, `ModelConfig::parallel_ssm`,
+  `AttnWeights::mamba2` on a GQA layer, `KvStep::recurrent_slot`,
+  `Decoder::mamba2_state_step` / `parallel_ssm_rows` /
+  `add_parallel_ssm` for the three host bodies; the fused Metal
+  launches refuse the model; `attn_output.bias` recorded as unread
+  (`:76,154`). KL 1.3e-13 / 6.2e-13 / 3.2e-13
+  (`tests/falcon_h1_graphs.rs`, `scripts/make_falcon_h1_fixture.py`).
+  84 audited.
 - **`nemotron_h_moe` runs: Nemotron-3 Nano 30B-A3B.** The routed and
   shared experts of an ungated architecture alias their gate to `up`
   as the dense loader does (`GluAct::ReluSqr` never reads it); a layer

@@ -8710,6 +8710,7 @@ pub(crate) mod tests {
             alibi_max_bias: None,
             layer_loops: None,
             skip_stream: false,
+            parallel_ssm: false,
             logit_multiplier: None,
             attention_scale: None,
             rope_theta_swa: None,

@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **83** architectures run with
+Honest position, re-audited 2026-09-14. **84** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -1013,6 +1013,28 @@ the loader's reader tables; a layer with `ffn_dim 0` takes the dense
 arm whatever the model's MoE says, so the block-only layers load no
 experts. `moe_latent_size` (Nemotron-3 Super, `:206-208`) is refused
 by name in `unsupported_feature_keys`. KL 3.6e-13.
+
+`falcon-h1` (Falcon-H1 0.5B to 34B) closed next, and it is the
+Mamba-2 block in its THIRD position: `falcon-h1.cpp:137-161` runs
+attention AND the block on every layer, in parallel on the same
+`attn_norm` output, summed before the one residual add. So the layer
+is `AttnShape::Gqa` with `AttnWeights::mamba2` set
+(`mamba2::PARALLEL_WITH_ATTENTION`, `ModelConfig::parallel_ssm`), its
+cache holds the attention rows AND the block's `RecurrentState`,
+attention counts the positions, and `Decoder::parallel_ssm_rows` /
+`add_parallel_ssm` are ONE pair the row body and both batched bodies
+call -- the block runs before the KV push so the two can never
+disagree about which token the state saw. Two measurements:
+`attn_output.bias` is created at `:76` and `:154` passes NULL for it,
+so it is `unread_tensors`' second row; and `ffn_norm` is the
+two-argument `LLM_TN` spelling (`:80`, `blk.N.ffn_norm` with no
+`.weight`), which libllama REQUIRES -- the `.weight` spelling fails
+`check_tensor_dims` -- and which `norm_sites` had accepted since
+`plamo3`. KL 1.3e-13 / 6.2e-13 (no `ssm_norm`) / 3.2e-13
+(`tests/falcon_h1_graphs.rs`); running the block on a fresh state
+every token turns six tests red. Every `build_mamba2_layer` caller
+of the 140 graphs is served; `jamba`, `plamo2` and `mamba` are
+`build_mamba_layer` (Mamba-1) and say so.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

@@ -260,12 +260,12 @@ impl ZeroKvLayer {
                  for; the Mamba-2 body (`crate::mamba2`) reads a per-head A",
             ),
             // `falcon-h1.cpp:161` runs the Mamba-2 block IN PARALLEL with
-            // attention on every layer, so its KV count is never zero;
+            // attention on every layer (`crate::mamba2::
+            // PARALLEL_WITH_ATTENTION`), so its KV count is never zero;
             // a zero here is not that graph.
             "falcon-h1" => ZeroKvLayer::Unserved(
-                "no falcon-h1 layer has a zero KV count: falcon-h1.cpp:149-166 runs attention \
-                 AND the Mamba-2 block on every layer, a parallel topology the generic layer \
-                 does not have",
+                "no falcon-h1 layer has a zero KV count: falcon-h1.cpp:137-161 runs attention \
+                 AND the Mamba-2 block on every layer (`ModelConfig::parallel_ssm`)",
             ),
             // `nemotron-h.cpp:9-11,143-152`: a layer is ONE of Mamba-2,
             // attention, or FFN, with one residual add. On the generic
@@ -735,7 +735,8 @@ impl ModelConfig {
     /// draft model, the prefix cache -- is fenced on
     /// (`ferrox_core::recurrent_state`).
     pub fn has_recurrent_layers(&self) -> bool {
-        (0..self.n_layers).any(|il| self.layer_shape(il).attention.is_recurrent())
+        self.parallel_ssm
+            || (0..self.n_layers).any(|il| self.layer_shape(il).attention.is_recurrent())
     }
 
     /// Layer `il`'s cache geometry (`AttnShape::cache_geometry` at this

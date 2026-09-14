@@ -500,6 +500,13 @@ pub struct Decoder {
     /// when there is nothing to hand over.
     pub final_norm: NormOp,
     pub output_head: WeightMatrix, // [vocab_size, hidden_dim]
+    /// `output.bias`, `[vocab_size]`, added to the logits right after
+    /// the head (`crate::proj_bias::OUTPUT_BIAS_CREATORS`: `phi2` and
+    /// `phimoe` REQUIRE it, `qwen2` creates it optional). Applied in
+    /// `decoder::lm_head::Logits`, the one place the head's
+    /// post-projection transforms run; a head with a bias is never
+    /// folded into a fused Metal decode stack (`FoldedLmHead::permit`).
+    pub output_bias: Option<Vec<f32>>,
     /// Real VRAM budget for GPU-resident routed experts.
     /// `None` (both constructors below
     /// set it) means every expert always runs on CPU -- the exact
@@ -818,6 +825,7 @@ impl Decoder {
             layers,
             final_norm,
             output_head,
+            output_bias: None,
             gpu_vram_budget_bytes: None,
             // Synthetic-weights constructor: no checkpoint, no gpt-oss.
             gpt_oss: None,
@@ -2296,6 +2304,7 @@ impl Decoder {
                             let folded = FoldedLmHead::permit(
                                 greedy_gpu,
                                 &self.final_norm,
+                                self.output_bias.as_deref(),
                                 lm_head_gpu_launch,
                             );
                             // The MoE stack used to be handed
@@ -2499,6 +2508,7 @@ impl Decoder {
                             let folded = FoldedLmHead::permit(
                                 greedy_gpu,
                                 &self.final_norm,
+                                self.output_bias.as_deref(),
                                 lm_head_gpu_launch,
                             );
                             // Pass final_norm_w when: (1) lm_head runs in stack (folded),
@@ -3921,6 +3931,7 @@ impl Decoder {
         Logits::project(
             &self.output_head,
             final_normed,
+            self.output_bias.as_deref(),
             self.config.final_logit_softcap,
             self.config.logit_multiplier,
         )
@@ -3934,6 +3945,7 @@ impl Decoder {
         let vocab_size = self.output_head.rows();
         let logits_batch = Logits::from_output_head(
             self.output_head.apply_batch(&flat, batch_size),
+            self.output_bias.as_deref(),
             self.config.final_logit_softcap,
             self.config.logit_multiplier,
         );

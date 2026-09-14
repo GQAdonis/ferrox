@@ -249,6 +249,7 @@ const LAYER_NORM_BIASES: &[&str] = &["output_norm.bias", "attn_norm.bias", "ffn_
 /// The projection biases, applied for exactly the architectures whose
 /// graph creates them (`ferrox_models::proj_bias`'s two tables).
 const PROJECTION_BIASES: &[&str] = &[
+    "output.bias",
     "attn_output.bias",
     "ffn_up.bias",
     "ffn_down.bias",
@@ -256,8 +257,11 @@ const PROJECTION_BIASES: &[&str] = &[
 ];
 
 fn creates_projection_bias(arch: &str, bias: &str) -> bool {
-    use ferrox_models::proj_bias::{ATTN_OUT_BIAS_CREATORS, FFN_BIAS_CREATORS};
+    use ferrox_models::proj_bias::{
+        ATTN_OUT_BIAS_CREATORS, FFN_BIAS_CREATORS, OUTPUT_BIAS_CREATORS,
+    };
     match bias {
+        "output.bias" => OUTPUT_BIAS_CREATORS.iter().any(|(n, _)| *n == arch),
         "attn_output.bias" => ATTN_OUT_BIAS_CREATORS.iter().any(|(n, _)| *n == arch),
         "ffn_up.bias" | "ffn_down.bias" => FFN_BIAS_CREATORS.iter().any(|(n, _, _)| *n == arch),
         "ffn_gate.bias" => FFN_BIAS_CREATORS.iter().any(|(n, _, g)| *n == arch && *g),

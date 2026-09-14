@@ -17,6 +17,21 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`phi2` runs: Phi-2 and Phi-1.5; the LM head has a bias slot.**
+  `output.bias` (`phi2.cpp:22,136`, REQUIRED) is `Decoder::output_bias`,
+  read by `proj_bias::load_output_bias` for the three graphs of 140
+  that create it (`phi2`, `phimoe` required; `qwen2` optional, whose
+  files with the tensor used to be refused as unread) and added in
+  `decoder::lm_head::Logits::from_output_head`, per row, before the
+  multiplier and the cap. `FoldedLmHead::permit` refuses a head with a
+  bias: no fused Metal stack adds it, and a bias moves the argmax where
+  the cap and the multiplier cannot. The rest of the graph was already
+  served: the shared-norm parallel residual, the biased LayerNorm, Q/K/V
+  biases split or fused, the required `attn_output` / FFN biases with
+  the ungated GELU, a partial NEOX rotary. `tests/phi2_graphs.rs`: KL
+  2.95e-7 (max delta 2.5e-3, the f16 GELU-table class), the fused and
+  split spellings on one golden (libllama byte-identical); dropping
+  the bias moves the logits by more than 1. 67 audited.
 - **`falcon` runs: Falcon-7B, 40B and 180B, both shapes.** Every
   Falcon layer is the parallel residual
   (`ferrox_models::parallel_residual`); the OPTIONAL `attn_norm_2`

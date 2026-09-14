@@ -17,6 +17,16 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`nemotron_h_moe` runs: Nemotron-3 Nano 30B-A3B.** The routed and
+  shared experts of an ungated architecture alias their gate to `up`
+  as the dense loader does (`GluAct::ReluSqr` never reads it); a layer
+  with `ffn_dim 0` takes the dense arm (`absent_ffn`) whatever the
+  model's MoE says; `nemotron_h_moe` joins `GATING_LITERAL_
+  ARCHITECTURES` (sigmoid), `EXPERT_WEIGHTS_SCALE_READERS` and
+  `EXPERT_WEIGHTS_NORM_READERS`; `moe_latent_size` is refused by name
+  (`capability::unsupported_feature_keys`). KL 3.6e-13
+  (`tests/nemotron_h_graphs.rs`, `make_nemotron_h_fixture.py --moe`).
+  83 audited.
 - **`nemotron_h` runs: Nemotron-H 8B / 47B / 56B, Nemotron-3 Nano
   dense.** One block per layer on the Mamba-2 seam:
   `layer_shapes::ZeroKvLayer::Mamba2UnlessFfn` reads both per-layer

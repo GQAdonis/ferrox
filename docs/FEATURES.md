@@ -103,8 +103,13 @@ is faster.
   (`layer_shapes::BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT`; deci's is
   discarded), or an FFN with no block whose pre-norm is `attn_norm`
   (`norm_sites::ONE_NORM_PER_LAYER`); `ZeroKvLayer::Mamba2UnlessFfn`
-  reads the two arrays. `nemotron_h_moe` (Nemotron-3 Nano 30B-A3B)
-  needs its latent ungated MoE and stays refused by name.
+  reads the two arrays. `nemotron_h_moe` (Nemotron-3 Nano 30B-A3B) is
+  the same graph with the FFN layer a sigmoid MoE of UNGATED
+  ReLU-squared experts (the gate aliased to `up`, as the dense ungated
+  FFN's is) with the required router bias, `expert_weights_norm` /
+  `_scale` read from the file, plus an ungated ReLU-squared shared
+  expert (KL 3.6e-13). Its latent variant (`moe_latent_size`,
+  Nemotron-3 Super) is refused by name.
 - **openPangu-Embedded** (`pangu-embedded`: 1B / 7B), audited against
   libllama on 2026-09-14 (`tests/pangu_embedded_graphs.rs`, KL 1.5e-13).
   A decoder LLM ("Embedded" as in edge devices) that had been filed as

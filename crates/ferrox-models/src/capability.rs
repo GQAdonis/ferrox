@@ -1089,6 +1089,15 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // (`nemotron-h.cpp:9-11,143-158`). Three fixtures: plain, the three
     // optional biases, a separate `output.weight`.
     "nemotron_h",
+    // tests/nemotron_h_graphs.rs: `nemotron_h_moe` (Nemotron-3 Nano
+    // 30B-A3B). The same layers with the FFN layer a sigmoid MoE
+    // (`nemotron-h.cpp:206-231`: the gating function a LITERAL, the
+    // router bias REQUIRED, `expert_weights_norm` / `_scale` from the
+    // file) of UNGATED ReLU-squared experts, plus an ungated
+    // ReLU-squared shared expert; the gate is aliased to `up` on both
+    // as the dense ungated FFN's is. `moe_latent_size` (Nemotron-3
+    // Super) is refused by name.
+    "nemotron_h_moe",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1816,17 +1825,23 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // attention never calls `ggml_rope_ext` (`:181-193`): the NEOX
         // group entry (llama-model.cpp:2671) is a filler and
         // `rope_layers` answers `Never`. Audited on
-        // tests/nemotron_h_graphs.rs. `nemotron_h_moe` stays above for
-        // its latent ungated MoE.
-        v.push(prof(
-            "nemotron_h",
-            TextGeneration,
-            DecoderFamily::Hybrid,
-            MemoryKind::Hybrid,
-            Neox,
-            ArchPath::GenericGqa { rope: Neox },
-            WholeVector,
-        ));
+        // tests/nemotron_h_graphs.rs. `nemotron_h_moe` (Nemotron-3 Nano
+        // 30B-A3B) is the same graph with a sigmoid MoE of UNGATED
+        // ReLU-squared experts and an ungated shared expert on the FFN
+        // layers (`:206-231`); its latent variant (`moe_latent_size`,
+        // Nemotron-3 Super) is refused by name
+        // (`unsupported_feature_keys`).
+        for n in ["nemotron_h", "nemotron_h_moe"] {
+            v.push(prof(
+                n,
+                TextGeneration,
+                DecoderFamily::Hybrid,
+                MemoryKind::Hybrid,
+                Neox,
+                ArchPath::GenericGqa { rope: Neox },
+                WholeVector,
+            ));
+        }
         // OLMo-1 was NEW CODE in `NORM_ROPE_TRIAGED` on its
         // non-parametric LayerNorm, which `crate::norm::NormOp` now
         // implements (`tests/olmo_graphs.rs`). NORM RoPE:
@@ -2465,7 +2480,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             ("jamba", Neox),
             ("falcon-h1", Neox),
             ("plamo2", Neox),
-            ("nemotron_h_moe", Neox),
             ("qwen3next", Neox),
             ("qwen35", Neox),
             ("qwen35moe", Neox),
@@ -3264,6 +3278,20 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
     // period. The array is `crate::swa_layers` now, read the way each
     // graph reads it -- ignored, honoured, or broadcast -- so neither
     // shape is refused here or anywhere else.
+    //
+    // `{arch}.moe_latent_size` (`LLM_KV_MOE_LATENT_SIZE`,
+    // `nemotron-h.cpp:21,36,82-85,206-208`): the routed experts run in a
+    // LATENT width the layer projects into with `ffn_latent_down` and
+    // out of with `ffn_latent_up`, while the router and the shared
+    // expert read the unprojected input. Nemotron-3 Nano writes no such
+    // key; Nemotron-3 Super does. The generic MoE bodies run their
+    // experts at `hidden_dim`, so a nonzero value stops here, by name.
+    out.push((
+        key("moe_latent_size"),
+        "a latent MoE (nemotron-h.cpp:206-208: the experts read `ffn_latent_down(x)` and \
+         their sum is `ffn_latent_up`ed back), which the generic MoE bodies, which run \
+         the experts at hidden_dim, do not have",
+    ));
     out
 }
 

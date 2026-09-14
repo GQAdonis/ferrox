@@ -1062,6 +1062,13 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // read by nothing in its hparams (the fixture declares 2.5 and the
     // golden is unscaled).
     "lfm2moe",
+    // tests/pangu_embedded_graphs.rs: `pangu-embedded` (openPangu-
+    // Embedded-1B / 7B), a decoder LLM that had been filed as an
+    // embedding model from its name. `pangu-embed.cpp` is `llama.cpp`'s
+    // graph with a REQUIRED `attn_output.bias` (`:37`), NEOX RoPE,
+    // `n_rot == n_embd_head` (`:59`), fused or split QKV, `output` tied
+    // when absent. Three fixtures: split, fused, separate `output`.
+    "pangu-embedded",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -2242,6 +2249,16 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // had evidenced the claim (tests/minimax_m2_graphs.rs). NEOX
         // RoPE: llama-model.cpp:2672.
         v.push(gqa_neox("minimax-m2"));
+        // `pangu-embedded` is openPangu-Embedded-1B / 7B (Huawei), a
+        // DECODER LLM: `PanguEmbeddedForCausalLM`, `conversion/pangu.py`
+        // is a `TextModel` with an `lm_head`, and "Embedded" means edge
+        // devices. It was filed here as "embedding variant; deferred"
+        // and in `embedding_model::NOT_YET` from the name alone.
+        // `pangu-embed.cpp` is `llama.cpp`'s graph with one REQUIRED
+        // `attn_output.bias` (`:37`; `proj_bias::ATTN_OUT_BIAS_CREATORS`),
+        // NEOX RoPE (llama-model.cpp:2675). Audited on
+        // tests/pangu_embedded_graphs.rs.
+        v.push(gqa_neox("pangu-embedded"));
         v.push(prof(
             "minimax-m3",
             TextGeneration,
@@ -2515,11 +2532,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             ),
             (
                 "gemma-embedding",
-                DeferredEncoderEmbedding,
-                "embedding variant; deferred",
-            ),
-            (
-                "pangu-embedded",
                 DeferredEncoderEmbedding,
                 "embedding variant; deferred",
             ),

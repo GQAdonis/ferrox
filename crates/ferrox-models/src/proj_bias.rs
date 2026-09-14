@@ -90,6 +90,7 @@ pub const ATTN_OUT_BIAS_CREATORS: &[(&str, Presence)] = &[
     ("minicpm", Presence::Optional),
     ("mistral3", Presence::Optional),
     ("nemotron", Presence::Optional),
+    ("pangu-embedded", Presence::Required),
     ("phimoe", Presence::Required),
     ("starcoder", Presence::Required),
     ("starcoder2", Presence::Required),

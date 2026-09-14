@@ -73,6 +73,11 @@ is faster.
   graph with `leading_dense_block_count` dense layers and a sigmoid
   MoE with `exp_probs_b` REQUIRED on the rest; the Mamba-2 hybrids
   name their block (`layer_shapes::ZeroKvLayer`) and refuse.
+- **openPangu-Embedded** (`pangu-embedded`: 1B / 7B), audited against
+  libllama on 2026-09-14 (`tests/pangu_embedded_graphs.rs`, KL 1.5e-13).
+  A decoder LLM ("Embedded" as in edge devices) that had been filed as
+  an embedding model from its name; `pangu-embed.cpp` is `llama.cpp`'s
+  graph with a required `attn_output.bias` (`proj_bias`) and NEOX RoPE.
 - **OLMo-2 and EXAONE-4**, audited against libllama on 2026-09-10 as
   ONE residual topology rather than two: neither has an `attn_norm` or
   an `ffn_norm` tensor, both sublayers read the raw residual, and each

@@ -41,7 +41,6 @@ const NOT_YET: &[(&str, &str)] = &[
         "gemma-embedding",
         "a decoder embedding path, not an encoder",
     ),
-    ("pangu-embedded", "a decoder embedding path, not an encoder"),
 ];
 
 /// True when `general.architecture` names an encoder / embedding model

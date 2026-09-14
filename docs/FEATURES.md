@@ -110,6 +110,19 @@ is faster.
   `_scale` read from the file, plus an ungated ReLU-squared shared
   expert (KL 3.6e-13). Its latent variant (`moe_latent_size`,
   Nemotron-3 Super) is refused by name.
+- **Mamba-1: Jamba, Mamba, FalconMamba; and pure Mamba-2** (`jamba`,
+  `mamba`, `mamba2`), audited against libllama on 2026-09-14
+  (`tests/mamba_graphs.rs`, KL 7.3e-12 / 2.3e-12 / 1.8e-12 / 3.6e-13).
+  `ferrox_models::mamba1` is `build_mamba_layer` once: the selective
+  scan with a per-state decay (`ferrox_core::mamba2::Decay::PerState`),
+  dt / B / C from one projection with the RMS norms Jamba's weights
+  carry or FalconMamba's `ssm.dt_b_c_rms` sets weightless, dt projected
+  up with its bias. `ssm_block::SsmBlock` is the one value the decoder
+  holds for either generation. Jamba's attention has no RoPE and its
+  FFN is dense or MoE per layer by the router's presence
+  (`moe_interleave::DENSE_LAYER_BY_ROUTER_ABSENCE`); the pure models
+  have no heads at all (`layer_shapes::PURE_RECURRENT`, head_dim 0).
+  Every Mamba graph in llama.cpp is served but PLaMo-2's own spelling.
 - **Falcon-H1** (`falcon-h1`: 0.5B / 1.5B / 3B / 7B / 34B), audited
   against libllama on 2026-09-14 (`tests/falcon_h1_graphs.rs`, KL
   1.3e-13 / 6.2e-13 / 3.2e-13). Attention AND the Mamba-2 block on

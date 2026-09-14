@@ -17,6 +17,17 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`jamba`, `mamba` and `mamba2` run: Jamba, Mamba / FalconMamba,
+  Mamba-Codestral.** `ferrox_models::mamba1` is `build_mamba_layer`
+  (`ferrox_core::mamba2::Decay::PerState` is the scan's per-state
+  decay arm; `DtBcNorm` the three norm spellings); `ssm_block::
+  SsmBlock` holds either generation on `AttnWeights::ssm`;
+  `layer_shapes::PURE_RECURRENT` makes a model with no heads every
+  layer the block (head_dim 0); `moe_interleave::
+  DENSE_LAYER_BY_ROUTER_ABSENCE` makes Jamba's FFN dense or MoE per
+  layer by the file; `rope_layers` answers `Never` for all three.
+  KL 7.3e-12 / 2.3e-12 / 1.8e-12 / 3.6e-13 (`tests/mamba_graphs.rs`,
+  `scripts/make_mamba_fixture.py`). 87 audited.
 - **`falcon-h1` runs: Falcon-H1 0.5B to 34B.** The Mamba-2 block in
   parallel with attention on every layer (`falcon-h1.cpp:137-161`):
   `mamba2::PARALLEL_WITH_ATTENTION`, `ModelConfig::parallel_ssm`,

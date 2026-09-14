@@ -65,6 +65,35 @@
 /// hard failures upstream.
 pub const INTERLEAVE_STEP_IS_REQUIRED: &[&str] = &["ernie4_5-moe"];
 
+/// Architectures whose LOADER decides dense-or-MoE per layer by the
+/// presence of `blk.N.ffn_gate_inp.weight`, with no key involved:
+/// `jamba.cpp:89-101` creates the router `TENSOR_NOT_REQUIRED` and
+/// creates the expert triple when it exists, the dense triple when it
+/// does not, and `:152` branches the graph on the same pointer. Jamba
+/// interleaves MoE and dense layers (every second layer on Jamba-v0.1)
+/// and its converter writes no `leading_dense_block_count` or
+/// interleave step.
+///
+/// Sixteen graphs branch on the pointer in their GRAPH (measured:
+/// `grep -l 'ffn_gate_inp == nullptr' src/models/*.cpp`), but every
+/// other loader creates it from `n_expert > 0` for every layer or from
+/// the leading-dense prefix, which `ModelConfig::layer_is_dense`
+/// already spells; only Jamba's loader reads the file.
+pub const DENSE_LAYER_BY_ROUTER_ABSENCE: &[&str] = &["jamba"];
+
+/// True when layer `layer` of `arch` is a dense layer BECAUSE the file
+/// has no router for it (`DENSE_LAYER_BY_ROUTER_ABSENCE`).
+pub fn dense_by_router_absence(
+    arch: &str,
+    file: &impl ferrox_gguf::TensorSource,
+    layer: usize,
+) -> bool {
+    DENSE_LAYER_BY_ROUTER_ABSENCE.contains(&arch)
+        && file
+            .find_tensor(&format!("blk.{layer}.ffn_gate_inp.weight"))
+            .is_none()
+}
+
 /// Why this file's interleave step cannot be served, or `None` when it
 /// can.
 ///

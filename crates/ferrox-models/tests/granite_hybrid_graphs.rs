@@ -275,10 +275,15 @@ fn the_loaded_decoder_is_the_graph() {
                     n_kv_heads: 2
                 }
             );
-            assert!(layer.attn.mamba2.is_none());
+            assert!(layer.attn.ssm.is_none());
         } else {
             assert_eq!(shape, AttnShape::Mamba2, "blk.{il}");
-            let m = layer.attn.mamba2.as_ref().expect("Mamba-2 weights");
+            let m = layer
+                .attn
+                .ssm
+                .as_ref()
+                .and_then(|b| b.mamba2())
+                .expect("Mamba-2 weights");
             assert_eq!(
                 (
                     m.h.d_conv,
@@ -307,7 +312,7 @@ fn the_recurrent_state_lives_on_the_cache_and_the_cache_counts_positions() {
     for (pos, &tok) in GRAPH_PROMPT.iter().enumerate() {
         d.forward_token(tok, pos, &mut kv);
     }
-    let m = d.layers[0].attn.mamba2.as_ref().unwrap();
+    let m = d.layers[0].attn.ssm.as_ref().unwrap().mamba2().unwrap();
     let (conv, ssm) = m.h.state_floats();
     let state = kv[0]
         .recurrent
@@ -379,10 +384,16 @@ fn each_seam_is_visible_in_the_logits() {
     let saved: Vec<Vec<f32>> = d
         .layers
         .iter()
-        .filter_map(|l| l.attn.mamba2.as_ref().map(|m| m.a.clone()))
+        .filter_map(|l| {
+            l.attn
+                .ssm
+                .as_ref()
+                .and_then(|b| b.mamba2())
+                .map(|m| m.a.clone())
+        })
         .collect();
     for l in d.layers.iter_mut() {
-        if let Some(m) = l.attn.mamba2.as_mut() {
+        if let Some(m) = l.attn.ssm.as_mut().and_then(|b| b.mamba2_mut()) {
             for a in m.a.iter_mut() {
                 *a = -30.0; // no memory at all
             }
@@ -392,14 +403,14 @@ fn each_seam_is_visible_in_the_logits() {
     assert!(worst > 1e-2, "the SSM state not seen: {worst}");
     let mut it = saved.into_iter();
     for l in d.layers.iter_mut() {
-        if let Some(m) = l.attn.mamba2.as_mut() {
+        if let Some(m) = l.attn.ssm.as_mut().and_then(|b| b.mamba2_mut()) {
             m.a = it.next().unwrap();
         }
     }
     assert_decoder_matches_on_all_three_paths(&d, &GH_GOLDEN, GRAPH_TOL, "restored");
 
     for l in d.layers.iter_mut() {
-        if let Some(m) = l.attn.mamba2.as_mut() {
+        if let Some(m) = l.attn.ssm.as_mut().and_then(|b| b.mamba2_mut()) {
             for v in m.d.iter_mut() {
                 *v = 0.0;
             }

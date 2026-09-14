@@ -127,7 +127,8 @@ pub const PER_LAYER_SHAPE_ARCHS: &[(&str, &str)] = &[
     ),
     (
         "jamba",
-        "hybrid: n_head_kv(i) == 0 marks a recurrent layer (jamba.cpp:12,48-49,122)",
+        "generic. jamba.cpp:8-10 (hparams), :37-58 (loader) and :90-92 (graph): n_head_kv(i) \
+         == 0 marks a Mamba-1 layer (`crate::mamba1`), served since 2026-09-14",
     ),
     (
         "lfm2",
@@ -204,6 +205,10 @@ pub enum AttnShape {
     /// `crate::mamba2`, then the residual add; the layer's cache holds
     /// no rows and carries a `RecurrentState` instead.
     Mamba2,
+    /// A Mamba-1 block (`build_mamba_layer`, `mamba-base.cpp:4-148`;
+    /// `jamba.cpp:128`, `mamba.cpp:106`): as [`AttnShape::Mamba2`] with
+    /// `crate::mamba1`'s block.
+    Mamba1,
 }
 
 /// Architectures whose graph ADDS a block's output to the residual on a
@@ -215,7 +220,27 @@ pub enum AttnShape {
 /// attention output is DISCARDED, and `LayerShapes::resolve` refuses
 /// that combination for every architecture not listed here rather than
 /// pin a dropped branch as the reference.
-pub const BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT: &[&str] = &["nemotron_h", "nemotron_h_moe"];
+pub const BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT: &[&str] =
+    &["nemotron_h", "nemotron_h_moe", "mamba", "mamba2"];
+
+/// Architectures with NO attention anywhere: every layer is the named
+/// block and nothing else (`mamba.cpp:73-88`, `mamba2.cpp`; the
+/// converter writes `head_count 0` and `feed_forward_length 0`,
+/// `conversion/mamba.py:155-156`). `LayerShapes::resolve` builds every
+/// layer from this table, because the counts alone -- `(0, 0)` -- are
+/// deci's attention-free layer on every other architecture.
+pub const PURE_RECURRENT: &[(&str, ZeroKvLayer)] = &[
+    ("mamba", ZeroKvLayer::Mamba1),
+    ("mamba2", ZeroKvLayer::Mamba2),
+];
+
+/// The block every layer of a pure recurrent model is, or `None`.
+pub fn pure_recurrent_block(arch: &str) -> Option<ZeroKvLayer> {
+    PURE_RECURRENT
+        .iter()
+        .find(|(a, _)| *a == arch)
+        .map(|(_, k)| *k)
+}
 
 /// What `head_count_kv == 0` with `head_count > 0` MEANS for an
 /// architecture, because two graphs spell two different blocks with the
@@ -228,6 +253,8 @@ pub enum ZeroKvLayer {
     ShortConv,
     /// `granite-hybrid.cpp:163`: the Mamba-2 block (`crate::mamba2`).
     Mamba2,
+    /// `jamba.cpp:128`: the Mamba-1 block (`crate::mamba1`).
+    Mamba1,
     /// `nemotron-h.cpp:9-11`: the Mamba-2 block when the layer's FFN
     /// width is ALSO zero, and an FFN-only layer (no attention block at
     /// all, [`AttnShape::Absent`]) when it is not -- every Nemotron-H
@@ -252,13 +279,8 @@ impl ZeroKvLayer {
             // `granite-hybrid.cpp:17-19,163`: Mamba-2 where the KV count
             // is zero, attention elsewhere, an FFN on every layer.
             "granitehybrid" | "granite-hybrid" => ZeroKvLayer::Mamba2,
-            // `jamba.cpp:128` is `build_mamba_layer`, Mamba-1: a
-            // `{d_state, n_head}` A and the selective-scan projections
-            // (`ssm_x`, `ssm_dt.weight`) `crate::mamba2` does not have.
-            "jamba" => ZeroKvLayer::Unserved(
-                "a Mamba-1 block (`build_mamba_layer`, jamba.cpp:128), which ferrox has no body \
-                 for; the Mamba-2 body (`crate::mamba2`) reads a per-head A",
-            ),
+            // `jamba.cpp:8-10,128`: `build_mamba_layer`, Mamba-1.
+            "jamba" => ZeroKvLayer::Mamba1,
             // `falcon-h1.cpp:161` runs the Mamba-2 block IN PARALLEL with
             // attention on every layer (`crate::mamba2::
             // PARALLEL_WITH_ATTENTION`), so its KV count is never zero;
@@ -274,7 +296,8 @@ impl ZeroKvLayer {
             // block.
             "nemotron_h" | "nemotron_h_moe" => ZeroKvLayer::Mamba2UnlessFfn,
             "plamo2" => ZeroKvLayer::Unserved(
-                "a Mamba-1 block (plamo2.cpp:218-219), which ferrox has no body for",
+                "PLaMo-2's Mamba-1 block (plamo2.cpp:218-219), which has its own dt / B / C \
+                 norms and gating order that `crate::mamba1` does not spell",
             ),
             "kimi-linear" => ZeroKvLayer::Unserved(
                 "a KDA block (kimi-linear.cpp:18), served by `crate::kimi_decoder` and not \
@@ -311,6 +334,7 @@ impl AttnShape {
                 ZeroKvLayer::Linear => Ok(AttnShape::Linear),
                 ZeroKvLayer::ShortConv => Ok(AttnShape::ShortConv),
                 ZeroKvLayer::Mamba2 => Ok(AttnShape::Mamba2),
+                ZeroKvLayer::Mamba1 => Ok(AttnShape::Mamba1),
                 // nemotron-h.cpp:9-11: `n_head_kv == 0 && n_ff == 0`.
                 ZeroKvLayer::Mamba2UnlessFfn if ffn_dim == 0 => Ok(AttnShape::Mamba2),
                 // :152-153: the FFN alone, under `attn_norm` (:145).
@@ -334,7 +358,11 @@ impl AttnShape {
     pub fn n_kv_heads(self) -> usize {
         match self {
             AttnShape::Gqa { n_kv_heads, .. } => n_kv_heads,
-            AttnShape::Linear | AttnShape::Absent | AttnShape::ShortConv | AttnShape::Mamba2 => 0,
+            AttnShape::Linear
+            | AttnShape::Absent
+            | AttnShape::ShortConv
+            | AttnShape::Mamba2
+            | AttnShape::Mamba1 => 0,
         }
     }
 
@@ -342,14 +370,18 @@ impl AttnShape {
     pub fn n_heads(self) -> usize {
         match self {
             AttnShape::Gqa { n_heads, .. } => n_heads,
-            AttnShape::Linear | AttnShape::Absent | AttnShape::ShortConv | AttnShape::Mamba2 => 0,
+            AttnShape::Linear
+            | AttnShape::Absent
+            | AttnShape::ShortConv
+            | AttnShape::Mamba2
+            | AttnShape::Mamba1 => 0,
         }
     }
 
     /// True for a block whose state between tokens is a
     /// `RecurrentState` rather than rows (`crate::mamba2`).
     pub fn is_recurrent(self) -> bool {
-        matches!(self, AttnShape::Mamba2)
+        matches!(self, AttnShape::Mamba2 | AttnShape::Mamba1)
     }
 
     /// The layer's cache as `(n_kv_heads, k_head_dim, v_head_dim)`, the
@@ -372,7 +404,9 @@ impl AttnShape {
     ) -> (usize, usize, usize) {
         match self {
             AttnShape::Gqa { n_kv_heads, .. } => (n_kv_heads, head_dim, v_head_dim),
-            AttnShape::Linear | AttnShape::Absent | AttnShape::Mamba2 => (0, head_dim, v_head_dim),
+            AttnShape::Linear | AttnShape::Absent | AttnShape::Mamba2 | AttnShape::Mamba1 => {
+                (0, head_dim, v_head_dim)
+            }
             AttnShape::ShortConv => (1, hidden_dim, 0),
         }
     }
@@ -436,6 +470,35 @@ impl LayerShapes {
     ) -> Result<Self, LoadError> {
         let n = heads.len();
         assert_eq!(kv_heads.len(), n);
+        // A pure recurrent model: every layer the one block, no FFN
+        // (`PURE_RECURRENT`). Its arrays are uniform zeros, which would
+        // otherwise read as a zero-head GQA model.
+        if let Some(kind) = pure_recurrent_block(arch) {
+            let shape = AttnShape::from_counts(1, 0, 0, kind)
+                .map_err(|why| LoadError::UnsupportedFeature(arch.to_string(), why))?;
+            for il in 0..n {
+                let ffn_dim = ffn.map_or(0, |f| f[il] as usize);
+                if heads[il] != 0 || kv_heads[il] != 0 || ffn_dim != 0 {
+                    return Err(LoadError::UnsupportedFeature(
+                        arch.to_string(),
+                        format!(
+                            "blk.{il}: head_count {} / head_count_kv {} / feed_forward_length \
+                             {ffn_dim} on a pure recurrent architecture, whose converter writes \
+                             0 for all three (conversion/mamba.py:155-156) and whose graph has no \
+                             attention and no FFN (mamba.cpp:73-88)",
+                            heads[il], kv_heads[il]
+                        ),
+                    ));
+                }
+            }
+            return Ok(LayerShapes::PerLayer(vec![
+                LayerShape {
+                    attention: shape,
+                    ffn_dim: 0
+                };
+                n
+            ]));
+        }
         let uniform = heads.windows(2).all(|w| w[0] == w[1])
             && kv_heads.windows(2).all(|w| w[0] == w[1])
             && ffn.is_none_or(|f| f.windows(2).all(|w| w[0] == w[1]));
@@ -596,7 +659,7 @@ pub(crate) fn load_non_gqa_attention(
     hidden_dim: usize,
 ) -> Result<AttnWeights, LoadError> {
     let mut shortconv = None;
-    let mut mamba2 = None;
+    let mut ssm = None;
     let (norm_weight, o_proj) = match shape {
         AttnShape::Linear => (
             norm_sites.load_pre_norm(norm_sites.attn, file, Some(layer))?,
@@ -613,7 +676,18 @@ pub(crate) fn load_non_gqa_attention(
             )
         }
         AttnShape::Mamba2 => {
-            mamba2 = Some(crate::mamba2::Mamba2::load(file, arch, layer, hidden_dim)?);
+            ssm = Some(crate::ssm_block::SsmBlock::Mamba2(
+                crate::mamba2::Mamba2::load(file, arch, layer, hidden_dim)?,
+            ));
+            (
+                norm_sites.load_pre_norm(norm_sites.attn, file, Some(layer))?,
+                no_rows(0),
+            )
+        }
+        AttnShape::Mamba1 => {
+            ssm = Some(crate::ssm_block::SsmBlock::Mamba1(
+                crate::mamba1::Mamba1::load(file, arch, layer, hidden_dim)?,
+            ));
             (
                 norm_sites.load_pre_norm(norm_sites.attn, file, Some(layer))?,
                 no_rows(0),
@@ -657,7 +731,7 @@ pub(crate) fn load_non_gqa_attention(
         o_scale: None,
         o_bias: None,
         shortconv,
-        mamba2,
+        ssm,
     })
 }
 
@@ -907,8 +981,24 @@ mod tests {
             AttnShape::from_counts(4, 2, 16, lfm2),
             Ok(AttnShape::Gqa { .. })
         ));
-        let err = AttnShape::from_counts(4, 0, 16, ZeroKvLayer::for_arch("jamba")).unwrap_err();
+        assert_eq!(
+            AttnShape::from_counts(4, 0, 16, ZeroKvLayer::for_arch("jamba")),
+            Ok(AttnShape::Mamba1)
+        );
+        let err = AttnShape::from_counts(4, 0, 16, ZeroKvLayer::for_arch("plamo2")).unwrap_err();
         assert!(err.contains("Mamba-1"), "{err}");
+        // A pure recurrent model: every layer the block, from uniform
+        // zeros that would otherwise read as a zero-head GQA model.
+        let s = LayerShapes::resolve("mamba", &[0, 0], &[0, 0], Some(&[0, 0]), 0).unwrap();
+        let LayerShapes::PerLayer(v) = s else {
+            panic!("per layer");
+        };
+        assert!(v
+            .iter()
+            .all(|l| l.attention == AttnShape::Mamba1 && l.ffn_dim == 0));
+        assert!(LayerShapes::resolve("mamba2", &[0, 0], &[0, 0], None, 0)
+            .is_ok_and(|s| matches!(s, LayerShapes::PerLayer(_))));
+        assert!(LayerShapes::resolve("mamba", &[4, 4], &[0, 0], None, 0).is_err());
         // The cache: one row of n_embd per token, no V.
         assert_eq!(AttnShape::ShortConv.cache_geometry(6, 6, 24), (1, 24, 0));
         // Mamba-2: no rows at all, the state rides beside the cache.
@@ -944,7 +1034,7 @@ mod tests {
         assert!(AttnShape::Mamba2.is_recurrent() && !AttnShape::ShortConv.is_recurrent());
         assert_eq!(AttnShape::Linear.cache_geometry(6, 6, 24), (0, 6, 6));
         assert_eq!(AttnShape::ShortConv.n_kv_heads(), 0);
-        let err = LayerShapes::resolve("jamba", &[4, 4], &[2, 0], None, 16).unwrap_err();
+        let err = LayerShapes::resolve("plamo2", &[4, 4], &[2, 0], None, 16).unwrap_err();
         assert!(err.to_string().contains("Mamba-1"), "{err}");
         let s = LayerShapes::resolve("lfm2", &[4, 4], &[0, 2], None, 16).unwrap();
         let LayerShapes::PerLayer(v) = s else {
@@ -1058,7 +1148,7 @@ mod tests {
             o_scale: None,
             o_bias: None,
             shortconv: None,
-            mamba2: None,
+            ssm: None,
         };
         assert!(
             check_gqa_projection_widths(0, shape, head_dim, head_dim, hidden, &build(24, 12))
@@ -1096,6 +1186,7 @@ mod tests {
                 "plamo3",
                 "laguna",
                 "step35",
+                "jamba",
                 "nemotron_h",
                 "granitehybrid",
                 "granite-hybrid"

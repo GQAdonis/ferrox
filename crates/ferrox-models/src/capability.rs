@@ -1108,6 +1108,18 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // into the weights by the converter. Three fixtures: plain, without
     // `ssm_norm`, a separate `output.weight`.
     "falcon-h1",
+    // tests/mamba_graphs.rs: `jamba` (AI21 Jamba-v0.1 / 1.5): the
+    // Mamba-1 block (`crate::mamba1`, `mamba-base.cpp:4-148`, with the
+    // REQUIRED dt / B / C norms, `jamba.cpp:49,52-53`) where
+    // `head_count_kv` is 0, attention with no RoPE elsewhere (`:98`),
+    // dense or MoE per layer by the router's presence (`:89-101,152`;
+    // softmax, `norm_w = false`, `:164`). `mamba` (Mamba-130M to 2.8B,
+    // FalconMamba-7B: `ssm.dt_b_c_rms`, the weightless dt / B / C
+    // norms) and `mamba2` (Mamba-Codestral-7B): every layer the block,
+    // no attention, no FFN, head_dim 0 (`layer_shapes::PURE_RECURRENT`).
+    "jamba",
+    "mamba",
+    "mamba2",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -2503,7 +2515,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "use ferrox_models::kimi_decoder / kimi_loader, not the generic GQA Decoder",
         ));
         for (n, rope) in [
-            ("jamba", Neox),
             ("plamo2", Neox),
             ("qwen3next", Neox),
             ("qwen35", Neox),
@@ -2543,7 +2554,40 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 PerHead,
             ));
         }
-        for n in ["mamba", "mamba2", "rwkv6", "rwkv6qwen2", "rwkv7", "arwkv7"] {
+        // `mamba` and `mamba2` (Mamba-130M to 2.8B, FalconMamba-7B;
+        // Mamba-Codestral-7B) left the recurrent group on 2026-09-14:
+        // every layer is the one block and no FFN
+        // (`layer_shapes::PURE_RECURRENT`), served by `crate::mamba1` /
+        // `crate::mamba2` on the generic path with head_dim 0 and no
+        // attention anywhere. `jamba` (AI21 Jamba) left the hybrid
+        // group with them: Mamba-1 where `head_count_kv` is 0
+        // (`ZeroKvLayer::Mamba1`), attention with NO RoPE elsewhere
+        // (`jamba.cpp:98`; `rope_layers` answers `Never`, the NEOX entry
+        // below is a filler as `gpt2`'s), dense or MoE per layer by the
+        // router's presence (`moe_interleave::
+        // DENSE_LAYER_BY_ROUTER_ABSENCE`). Audited on
+        // tests/mamba_graphs.rs.
+        for n in ["mamba", "mamba2"] {
+            v.push(prof(
+                n,
+                TextGeneration,
+                DecoderFamily::Recurrent,
+                MemoryKind::Recurrent,
+                Neox,
+                ArchPath::GenericGqa { rope: Neox },
+                WholeVector,
+            ));
+        }
+        v.push(prof(
+            "jamba",
+            TextGeneration,
+            DecoderFamily::Hybrid,
+            MemoryKind::Hybrid,
+            Neox,
+            ArchPath::GenericGqa { rope: Neox },
+            WholeVector,
+        ));
+        for n in ["rwkv6", "rwkv6qwen2", "rwkv7", "arwkv7"] {
             v.push(prof(
                 n,
                 TextGeneration,

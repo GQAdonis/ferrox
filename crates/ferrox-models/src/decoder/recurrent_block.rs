@@ -38,7 +38,9 @@ impl Decoder {
     ) -> Vec<f32> {
         match self.config.layer_shape(layer_idx).attention {
             AttnShape::ShortConv => self.shortconv_block(layer_idx, layer, normed, rows, kv),
-            AttnShape::Mamba2 => self.mamba2_block(layer_idx, layer, normed, rows, kv),
+            AttnShape::Mamba1 | AttnShape::Mamba2 => {
+                self.ssm_block(layer_idx, layer, normed, rows, kv)
+            }
             other => unreachable!("layer {layer_idx} is {other:?}, not a recurrent block"),
         }
     }
@@ -84,12 +86,12 @@ impl Decoder {
         }
     }
 
-    /// The Mamba-2 block where attention would be. The state is the
-    /// cache's `recurrent` slot ([`Self::mamba2_state_step`]); after the
+    /// The state-space block where attention would be. The state is the
+    /// cache's `recurrent` slot ([`Self::ssm_state_step`]); after the
     /// rows run, the cache is advanced by `rows` EMPTY positions so its
     /// `positions()` / `seq_len()` still says how far the sequence has
     /// got, which is what every consumer of a per-layer cache reads.
-    fn mamba2_block(
+    fn ssm_block(
         &self,
         layer_idx: usize,
         layer: &LayerWeights,
@@ -97,7 +99,7 @@ impl Decoder {
         rows: usize,
         mut kv: KvStep<'_>,
     ) -> Vec<f32> {
-        let out = self.mamba2_state_step(layer_idx, layer, normed, rows, kv.recurrent_slot());
+        let out = self.ssm_state_step(layer_idx, layer, normed, rows, kv.recurrent_slot());
         match kv {
             KvStep::Decode(cache) | KvStep::Batched(cache) => {
                 cache
@@ -116,12 +118,13 @@ impl Decoder {
         out
     }
 
-    /// The Mamba-2 arithmetic over `rows` rows of ONE sequence, on the
+    /// The block's arithmetic (`crate::ssm_block`, either generation)
+    /// over `rows` rows of ONE sequence, on the
     /// state in `slot`, created at this layer's size on the sequence's
     /// first token (zeros, as `build_rs` zeroes a new sequence's). Counts
     /// no positions: the zero-KV arm above does that, and the parallel
     /// arm ([`Self::add_parallel_ssm`]) leaves it to attention.
-    pub(crate) fn mamba2_state_step(
+    pub(crate) fn ssm_state_step(
         &self,
         layer_idx: usize,
         layer: &LayerWeights,
@@ -130,7 +133,7 @@ impl Decoder {
         slot: &mut Option<RecurrentState>,
     ) -> Vec<f32> {
         let block =
-            layer.attn.mamba2.as_ref().unwrap_or_else(|| {
+            layer.attn.ssm.as_ref().unwrap_or_else(|| {
                 panic!("layer {layer_idx} runs a Mamba-2 block but has no weights")
             });
         let state = slot.get_or_insert_with(|| block.zero_state());
@@ -152,12 +155,10 @@ impl Decoder {
         rows: usize,
         slot: &mut Option<RecurrentState>,
     ) -> Option<Vec<f32>> {
-        if layer.attn.mamba2.is_none()
-            || self.config.layer_shape(layer_idx).attention.is_recurrent()
-        {
+        if layer.attn.ssm.is_none() || self.config.layer_shape(layer_idx).attention.is_recurrent() {
             return None;
         }
-        Some(self.mamba2_state_step(layer_idx, layer, normed, rows, slot))
+        Some(self.ssm_state_step(layer_idx, layer, normed, rows, slot))
     }
 
     /// `falcon-h1.cpp:160`: `attn_out + ssm_out`, before the one residual

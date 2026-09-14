@@ -247,7 +247,9 @@ const DEDICATED_OWNS_ITS_BEHAVIOUR: &[(&str, &str)] = &[
 // Ferrox therefore renormalised where llama.cpp does not. Same class of
 // bug as the OLMoE one above, and latent only because `deepseek` is
 // unaudited and refuses first.
-const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] = &["deepseek", "olmoe", "qwen2moe"];
+// `jamba.cpp:164` passes `norm_w = false` and its converter writes no
+// `expert_weights_norm` (`conversion/jamba.py:24-54`).
+const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] = &["deepseek", "jamba", "olmoe", "qwen2moe"];
 
 /// Architectures whose `{arch}.feed_forward_length` counts the gate and
 /// the up projection TOGETHER, so each FFN matrix is half as wide as the
@@ -491,17 +493,24 @@ impl ModelConfig {
                 // a file whose layer 0 has none is a division by zero
                 // there and a refusal here.
                 let h0 = heads_per_layer.first().copied().unwrap_or(0) as usize;
-                if h0 == 0 {
-                    return Err(LoadError::MissingHparam(format!(
-                        "{} (layer 0 declares head_count 0, so it cannot be derived as \
-                         hidden_dim / n_heads)",
-                        key("attention.key_length")
-                    )));
+                // A pure recurrent model has no heads and no head width
+                // (`layer_shapes::PURE_RECURRENT`); nothing reads one.
+                match hidden_dim.checked_div(h0) {
+                    _ if h0 == 0 && crate::layer_shapes::pure_recurrent_block(&arch).is_some() => 0,
+                    None => {
+                        return Err(LoadError::MissingHparam(format!(
+                            "{} (layer 0 declares head_count 0, so it cannot be derived as \
+                             hidden_dim / n_heads)",
+                            key("attention.key_length")
+                        )));
+                    }
+                    Some(derived) => {
+                        best_effort_fields.push(
+                            "head_dim (no attention.key_length key; derived as hidden_dim / n_heads)",
+                        );
+                        derived
+                    }
                 }
-                best_effort_fields.push(
-                    "head_dim (no attention.key_length key; derived as hidden_dim / n_heads)",
-                );
-                hidden_dim / h0
             }
         };
         let v_head_dim = crate::kv_head_dims::resolve_v_head_dim(
@@ -2694,13 +2703,10 @@ impl Decoder {
                         // falcon-h1.cpp:55-71: the Mamba-2 block beside
                         // attention on every layer (`crate::mamba2::
                         // PARALLEL_WITH_ATTENTION`).
-                        mamba2: if config.parallel_ssm {
-                            Some(crate::mamba2::Mamba2::load(
-                                &file,
-                                &arch,
-                                l,
-                                config.hidden_dim,
-                            )?)
+                        ssm: if config.parallel_ssm {
+                            Some(crate::ssm_block::SsmBlock::Mamba2(
+                                crate::mamba2::Mamba2::load(&file, &arch, l, config.hidden_dim)?,
+                            ))
                         } else {
                             None
                         },
@@ -2735,8 +2741,10 @@ impl Decoder {
             // A layer with NO FFN at all (`ffn_dim 0`: deci's, Nemotron-H's
             // block-only layers) takes the dense arm, whose loader answers
             // `absent_ffn` for that width, whatever the model's MoE says.
-            let is_dense_layer =
-                config.layer_is_dense(l) || config.moe.n_experts <= 1 || shape.ffn_dim == 0;
+            let is_dense_layer = config.layer_is_dense(l)
+                || config.moe.n_experts <= 1
+                || shape.ffn_dim == 0
+                || crate::moe_interleave::dense_by_router_absence(&arch, &file, l);
             // The ungated experts (`nemotron-h.cpp:82-86,209-215`: a null
             // gate into `build_moe_ffn`, `LLM_FFN_RELU_SQR`) are spelled
             // the way the dense ungated FFN is (`load_dense_expert`): the

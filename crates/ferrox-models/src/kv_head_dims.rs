@@ -72,7 +72,9 @@ pub fn resolve_v_head_dim(
 ) -> Result<usize, LoadError> {
     let v_head_dim = value_length.unwrap_or(head_dim);
     if v_head_dim == head_dim || admits_split_kv_head_dims(arch) {
-        if v_head_dim == 0 {
+        // A pure recurrent model has no heads and no head width at all
+        // (`layer_shapes::PURE_RECURRENT`): zero is its answer.
+        if v_head_dim == 0 && crate::layer_shapes::pure_recurrent_block(arch).is_none() {
             return Err(LoadError::UnsupportedFeature(
                 arch.to_string(),
                 "attention.value_length is 0".to_string(),

@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **90** architectures run with
+Honest position, re-audited 2026-09-14. **91** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -1103,6 +1103,46 @@ deleted port had assumed for everyone) and `gdn::BetaAlpha::Fused`
 `:422-436`), plain NEOX RoPE, KL 8.7e-12; swapping beta and alpha
 or tiling the heads each turns its test red. Every gated-delta-net
 graph in llama.cpp is served.
+
+`llama4` (Llama 4 Scout / Maverick) closed on 2026-09-14, and it is
+the row that says "read the graph AND the helper it calls":
+`llama4.cpp` has four things on top of Llama, and the one that cost
+the most was not in it. `ferrox-models/src/chunked_swa.rs` is the
+new seam: `llama4.cpp:13-14` set `LLAMA_SWA_TYPE_CHUNKED` at a
+literal 8192 (the file's value is never read, and a declared ZERO is
+the branch libllama ABORTS on, `llama-graph.cpp:159`, refused by
+name), `llama-hparams.h:419-425` mask every key before the query's
+own chunk, so a query at `p` sees `p % 8192 + 1` positions where a
+sliding layer sees a constant. `ModelConfig::layer_window_for_query`
+is that number for the row body, `BatchWindow` sends the batched
+prefill to a per-query arm when a batch straddles a boundary and to
+the blocked kernel when it sits inside the first chunk, eviction
+keeps the last 8192 rows, and `metal_can_serve_model` refuses the
+model. The other three each landed as a per-layer gate on a seam
+that existed: the temperature 0.1 / 8192 / 1.0 from literals
+(`attn_temperature::LITERAL_ATTN_TEMPERATURE`) on the layers that do
+NOT rotate (`AttnTemperature::unrotated_layers_only`); a weightless
+per-head RMS on Q and K AFTER RoPE on the layers that do, for every
+expert count but 128 (`llama4.cpp:43,182-188`; `weightless_qk_norm`,
+a `bool`, one reachable graph of 140); and the interleave step,
+honoured because `llama4.cpp:64` is the ONE tensor loader of 140
+that branches on it (`moe_interleave::
+INTERLEAVE_STEP_HONOURED_BY_LOADER`; ERNIE's does not, which is why
+that arm is a refusal). The fourth thing is `llama-graph.cpp:1947`:
+`weight_before_ffn = arch == LLM_ARCH_LLAMA4`, the sigmoid weight
+multiplied into the expert's INPUT before `mul_mat_id` where every
+other graph multiplies the output -- SwiGLU is not homogeneous, the
+fixture's logits move by 0.86 between the two, and
+`ferrox-models/src/routed_weight_site.rs` scales the row per slot at
+the two host sites that gather a routed input. Building it found
+`route_top_k_sigmoid` renormalising whatever `norm_topk_prob` said:
+every sigmoid row before this one declared the key true, so the
+ignored argument had never changed an answer; `llama4.cpp:228`
+passes `false`. KL 1.1e-12 on the 16- and 128-expert shapes and at
+the last of 8200 positions across the chunk boundary on both bodies
+(`REF_N_CTX` on the reference tool); each seam switched off turns
+the test red; a zero expert count is refused as `llama4.cpp:49-51`
+refuse it. The engine stub that had refused the row is deleted.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

@@ -55,6 +55,24 @@
 //! reference can confirm. Implementing the modulo would have added a
 //! decode path that no loadable checkpoint reaches and no golden run
 //! could check.
+//!
+//! # The one loader that HONOURS the step
+//!
+//! `grep -n n_moe_layer_step src/models/*.cpp` over all 140 graphs is
+//! the two ERNIE lines above and `llama4.cpp:6,64`. Llama 4 reads the
+//! key as REQUIRED (`:6`) and its TENSOR LOADER branches on it
+//! (`:64`, `is_moe_layer = n_moe_layer_step > 0 && (i + 1) % step ==
+//! 0`, the routed triple plus a shared expert on those layers and the
+//! dense triple on the rest, `:77-94`), so a Llama 4 file whose step
+//! interleaves loads upstream, and its graph branches on the router's
+//! presence (`:202`). Scout and Maverick export step 1 (every layer
+//! MoE); `interleave_moe_layer_step: 2` is Llama-4's config for the
+//! shape the fixture takes. [`INTERLEAVE_STEP_HONOURED_BY_LOADER`] is
+//! that one row, [`interleave_step`] its answer, and
+//! `ModelConfig::layer_is_dense` the ONE place the modulo is spelled.
+//! A step of 0 there makes every layer dense with `n_expert` still
+//! nonzero, a file no converter writes and no fixture has a golden
+//! for; it is refused by name rather than served unmeasured.
 
 /// Architectures for which llama.cpp reads the interleave step as a
 /// REQUIRED key, so a file lacking it is one llama.cpp refuses to load.
@@ -64,6 +82,49 @@
 /// `ernie4-5-moe.cpp:26` then asserts the value is positive. Both are
 /// hard failures upstream.
 pub const INTERLEAVE_STEP_IS_REQUIRED: &[&str] = &["ernie4_5-moe"];
+
+/// Architectures whose loader creates the expert tensors on exactly
+/// the layers `(i + 1) % step == 0` (`llama4.cpp:64`), so the step is
+/// served, with the line that refuses a zero expert count before any
+/// layer is read (`:49-51`).
+pub const INTERLEAVE_STEP_HONOURED_BY_LOADER: &[(&str, &str)] =
+    &[("llama4", "src/models/llama4.cpp:6,49-51,64")];
+
+/// The step `ModelConfig::layer_is_dense` applies for `arch`, or
+/// `None` where the loader does not branch on it. `n_experts` is the
+/// file's `expert_count`, refused at zero where llama.cpp throws.
+pub fn interleave_step(
+    arch: &str,
+    step: Option<u64>,
+    n_experts: usize,
+) -> Result<Option<usize>, String> {
+    let Some((_, lines)) = INTERLEAVE_STEP_HONOURED_BY_LOADER
+        .iter()
+        .find(|(a, _)| *a == arch)
+    else {
+        return Ok(None);
+    };
+    if n_experts == 0 {
+        return Err(format!(
+            "`{arch}.expert_count` is 0: llama.cpp throws `{arch} model cannot have zero \
+             experts` before creating a tensor ({lines}; measured on \
+             scripts/make_llama4_fixture.py --dense), so a dense Llama 4 (MobileLLM) has no \
+             reference graph to match"
+        ));
+    }
+    match step {
+        None => Err(format!(
+            "`{arch}.interleave_moe_layer_step` is missing; llama.cpp reads it as a REQUIRED \
+             key ({lines}) and every export writes it (conversion/llama.py:392)"
+        )),
+        Some(0) => Err(format!(
+            "`{arch}.interleave_moe_layer_step` is 0: {lines} then loads EVERY layer dense \
+             with `expert_count` nonzero, a file no converter writes and no fixture has a \
+             libllama golden for"
+        )),
+        Some(step) => Ok(Some(step as usize)),
+    }
+}
 
 /// Architectures whose LOADER decides dense-or-MoE per layer by the
 /// presence of `blk.N.ffn_gate_inp.weight`, with no key involved:
@@ -108,6 +169,12 @@ pub fn dense_by_router_absence(
 ///   leading-dense prefix, which ferrox implements.
 /// * absent-but-required, `0`, or `> 1` -> refused, by name.
 pub fn interleave_step_refusal(arch: &str, step: Option<u64>) -> Option<String> {
+    if INTERLEAVE_STEP_HONOURED_BY_LOADER
+        .iter()
+        .any(|(a, _)| *a == arch)
+    {
+        return None;
+    }
     match step {
         None if INTERLEAVE_STEP_IS_REQUIRED.contains(&arch) => Some(format!(
             "`{arch}.interleave_moe_layer_step` is missing. llama.cpp reads it as a REQUIRED \
@@ -181,6 +248,26 @@ mod tests {
                 "{arch} must not require the key"
             );
         }
+    }
+
+    /// The honoured row: served at any positive step, refused by name
+    /// at zero, without the key, and without experts; everyone else
+    /// answers `None` and keeps the ERNIE rule.
+    #[test]
+    fn llama4_s_step_is_served_and_its_three_refusals_name_the_lines() {
+        assert_eq!(interleave_step("llama4", Some(2), 16).unwrap(), Some(2));
+        assert_eq!(interleave_step("llama4", Some(1), 128).unwrap(), Some(1));
+        assert!(interleave_step("llama4", None, 16)
+            .unwrap_err()
+            .contains("REQUIRED"));
+        assert!(interleave_step("llama4", Some(0), 16)
+            .unwrap_err()
+            .contains("EVERY layer dense"));
+        assert!(interleave_step("llama4", Some(2), 0)
+            .unwrap_err()
+            .contains("cannot have zero"));
+        assert_eq!(interleave_step("ernie4_5-moe", Some(2), 16).unwrap(), None);
+        assert!(interleave_step_refusal("llama4", Some(2)).is_none());
     }
 
     /// Zero is refused separately, because it is the one value that

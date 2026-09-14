@@ -227,6 +227,11 @@ pub struct ModelConfig {
     /// "every layer uses this model's MoE topology," the default for
     /// architectures that don't do this.
     pub n_dense_leading_layers: usize,
+    /// `{arch}.interleave_moe_layer_step` where the loader honours it
+    /// (`crate::moe_interleave::INTERLEAVE_STEP_HONOURED_BY_LOADER`):
+    /// layer `il` is MoE when `(il + 1) % step == 0`. `None` everywhere
+    /// else, including the ERNIE files whose step is 1.
+    pub moe_interleave_step: Option<usize>,
     /// Llama 3/3.1/3.2's real per-band RoPE frequency correction (the
     /// `rope_freqs.weight` GGUF tensor, `head_dim/2` elements,
     /// `TENSOR_NOT_REQUIRED` so most architectures leave this `None`).
@@ -476,6 +481,17 @@ pub struct ModelConfig {
     /// [`Self::has_recurrent_layers`] is true and the fused Metal
     /// launches refuse the model.
     pub parallel_ssm: bool,
+    /// The sliding layers' window is a CHUNK (`crate::chunked_swa`): a
+    /// query sees its own `sliding_window`-sized chunk and nothing
+    /// before it. [`Self::layer_window_for_query`] is the per-query
+    /// window the single-query kernels take for it; the fused Metal
+    /// launches refuse the model.
+    pub swa_chunked: bool,
+    /// A per-head RMSNorm with no weight on Q and K after RoPE, on the
+    /// layers that rotate (`crate::weightless_qk_norm`, Llama 4's
+    /// `Llama4TextL2Norm`). Applied at the post-RoPE QK-norm hook;
+    /// the fused Metal launches refuse the model.
+    pub weightless_qk_norm: bool,
     /// RoPE base used on SWA layers (Gemma 3: defaults to `10000` when
     /// the GGUF omits `rope.freq_base_swa`; full-attn layers keep
     /// [`Self::rope_theta`]).
@@ -653,6 +669,16 @@ pub enum FfnActivation {
     SwigluClamped(crate::act_layers::SwigluClamps),
 }
 
+/// [`ModelConfig::batch_window`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchWindow {
+    /// Every query in the batch takes this window (`None`: full causal).
+    Uniform(Option<usize>),
+    /// Each query takes [`ModelConfig::layer_window_for_query`] at its
+    /// own position.
+    PerQuery,
+}
+
 impl ModelConfig {
     /// The V head width: the width of every V head, of each head's
     /// attention output, and so of `o_proj`'s input (`n_heads *
@@ -713,9 +739,15 @@ impl ModelConfig {
     }
 
     /// True if layer `layer_idx` (0-indexed) should be built as an
-    /// ordinary dense FFN rather than this model's MoE topology.
+    /// ordinary dense FFN rather than this model's MoE topology: the
+    /// leading-dense prefix, and, where the loader honours the
+    /// interleave step (`crate::moe_interleave`, `llama4.cpp:64`), a
+    /// layer with `(il + 1) % step != 0`.
     pub fn layer_is_dense(&self, layer_idx: usize) -> bool {
         layer_idx < self.n_dense_leading_layers
+            || self
+                .moe_interleave_step
+                .is_some_and(|step| !(layer_idx + 1).is_multiple_of(step))
     }
 
     /// Sliding-window size for layer `il`, honouring Gemma-style
@@ -726,6 +758,31 @@ impl ModelConfig {
         // in; `crate::swa_layers` is the one implementation of both.
         let window = self.sliding_window?;
         self.swa_layers.slides(layer_idx).then_some(window)
+    }
+
+    /// The window the single-query kernels take for a query at `pos`
+    /// on layer `il`: the layer's sliding window, or, when the window
+    /// is chunked (`crate::chunked_swa`), the `pos % chunk + 1`
+    /// positions of the query's own chunk. `None` for a full layer.
+    pub fn layer_window_for_query(&self, il: usize, pos: usize) -> Option<usize> {
+        let w = self.layer_sliding_window(il)?;
+        Some(if self.swa_chunked { pos % w + 1 } else { w })
+    }
+
+    /// The window a batch of `batch_size` queries starting at
+    /// `start_pos` takes on layer `il`, for the batched prefill body:
+    /// one window for the blocked kernel, or one per query where a
+    /// chunked layer's queries do not share a chunk start.
+    pub fn batch_window(&self, il: usize, start_pos: usize, batch_size: usize) -> BatchWindow {
+        match self.layer_sliding_window(il) {
+            None => BatchWindow::Uniform(None),
+            Some(w) if !self.swa_chunked => BatchWindow::Uniform(Some(w)),
+            // Every query in the first chunk sees its whole causal
+            // prefix: `pos / chunk == 0` for all of them
+            // (`llama-hparams.h:419-425`), which is the full mask.
+            Some(chunk) if start_pos + batch_size <= chunk => BatchWindow::Uniform(None),
+            Some(_) => BatchWindow::PerQuery,
+        }
     }
 
     /// The narrowest sliding window any layer of this model uses, or
@@ -947,6 +1004,7 @@ pub fn glm_5_2() -> ModelConfig {
         rms_norm_eps: 1e-5,
         moe: MoeLayerConfig {
             expert_weights_scale: 1.0,
+            routed_weight_before_ffn: false,
             n_experts: 256,
             n_experts_active: 8,
             n_shared_experts: 1,
@@ -968,6 +1026,7 @@ pub fn glm_5_2() -> ModelConfig {
         // topology) rather than assuming DeepSeek's convention
         // applies here too.
         n_dense_leading_layers: 0,
+        moe_interleave_step: None,
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
@@ -997,6 +1056,8 @@ pub fn glm_5_2() -> ModelConfig {
         layer_loops: None,
         skip_stream: false,
         parallel_ssm: false,
+        swa_chunked: false,
+        weightless_qk_norm: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1037,6 +1098,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         rms_norm_eps: 1e-6,
         moe: MoeLayerConfig {
             expert_weights_scale: 1.0,
+            routed_weight_before_ffn: false,
             n_experts: 385,
             n_experts_active: 6,
             n_shared_experts: 1,
@@ -1065,6 +1127,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         // DeepSeek V4 Pro is presumed to continue this convention;
         // not confirmed against V4 Pro's own config.json.
         n_dense_leading_layers: 3,
+        moe_interleave_step: None,
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
@@ -1093,6 +1156,8 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         layer_loops: None,
         skip_stream: false,
         parallel_ssm: false,
+        swa_chunked: false,
+        weightless_qk_norm: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1141,6 +1206,7 @@ pub fn kimi_k3() -> ModelConfig {
         rms_norm_eps: 1e-5,
         moe: MoeLayerConfig {
             expert_weights_scale: 1.0,
+            routed_weight_before_ffn: false,
             n_experts: 896,
             n_experts_active: 16,
             n_shared_experts: 2,
@@ -1154,6 +1220,7 @@ pub fn kimi_k3() -> ModelConfig {
         // Confirmed directly from the real config.json:
         // "first_k_dense_replace": 1.
         n_dense_leading_layers: 1,
+        moe_interleave_step: None,
         // Kimi K3's real, published attention topology (verified
         // against huggingface.co/moonshotai/Kimi-K3/config.json's
         // linear_attn_config block and the real KimiDeltaAttention /
@@ -1221,6 +1288,8 @@ pub fn kimi_k3() -> ModelConfig {
         layer_loops: None,
         skip_stream: false,
         parallel_ssm: false,
+        swa_chunked: false,
+        weightless_qk_norm: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1256,6 +1325,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         rms_norm_eps: 1e-5,
         moe: MoeLayerConfig {
             expert_weights_scale: 1.0,
+            routed_weight_before_ffn: false,
             n_experts: 1,
             n_experts_active: 1,
             n_shared_experts: 0,
@@ -1267,6 +1337,7 @@ pub fn test_dense_fixture() -> ModelConfig {
             expert_group_used_count: None,
         },
         n_dense_leading_layers: 0,
+        moe_interleave_step: None,
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
@@ -1295,6 +1366,8 @@ pub fn test_dense_fixture() -> ModelConfig {
         layer_loops: None,
         skip_stream: false,
         parallel_ssm: false,
+        swa_chunked: false,
+        weightless_qk_norm: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1326,6 +1399,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         rms_norm_eps: 1e-5,
         moe: MoeLayerConfig {
             expert_weights_scale: 1.0,
+            routed_weight_before_ffn: false,
             n_experts: 4,
             n_experts_active: 2,
             n_shared_experts: 1,
@@ -1337,6 +1411,7 @@ pub fn test_moe_fixture() -> ModelConfig {
             expert_group_used_count: None,
         },
         n_dense_leading_layers: 0,
+        moe_interleave_step: None,
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
@@ -1364,6 +1439,8 @@ pub fn test_moe_fixture() -> ModelConfig {
         layer_loops: None,
         skip_stream: false,
         parallel_ssm: false,
+        swa_chunked: false,
+        weightless_qk_norm: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1398,6 +1475,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         rms_norm_eps: 1e-5,
         moe: MoeLayerConfig {
             expert_weights_scale: 1.0,
+            routed_weight_before_ffn: false,
             n_experts: 3,
             n_experts_active: 1,
             n_shared_experts: 1,
@@ -1409,6 +1487,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
             expert_group_used_count: None,
         },
         n_dense_leading_layers: 1,
+        moe_interleave_step: None,
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
@@ -1436,6 +1515,8 @@ pub fn test_mixed_fixture() -> ModelConfig {
         layer_loops: None,
         skip_stream: false,
         parallel_ssm: false,
+        swa_chunked: false,
+        weightless_qk_norm: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,

@@ -245,11 +245,13 @@ pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> Rop
         // (`tests/gated_attention_graphs.rs`).
         "afmoe" => no_rope_every(NoRopePhase::LastOfPeriod),
         // `llama4.cpp:11` sets the step to `n_layer` ("always use rope",
-        // its own comment) only when the file declares a window of ZERO;
-        // every other Llama-4 keeps the default 4 and :145-146 skips
-        // `(il + 1) % 4 == 0`. LATENT on the generic path (`llama4` has
-        // a dedicated engine), and `llama4`'s chunked attention is not
-        // ferrox's `sliding_window` either.
+        // its own comment) only when the file declares a window of ZERO,
+        // the branch `crate::chunked_swa` refuses because libllama
+        // aborts on it; every other Llama-4 keeps the default 4 and
+        // :145-146 skips `(il + 1) % 4 == 0`, which is exactly the
+        // full-attention layer of its 3-chunked-1-full period. LIVE
+        // since 2026-09-14 (`tests/llama4_graphs.rs`); the chunked
+        // window is ferrox's `sliding_window` with `swa_chunked` set.
         "llama4" if has_sliding_window => no_rope_every(NoRopePhase::LastOfPeriod),
         _ => RopeLayers::All,
     }

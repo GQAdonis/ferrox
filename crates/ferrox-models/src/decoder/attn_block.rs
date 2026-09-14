@@ -159,9 +159,9 @@ impl Decoder {
         for h in 0..n_kv_heads {
             self.apply_rope_head_layer(&mut k[h * head_dim..(h + 1) * head_dim], pos, layer_idx);
         }
-        self.apply_qk_norms_post_rope(layer, &mut q, &mut k, q_width, kv_width);
+        self.apply_qk_norms_post_rope(layer, layer_idx, &mut q, &mut k, q_width, kv_width);
         self.apply_attention_scale(&mut q);
-        self.apply_attn_temperature(&mut q, q_width, |_| pos);
+        self.apply_attn_temperature(layer_idx, &mut q, q_width, |_| pos);
 
         // falcon-h1.cpp:156-160: the parallel Mamba-2 block on the same
         // normed row, summed into the attention branch.
@@ -292,7 +292,13 @@ impl Decoder {
         );
         let head_dim = self.config.head_dim;
         let v_head_dim = self.config.v_head_dim();
-        let window = self.config.layer_sliding_window(layer_idx);
+        // The query's own position, BEFORE the push: a chunked layer's
+        // window is a function of it (`crate::chunked_swa`).
+        let query_pos = match &kv {
+            KvStep::Decode(cache) | KvStep::Batched(cache) => cache.positions(),
+            KvStep::Paged { cache, .. } => cache.seq_len(),
+        };
+        let window = self.config.layer_window_for_query(layer_idx, query_pos);
         // The sink arm carries no softcap, matching llama.cpp's.
         let softcap = if sinks.is_some() {
             None

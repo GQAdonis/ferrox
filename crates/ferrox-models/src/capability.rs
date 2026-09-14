@@ -806,6 +806,29 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // at 8), the split spelling, and the same file without the value
     // scale.
     "mimo2",
+    // tests/llama4_graphs.rs: `llama4` (Llama 4 Scout 17B-16E, Maverick
+    // 17B-128E), NEW CODE on the CHUNKED window: `llama4.cpp:13-14`
+    // set `LLAMA_SWA_TYPE_CHUNKED` at a literal 8192 on the branch
+    // every export takes, and `llama-hparams.h:419-425` mask every key
+    // before the query's own chunk, so a query at `p` sees `p % 8192 +
+    // 1` positions where a sliding layer sees a constant. One graph of
+    // 140 sets the type (`crate::chunked_swa`); the row's other three
+    // facts each landed on a seam that existed with a per-layer gate:
+    // the literal temperature 0.1 / 8192 / 1.0 on the layers that do
+    // NOT rotate (`:15-17,175-176`, `attn_temperature::
+    // LITERAL_ATTN_TEMPERATURE`), a weightless per-head RMS on Q and K
+    // AFTER RoPE on the layers that do, for every expert count but 128
+    // (`:43,182-188`, `crate::weightless_qk_norm`), and the interleave
+    // step the TENSOR LOADER honours (`:64`, unlike ERNIE's,
+    // `moe_interleave::INTERLEAVE_STEP_HONOURED_BY_LOADER`) with a
+    // shared expert at `n_ff_exp` on the MoE layers, SIGMOID from a
+    // literal with `norm_w = false` (`:228-230`). A declared window of
+    // ZERO (`:8-11`, the converter's spelling for an all-full-attention
+    // MobileLLM) is refused by name because libllama aborts on it
+    // (llama-graph.cpp:159), and zero experts because `:49-51` throw.
+    // Two fixtures: 16 experts at step 2 and 128 experts at step 1
+    // with a separate `output.weight` (no QK norm).
+    "llama4",
     // tests/layer_loop_graphs.rs: `nanbeige`, NEW CODE on RUNNING THE
     // SAME PHYSICAL LAYERS MORE THAN ONCE. `nanbeige.cpp:6-12` read
     // `num_loops` / `skip_loop_final_norm`, `:19-31` set `n_layer_all =
@@ -2342,24 +2365,17 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                  different row",
             ),
         );
-        // Llama 4: MoE + interleaved / non-generic attention graph -- not
-        // safe to admit as GenericGqa (was wrongly listed with plain llama).
-        v.push(prof(
-            "llama4",
-            TextGeneration,
-            Dedicated,
-            KvGqa,
-            Norm,
-            ArchPath::DedicatedOnly {
-                reason: "llama4 MoE + chunked attention -- see llama4_engine.rs tensor list. \
-                         Its attention temperature (llama4.cpp:15-17: scale 0.1, floor 8192, \
-                         offset 1.0, from LITERALS, applied at :175-176 to the no-RoPE layers \
-                         only) is `crate::attn_temperature` plus a per-layer gate on \
-                         `ModelConfig::layer_rotates`; what it still needs is the chunked \
-                         SWA (`LLAMA_SWA_TYPE_CHUNKED`, :13) and the interleaved MoE",
-            },
-            WholeVector,
-        ));
+        // Llama 4 (Scout, Maverick): was a `DedicatedOnly` refusal on
+        // an engine that never existed, audited now on
+        // tests/llama4_graphs.rs. The chunked window is
+        // `crate::chunked_swa`, the literal temperature on the unrotated
+        // layers `attn_temperature::LITERAL_ATTN_TEMPERATURE`, the
+        // weightless post-RoPE QK norm `crate::weightless_qk_norm`, the
+        // honoured interleave step `moe_interleave::
+        // INTERLEAVE_STEP_HONOURED_BY_LOADER`. NORM RoPE:
+        // llama-model.cpp's `LLM_ARCH_LLAMA4` sits in the NORM group,
+        // pinned by `tests/rope_layout.rs`.
+        v.push(gqa_norm("llama4"));
         // MiniMax M2 and M3 are two DIFFERENT architectures and were
         // wrong to share one reason. Both used to refuse with "256-expert
         // sigmoid MoE + MTP"; neither clause is true.
@@ -3114,7 +3130,8 @@ pub fn default_swa_layout(arch: &str) -> Option<SwaPattern> {
         // this phase are exercised end to end against libllama.
         "plamo3" => last_dense(8),
         // src/models/llama4.cpp:19 ("pattern: 3 chunked - 1 full").
-        // `llama4` is `DedicatedOnly` today, so latent.
+        // LIVE: the chunked window is `crate::chunked_swa`, and
+        // tests/llama4_graphs.rs drives a period of 2 from the file.
         "llama4" => last_dense(4),
         // --- dense_first = true -----------------------------------
         //
@@ -3988,15 +4005,9 @@ mod tests {
             ),
             "minimax-m3 must fail closed, not silent generic GQA"
         );
-        match resolve_architecture("llama4") {
-            Some(ArchPath::DedicatedOnly { reason }) => {
-                assert!(
-                    reason.contains("llama4_engine.rs") && reason.contains("attn_temperature"),
-                    "llama4's reason names its engine and the temperature seam: {reason}"
-                );
-            }
-            other => panic!("llama4 must fail closed, not silent generic GQA: {other:?}"),
-        }
+        // `llama4` was a `DedicatedOnly` refusal here and is an audited
+        // generic row now (tests/llama4_graphs.rs).
+        assert!(is_audited_generic("llama4"));
         // `glm4` and `glm4moe` were DedicatedOnly refusals here and are
         // audited generic rows now (tests/glm4_graphs.rs,
         // tests/glm4moe_graphs.rs); `glm-dsa` stays on its engine.

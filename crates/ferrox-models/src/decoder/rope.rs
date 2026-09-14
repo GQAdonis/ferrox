@@ -192,6 +192,7 @@ impl Decoder {
     #[inline]
     pub(crate) fn apply_attn_temperature(
         &self,
+        layer_idx: usize,
         q: &mut [f32],
         q_width: usize,
         pos_of_row: impl Fn(usize) -> usize,
@@ -199,6 +200,11 @@ impl Decoder {
         let Some(temp) = self.config.attn_temperature else {
             return;
         };
+        // `llama4.cpp:163-177`: the multiply is the `else` of the RoPE
+        // branch, so a rotating layer is left alone.
+        if temp.unrotated_layers_only && self.config.layer_rotates(layer_idx) {
+            return;
+        }
         temp.apply_rows(q, q_width, pos_of_row);
     }
 }

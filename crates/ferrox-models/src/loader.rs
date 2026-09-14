@@ -135,10 +135,14 @@ const GATING_LITERAL_ARCHITECTURES: &[(&str, GatingFunction)] = &[
     // `nemotron-h.cpp:218`: the SIGMOID literal; the converter writes no
     // `expert_gating_func` (`conversion/nemotron.py:238-250`).
     ("nemotron_h_moe", GatingFunction::Sigmoid),
+    // `llama4.cpp:230`: the SIGMOID literal, with `norm_w = false` at
+    // `:228` (`NO_TOPK_RENORMALIZE_ARCHITECTURES`); the converter
+    // writes no key (`conversion/llama.py:374-394`).
+    ("llama4", GatingFunction::Sigmoid),
 ];
 /// The names alone, for the cross-table test.
 #[cfg(test)]
-const GATING_LITERAL_NAMES: &[&str] = &["mimo2", "nemotron_h_moe"];
+const GATING_LITERAL_NAMES: &[&str] = &["mimo2", "nemotron_h_moe", "llama4"];
 
 /// Architectures whose `load_arch_hparams` reads
 /// `{arch}.expert_weights_scale` (`LLM_KV_EXPERT_WEIGHTS_SCALE`) -- and
@@ -249,7 +253,11 @@ const DEDICATED_OWNS_ITS_BEHAVIOUR: &[(&str, &str)] = &[
 // unaudited and refuses first.
 // `jamba.cpp:164` passes `norm_w = false` and its converter writes no
 // `expert_weights_norm` (`conversion/jamba.py:24-54`).
-const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] = &["deepseek", "jamba", "olmoe", "qwen2moe"];
+// `llama4.cpp:228` passes `false` beside its SIGMOID literal
+// (`GATING_LITERAL_ARCHITECTURES`): the top-k sigmoid scores weight
+// the experts unrenormalised.
+const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] =
+    &["deepseek", "jamba", "llama4", "olmoe", "qwen2moe"];
 
 /// Architectures whose `{arch}.feed_forward_length` counts the gate and
 /// the up projection TOGETHER, so each FFN matrix is half as wide as the
@@ -602,7 +610,18 @@ impl ModelConfig {
         // the key, and its layer 0 is dense (:105), so a real Laguna
         // export loaded with its three REQUIRED `_shexp` tensors
         // (:138-140) unread on every MoE layer.
-        let first_moe_layer = n_dense_leading_layers.min(n_layers.saturating_sub(1));
+        // The interleave step the loader honours (`crate::moe_interleave`,
+        // `llama4.cpp:64`), read here because the shared-expert probe
+        // below needs the first layer it makes MoE.
+        let moe_interleave_step = crate::moe_interleave::interleave_step(
+            &arch,
+            metadata_u64_any(file, &[key("interleave_moe_layer_step")]),
+            n_experts,
+        )
+        .map_err(|reason| LoadError::UnsupportedFeature(arch.clone(), reason))?;
+        let first_moe_layer = (n_dense_leading_layers..n_layers)
+            .find(|&il| !moe_interleave_step.is_some_and(|step| !(il + 1).is_multiple_of(step)))
+            .unwrap_or(n_layers.saturating_sub(1));
         let shexp_probe = format!("blk.{first_moe_layer}.ffn_gate_shexp.weight");
         let n_shared_experts = match metadata_u64_any(file, &[key("expert_shared_count")]) {
             Some(n) => n as usize,
@@ -757,7 +776,8 @@ impl ModelConfig {
         // (`use_sliding_window: false`) -- llama.cpp's own convention
         // is that a window of 0 means "unused," so only a real nonzero
         // value here is treated as active.
-        let sliding_window = metadata_u64_any(file, &[key("attention.sliding_window")])
+        let declared_window = metadata_u64_any(file, &[key("attention.sliding_window")]);
+        let sliding_window = declared_window
             .map(|v| v as usize)
             .filter(|&w| w > 0)
             // `phi3` declares a window that llama.cpp deliberately does
@@ -783,6 +803,14 @@ impl ModelConfig {
                     crate::capability::SwaWindowOverride::Pin(pinned) => Some(pinned),
                 },
             );
+
+        // A CHUNKED window (`crate::chunked_swa`): the literal chunk on
+        // the branch the file takes, whatever nonzero value it declares
+        // and whether it declares one at all; a declared ZERO is the
+        // branch libllama aborts on, refused there by name.
+        let swa_chunked = crate::chunked_swa::chunked_window(&arch, declared_window)?;
+        let sliding_window = swa_chunked.or(sliding_window);
+        let swa_chunked = swa_chunked.is_some();
 
         // A window llama.cpp REQUIRES (`crate::swa_geometry::
         // window_required`): without it the file does not load upstream,
@@ -1404,6 +1432,8 @@ impl ModelConfig {
             layer_loops,
             skip_stream: crate::skip_stream::has_skip_stream(&arch),
             parallel_ssm: crate::mamba2::parallel_with_attention(&arch),
+            swa_chunked,
+            weightless_qk_norm: crate::weightless_qk_norm::weightless_qk_norm(&arch, n_experts),
             hidden_dim,
             n_heads,
             n_kv_heads,
@@ -1458,8 +1488,10 @@ impl ModelConfig {
                     .map(|v| v as usize)
                     .filter(|&c| c > 0),
                 expert_weights_scale,
+                routed_weight_before_ffn: crate::routed_weight_site::weight_before_ffn(&arch),
             },
             n_dense_leading_layers,
+            moe_interleave_step,
             rope_freqs,
             rope_layout,
             qk_norm_style,
@@ -4034,18 +4066,34 @@ mod tests {
 
     /// A NAMED problem must outrank "unaudited".
     ///
-    /// `llama4` is refused for its chunked attention, and that is what
-    /// its refusal should say. Reporting "unaudited" instead would be
-    /// true and far less useful, and it is the ordering the loader's
-    /// own comment claims. Nothing checked that claim. (`gpt2` and then
-    /// `bloom` were the example until their positions were served.)
+    /// `grovemoe` is unaudited AND names its second expert bank; a
+    /// `llama4` file declaring a window of zero names the branch
+    /// libllama aborts on (`crate::chunked_swa`), and that is what its
+    /// refusal should say. Reporting "unaudited" instead would be true
+    /// and far less useful, and it is the ordering the loader's own
+    /// comment claims. Nothing checked that claim. (`gpt2`, `bloom` and
+    /// then a plain `llama4` were the example until each was served.)
     #[test]
     fn a_named_refusal_outranks_the_unaudited_one() {
-        let err = config_for_arch("llama4").expect_err("llama4 must refuse");
+        let kvs: Vec<(&str, Kv)> = vec![
+            ("general.architecture", Kv::Str("llama4")),
+            ("llama4.block_count", Kv::U32(1)),
+            ("llama4.embedding_length", Kv::U32(64)),
+            ("llama4.attention.head_count", Kv::U32(1)),
+            ("llama4.attention.head_count_kv", Kv::U32(1)),
+            ("llama4.attention.key_length", Kv::U32(64)),
+            ("llama4.rope.freq_base", Kv::F32(10_000.0)),
+            ("llama4.expert_count", Kv::U32(16)),
+            ("llama4.interleave_moe_layer_step", Kv::U32(1)),
+            ("llama4.attention.sliding_window", Kv::U32(0)),
+        ];
+        let err = ModelConfig::from_gguf(&open_metadata_gguf("llama4", &kvs))
+            .expect_err("a zero window must refuse");
         assert!(
             !matches!(err, LoadError::UnauditedArchitecture(..)),
             "llama4 should report its own reason, not that nobody audited it: {err:?}"
         );
+        assert!(err.to_string().contains("llama-graph.cpp:159"), "{err}");
     }
 
     /// A checkpoint that declares YaRN gets the per-band divisors the

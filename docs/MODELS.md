@@ -76,7 +76,7 @@ OLMoE (1.11×) and Gemma-3-1B (1.18×) on Metal.
 | GLM-4.5 / 4.5-Air / 4.6 (`glm4moe`) | **Generic path, audited 2026-09-12** (`tests/glm4moe_graphs.rs`, KL 1.51e-15 and 2.41e-15 on the 355B and Air shapes). Its refusal had two lives -- sent to the MLA loader for a `q_lora_rank` it never carries, then named for its pre-FFN norm stored as `post_attention_norm` -- and the second was one row in `norm_sites::PRE_FFN_NORM_IS_POST_ATTENTION_NORM`. A GLM-4.5V text tower's `rope.dimension_sections` rotates NEOX here, and libllama's M-RoPE logits on text positions are byte-identical (measured). No real checkpoint run yet: the smallest export is 106B |
 | Gemma-4-E2B | Dedicated `Gemma4Engine` + SPM-style `gemma4` BPE tokenizer + `<|turn>` chat wrap. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` (`unsloth/gemma-4-E2B-it-GGUF`). Suite id `gemma4_e2b_q4km`, Homebrew llama may still lack `gemma4` arch. **Cross-engine evidence since 2026-09-12**: against a libllama built from `.scratch/llama.cpp` (1269cb1, which has `gemma4.cpp`), `ferrox parity` reads tokenizer MATCH (21 cases x 2) and logits MATCH, KL 5.1e-4 on Q4_K_M with top-10 overlap 10/10 -- the K-quant band, so the graph agrees and the file is not one a WRONG line can be drawn on. |
 | gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal stops with an error, because no Metal kernel implements attention sinks. The paged-KV decode path runs it: all three attention arms are bit-identical to their contiguous twins |
-| Llama 4 | **Will not load**, with the reason stated: `llama4 MoE + non-GQA attn` |
+| Llama 4 (`llama4`: Scout 17B-16E, Maverick 17B-128E) | **Generic path, audited 2026-09-14** (`tests/llama4_graphs.rs`, KL 1.1e-12 on the 16-expert and 128-expert shapes, and the last of 8200 positions across the 8192-position chunk boundary on both the prefill and the row body). Four seams: the CHUNKED window (`ferrox_models::chunked_swa`, a query sees its own chunk), the literal attention temperature on the unrotated layers (`attn_temperature::LITERAL_ATTN_TEMPERATURE`), a weightless per-head QK norm after RoPE on the rotating layers for every expert count but 128 (`weightless_qk_norm`), the routing weight on the expert's INPUT (`routed_weight_site`, `llama-graph.cpp:1947`) and the interleave step the tensor loader honours (`moe_interleave::INTERLEAVE_STEP_HONOURED_BY_LOADER`). A converter's `sliding_window 0` (all-full-attention MobileLLM) and a zero expert count are refused by name: libllama aborts on the first and refuses the second. CPU only: the fused Metal launches take one window per layer |
 | MiniMax | `minimax-m2` (MiniMax-M2) **runs** on the generic path since 2026-09-14: plain GQA + whole-vector QK norm + partial NEOX RoPE + a sigmoid MoE with `exp_probs_b`, KL 3.4e-15 against libllama on the fixture that had said it was a fixture away (`tests/minimax_m2_graphs.rs`). `minimax-m3` **will not load**: it needs MiniMax Sparse Attention (a per-layer indexer driving its own MSA KV cache), of which ferrox has only the block-selection rule |
 | LFM2 (`lfm2`: LFM2-350M / 700M / 1.2B / 2.6B, LFM2-VL's text tower; `lfm2moe`: LFM2-8B-A1B, 24B-A2B) | **Generic path, audited 2026-09-14** (`tests/lfm2_graphs.rs`, KL 3.2e-12 on the split, fused-QKV and separate-`output` fixtures, 6.0e-13 on the MoE, contiguous, paged and multi-seq). The first hybrid row: `lfm2.cpp:9-11` marks a layer recurrent when `head_count_kv` is 0, and its short convolution (`ferrox_models::shortconv`) runs at the attention site with its state kept as the layer's KV history. `lfm2moe` is the same graph with leading dense layers and a sigmoid MoE with `exp_probs_b`; a file declaring `attention.sliding_window` is refused by name (no export writes it) |
 | Granite 4.0 (`granitehybrid`: H-Micro 3B, H-Tiny 7B-A1B, H-Small 32B-A9B; `granite-hybrid` alias) | **Generic path, audited 2026-09-14** (`tests/granite_hybrid_graphs.rs`, KL 1.9e-13 NoPE dense, 7.9e-13 rotated, 1.0e-13 MoE + shared expert). The first Mamba-2 row: the block runs where attention would be on the zero-KV layers (`ferrox_models::mamba2`), its state as a `RecurrentState` beside the layer's cache. `rope.scaling.finetuned = false` (every real export) rotates nothing. No prefix-cache reuse and no `--model-draft` on such a model: a Mamba state cannot be rolled back to a middle position |
@@ -103,8 +103,9 @@ The error always names the reason. Six things cause it:
 1. **Ferrox does not know the architecture.** It is not in the
    capability registry.
 
-2. **Ferrox knows it and has not implemented it.** `llama4` and
-   `minimax-m3` stop with the missing feature named.
+2. **Ferrox knows it and has not implemented it.** `minimax-m3` stops
+   with the missing feature named (`llama4` left this list on
+   2026-09-14).
    The parallel residual, `x + attn(norm(x)) + ffn(norm(x))`, used to
    be this list's biggest group and is served now
    (`ferrox_models::parallel_residual`; `gptneox` and `plamo` run on
@@ -745,8 +746,10 @@ it used to load and drop both keys: it had no golden to check an
 implementation against when that landed (it has `plm`'s and
 `deepseek2`'s since 2026-09-12), so an implementation there would have
 been a guess.
-`llama4`'s verdict says the temperature is this seam plus a per-layer
-gate, and names what it still needs.
+`llama4` runs on this seam since 2026-09-14: its three literals are
+`attn_temperature::LITERAL_ATTN_TEMPERATURE`, and the per-layer gate
+its verdict had named is `AttnTemperature::unrotated_layers_only`,
+read against `ModelConfig::layer_rotates` by the one helper.
 
 Two corrections came with it. The verdict had described `mistral3` as
 "leading-dense + MoE + shared expert": `mistral3.cpp:64-84` is EITHER
@@ -991,8 +994,7 @@ NONE`; `exaone-moe.cpp:136,155-161` is `is_swa(il)` around the same two
 similar. `smollm3.cpp:5,69` is a different variant of the same enum,
 `(il + 1) % 4 != 0`, with no window involved. All six architectures
 llama.cpp gates this way (`smallthinker`, `afmoe` and `llama4` are the
-other three; the first two closed later, on other seams, and `llama4`
-still refuses for something else) sit in ONE table,
+other three; all three closed later, on other seams) sit in ONE table,
 `ferrox_models::rope_layers`, and `ModelConfig::layer_rope` answers
 `None` for an unrotated layer -- an `Option` around the base and the
 divisors rather than a `bool` beside them, so no rotation site can take
@@ -1210,7 +1212,7 @@ name, as libllama refuses it (`wrong number of tensors; expected 21, got
 | An FFN activation whose PARAMETERS vary by layer (xIELU's four arrays; the SwiGLU clamp arrays by site) | CLOSED (`ferrox_models::act_layers`): `apertus` and `step35` run on it |
 | A second rotary width on the sliding layers (`n_rot(il)`: `rope.dimension_count_swa`, or `step35`'s halved full width) | CLOSED (`ModelConfig::rope_dim_swa`, `ferrox_models::swa_geometry`): `step35` and the Laguna-XS.2 shape run on it; the two `_swa` HEAD-width keys stay refused by name, and two widths with per-band divisors are refused for any architecture but `step35` |
 | An ungated or non-SwiGLU FFN | CLOSED for the ungated ReLU-squared form (`FfnActivation::ReluSqr`), the gated ReLU form (`FfnActivation::Reglu`) and xIELU (`FfnActivation::Xielu`): `arcee`, `smallthinker` and `apertus` run on them, and `plm` on the MLA engine (`MlaDenseFfn::act`) |
-| A per-position attention temperature | CLOSED (`ferrox_models::attn_temperature`): `mistral3` runs on it; `deepseek2` / `mistral4` (Mistral-Large-3) refuse it by name on the MLA engine and `llama4` needs a per-layer gate on it beside its chunked attention |
+| A per-position attention temperature | CLOSED (`ferrox_models::attn_temperature`): `mistral3` runs on it from a key and `llama4` from literals on its unrotated layers; `deepseek2` / `mistral4` (Mistral-Large-3) refuse it by name on the MLA engine |
 | A recurrent block at the attention site (`head_count_kv 0`, or the layers `attention.recurrent_layers` / `full_attention_interval` name) | CLOSED for the gated delta net (`ferrox_models::gdn`, `ferrox_core::gdn`, `AttnShape::Gdn`): `qwen35` runs on it, its attention layers' interleaved `wq` gate in `attn_gate::Q_INTERLEAVED_GATE_ARCHS`. CLOSED for the short convolution (`ferrox_models::shortconv`, `layer_shapes::AttnShape::ShortConv`, the state as the layer's KV history on all three backings): `lfm2` and `lfm2moe` run on it. CLOSED for the Mamba-2 block (`ferrox_models::mamba2`, `ferrox_core::mamba2`, `AttnShape::Mamba2`, the state as `ferrox_core::recurrent_state::RecurrentState` beside the cache): `granitehybrid` and `nemotron_h` run on it (the latter's one-block-per-layer topology is `layer_shapes::BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT` plus `norm_sites::ONE_NORM_PER_LAYER`). `falcon-h1` runs attention and Mamba-2 in PARALLEL on every layer (`ModelConfig::parallel_ssm`). CLOSED for the Mamba-1 block (`ferrox_models::mamba1`, `AttnShape::Mamba1`): `jamba` runs on it, `mamba` and `mamba2` run every layer as the block (`layer_shapes::PURE_RECURRENT`). `plamo2` (its own Mamba-1 spelling) says what it needs in `ZeroKvLayer` and refuses |
 | Something structurally new | `grovemoe` (a second expert bank -- and, read against `modeling_grove_moe.py` on 2026-09-12, llama.cpp's graph feeds the chunk experts the routed experts' OUTPUT and gathers their weights at the CHUNK index where the reference does neither, so there is no one graph to match; its verdict says so); `plm` (MLA attention on a dense model) was here and is CLOSED on the MLA engine (`ferrox_models::mla_arch`); `arctic` (a parallel dense + MoE layer) was here and is CLOSED (`ferrox_models::parallel_dense_ffn`); `mellum` was here on "two per-layer RoPE variants", which is the Olmo-3 rule refused by name, and is CLOSED; `mistral3` was here on the temperature and is CLOSED; `nanbeige` was here on running the same layers more than once and is CLOSED (`ferrox_models::layer_loops`) |
 

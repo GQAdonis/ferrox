@@ -39,14 +39,16 @@
 //! / `deepseek4.cpp:124` name a `blk.N.hc_attn_scale` TENSOR, which is
 //! a hyper-connection weight. `plamo3.cpp:140` is a local variable.
 //!
-//! So `mistral3` is the ONLY generic-path reader, and this module's
-//! resolution is written for the two that read a key. `llama4` seeds
-//! literals and gates the multiply on `!use_rope`
-//! (`llama4.cpp:175` is an `else if` on the RoPE branch), which is a
-//! per-layer variant [`AttnTemperature`] does not have -- deliberately:
-//! `llama4` is `DedicatedOnly` for its chunked attention and its own
-//! engine, and a variant with no caller is the OLMo lesson. Its
-//! verdict says the temperature is one seam away from here.
+//! So `mistral3` is the ONLY generic-path reader of a KEY, and
+//! [`resolve_attn_temperature`] is written for the two that read one.
+//! `llama4` seeds LITERALS ([`LITERAL_ATTN_TEMPERATURE`]) on the
+//! branch every real export takes (`llama4.cpp:13-17`; the other
+//! branch is refused by name in `crate::chunked_swa`) and gates the
+//! multiply on `!use_rope` (`:175` is an `else if` on the RoPE branch),
+//! so [`AttnTemperature::unrotated_layers_only`] is the per-layer
+//! variant, read against `ModelConfig::layer_rotates` by the one
+//! helper. It landed with its one caller, as the OLMo lesson says a
+//! variant should.
 //!
 //! # The floor is `n_ctx_orig_yarn`, which is NOT a key
 //!
@@ -104,6 +106,12 @@ pub struct AttnTemperature {
     /// `hparams.f_attn_temp_offset`, added to the position before the
     /// division. `0.0` for both key-driven readers; `llama4` uses `1.0`.
     pub offset: f32,
+    /// Multiply Q on the layers that do NOT rotate and leave the
+    /// rotating ones alone: `llama4.cpp:163-177` is `if (use_rope) {
+    /// rope } else if (inp_attn_scale) { mul }`. The two key-driven
+    /// readers scale every layer (`mistral3.cpp:153-156` has no
+    /// branch).
+    pub unrotated_layers_only: bool,
 }
 
 impl AttnTemperature {
@@ -187,6 +195,21 @@ pub const ATTN_TEMPERATURE_READERS: &[(&str, FloorSource, &str)] = &[
     ),
 ];
 
+/// The graphs that seed the three constants from LITERALS rather than
+/// keys, with the values and the line. One of 140 (`grep -n
+/// f_attn_temp_scale src/models/*.cpp`): the three assignments at
+/// `llama4.cpp:15-17`, on the chunked branch its files take.
+pub const LITERAL_ATTN_TEMPERATURE: &[(&str, AttnTemperature, &str)] = &[(
+    "llama4",
+    AttnTemperature {
+        scale: 0.1,
+        floor_scale: NonZeroU32::new(8192).unwrap(),
+        offset: 1.0,
+        unrotated_layers_only: true,
+    },
+    "src/models/llama4.cpp:15-17,175-176",
+)];
+
 /// What the file declares, gathered by the loader.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DeclaredTemperature {
@@ -247,6 +270,15 @@ pub fn resolve_attn_temperature(
     arch: &str,
     declared: DeclaredTemperature,
 ) -> Result<Option<AttnTemperature>, AttnTemperatureError> {
+    // The literal seeders first: the file's keys are not read for them
+    // (`llama4.cpp:3-26` reads no `temperature_*` key), so a declared
+    // value is dead metadata as it is on every non-reader.
+    if let Some((_, literal, _)) = LITERAL_ATTN_TEMPERATURE
+        .iter()
+        .find(|(name, _, _)| *name == arch)
+    {
+        return Ok(Some(*literal));
+    }
     let Some((_, floor_source, _)) = ATTN_TEMPERATURE_READERS
         .iter()
         .find(|(name, _, _)| *name == arch)
@@ -271,6 +303,7 @@ pub fn resolve_attn_temperature(
         // Both key-driven readers assign 0.0 (`mistral3.cpp:11`,
         // `deepseek2.cpp:49`); only llama4's literal is 1.0.
         offset: 0.0,
+        unrotated_layers_only: false,
     }))
 }
 
@@ -283,6 +316,32 @@ mod tests {
             scale,
             floor_scale: NonZeroU32::new(floor).unwrap(),
             offset: 0.0,
+            unrotated_layers_only: false,
+        }
+    }
+
+    /// The literal seeder answers its literals whatever the file says,
+    /// including a declared key it never reads, and no key-driven
+    /// reader is in the literal table.
+    #[test]
+    fn llama4_takes_its_literals_and_ignores_a_declared_key() {
+        let declared = DeclaredTemperature {
+            scale: Some(0.5),
+            length: Some(16),
+            n_ctx_orig_yarn: Some(16),
+        };
+        let got = resolve_attn_temperature("llama4", declared)
+            .unwrap()
+            .expect("llama4 always scales");
+        assert_eq!(got, LITERAL_ATTN_TEMPERATURE[0].1);
+        assert!(got.unrotated_layers_only);
+        assert_eq!(got.scale_at(8190), 1.0);
+        assert!(got.scale_at(8191) > 1.0);
+        for (name, _, _) in ATTN_TEMPERATURE_READERS {
+            assert!(
+                !LITERAL_ATTN_TEMPERATURE.iter().any(|(n, _, _)| n == name),
+                "{name} reads a key and cannot also seed a literal"
+            );
         }
     }
 

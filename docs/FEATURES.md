@@ -135,6 +135,27 @@ is faster.
   GROUPED (`gdn::GROUPED_HEAD_ARCHITECTURES`, `HeadMap::Grouped`) and
   beta / alpha come from one `ssm_ba` projection (`gdn::BetaAlpha::
   Fused`); plain NEOX RoPE; KL 8.7e-12.
+- **Llama 4: Scout and Maverick** (`llama4`), audited against libllama
+  on 2026-09-14 (`tests/llama4_graphs.rs`, KL 1.1e-12 on the 16- and
+  128-expert shapes, and the last of 8200 positions across the chunk
+  boundary on the prefill and row bodies). The CHUNKED window
+  (`ferrox_models::chunked_swa`: `llama4.cpp:13-14` set
+  `LLAMA_SWA_TYPE_CHUNKED` at a literal 8192, and a query at `p` sees
+  the `p % 8192 + 1` keys of its own chunk, `ModelConfig::
+  layer_window_for_query`, with the batched prefill taking a per-query
+  arm when a batch straddles a boundary); the literal temperature
+  0.1 / 8192 / 1.0 on the layers that do NOT rotate
+  (`attn_temperature::LITERAL_ATTN_TEMPERATURE`); a weightless
+  per-head RMS norm on Q and K after RoPE on the layers that do, for
+  every expert count but Maverick's 128 (`weightless_qk_norm`); the
+  routing weight multiplied into the expert's INPUT rather than its
+  output (`routed_weight_site`, `llama-graph.cpp:1947`, the one graph
+  of 140); and the interleave step the TENSOR LOADER honours
+  (`moe_interleave::INTERLEAVE_STEP_HONOURED_BY_LOADER`, unlike
+  ERNIE's). Sigmoid routing from a literal with `norm_w = false`,
+  which found `route_top_k_sigmoid` renormalising whatever the flag
+  said. The converter's `sliding_window 0` and a zero expert count
+  are refused by name (libllama aborts on one, refuses the other).
 - **Mamba-1: Jamba, Mamba, FalconMamba; and pure Mamba-2** (`jamba`,
   `mamba`, `mamba2`), audited against libllama on 2026-09-14
   (`tests/mamba_graphs.rs`, KL 7.3e-12 / 2.3e-12 / 1.8e-12 / 3.6e-13).
@@ -186,9 +207,8 @@ is faster.
   divisors without answering the third question, and both fused Metal
   stacks take an `Option<LayerRope>` per layer. A 64-layer fixture is
   what evidences the 32B, because `exaone4.cpp:4` tests equality.
-  `smallthinker`, `afmoe` and `llama4` are in the same table; the first
-  two closed later on other seams, and `llama4` still refuses for other
-  things. Found on the way: EXAONE-4 1.2B must ignore a
+  `smallthinker`, `afmoe` and `llama4` are in the same table; all
+  three closed later on other seams. Found on the way: EXAONE-4 1.2B must ignore a
   window its file declares, and `nextn_predict_layers` (MTP blocks
   inside `block_count`) was refused nowhere and was then refused
   everywhere; it is SKIPPED now, as llama.cpp skips it, for the

@@ -17,6 +17,15 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`llama4` runs: Llama 4 Scout 17B-16E and Maverick 17B-128E.**
+  `chunked_swa` (the 8192-position chunk, per-query windows,
+  `BatchWindow`), `attn_temperature::LITERAL_ATTN_TEMPERATURE` with
+  `unrotated_layers_only`, `weightless_qk_norm`, `routed_weight_site`
+  (the sigmoid weight on the expert's input, `llama-graph.cpp:1947`),
+  `moe_interleave::INTERLEAVE_STEP_HONOURED_BY_LOADER`. KL 1.1e-12
+  (`tests/llama4_graphs.rs`, `make_llama4_fixture.py`), the chunk
+  boundary measured at position 8199. `route_top_k_sigmoid` honours
+  `norm_topk_prob` (it renormalised unconditionally). 91 audited.
 - **`qwen3next` runs: Qwen3-Next-80B-A3B.** `gdn::GROUPED_HEAD_
   ARCHITECTURES` / `GdnHparams::map` (`HeadMap::Grouped`) and
   `gdn::BetaAlpha::Fused` (the `ssm_ba` projection); catalog and

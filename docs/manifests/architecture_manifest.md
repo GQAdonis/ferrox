@@ -87,6 +87,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `phi4` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
 | `llama4` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `minimax-m2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `pangu-embedded` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `minimax-m3` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `minicpm3` | TextGeneration | Mla | KvMla | dedicated |
 | `deepseek2` | TextGeneration | Mla | KvMla | dedicated |
@@ -130,7 +131,6 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `eurobert` | DeferredEncoderEmbedding | StandardGqa | None | deferred |
 | `llama-embed` | DeferredEncoderEmbedding | StandardGqa | None | deferred |
 | `gemma-embedding` | DeferredEncoderEmbedding | StandardGqa | None | deferred |
-| `pangu-embedded` | DeferredEncoderEmbedding | StandardGqa | None | deferred |
 | `yi-vl` | DeferredMultimodal | StandardGqa | None | deferred |
 | `qwen2vl` | DeferredMultimodal | StandardGqa | None | deferred |
 | `qwen3vl` | DeferredMultimodal | StandardGqa | None | deferred |

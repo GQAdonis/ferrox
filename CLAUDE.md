@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **78** architectures run with
+Honest position, re-audited 2026-09-14. **79** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -934,6 +934,20 @@ MoE with `exp_probs_b` REQUIRED on the rest, KL 6.0e-13, its
 `expert_weights_scale` dead metadata as `mimo2`'s. A window stays
 refused by name: `lfm2.cpp:24-29` windows the attention layers ALONE,
 which `swa_layers` cannot spell, and no export writes the key.
+
+`pangu-embedded` (openPangu-Embedded-1B / 7B, Huawei) closed the same
+day from the DEFERRED column, which no row had left before, and the
+lesson is the cheapest kind: the row had been classified from its
+NAME. "Embedded" means edge devices; `PanguEmbeddedForCausalLM` is a
+decoder with an `lm_head`, `conversion/pangu.py` is a `TextModel`, and
+ferrox had it in the catalog as "embedding variant; deferred" AND in
+`embedding_model::NOT_YET` as "a decoder embedding path", two copies
+of one wrong reading. `pangu-embed.cpp` is `llama.cpp`'s graph with a
+REQUIRED `attn_output.bias` (`:37`) and NEOX RoPE: one `proj_bias`
+row, one profile line, KL 1.5e-13 on three fixtures
+(`tests/pangu_embedded_graphs.rs`). Reading the converter's base
+class takes a minute; the deferred column has thirty-one rows left and
+every one of them deserves that minute.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

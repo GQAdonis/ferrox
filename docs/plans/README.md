@@ -60,16 +60,16 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **78** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **79** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`; `deepseek2` in both tensor forms, `tests/deepseek2_graphs.rs`; the real PLM-1.8B through `ferrox parity`), `Gemma4` has it on the real Gemma-4-E2B (parity MATCH, KL 5.1e-4 on Q4_K_M, against a libllama that has `gemma4.cpp`), `Glm52` and `Kimi` none |
 | Refuses as **unaudited**, now triaged | 2 |
-| Off the generic path: refuses by name, or reaches one of those 4 engines | 67 (35 `dedicated` + 32 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `refact`, `bloom`, `mpt`, `jais`, `minimax-m2`, `lfm2` and `lfm2moe` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
+| Off the generic path: refuses by name, or reaches one of those 4 engines | 66 (35 `dedicated` + 31 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `refact`, `bloom`, `mpt`, `jais`, `minimax-m2`, `lfm2` and `lfm2moe` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 80 generic-gqa (78 of
-them audited), 35 dedicated, 32 deferred, 3 test fixtures.
+regenerated with `ferrox archs --write`: 150 rows, 81 generic-gqa (79 of
+them audited), 35 dedicated, 31 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
 opt-in: an architecture not on the audited list stops rather than
@@ -271,6 +271,11 @@ MoE's (`tests/lfm2_graphs.rs`). Reach measured first: two graphs of 140
 build the block; the Mamba-2 hybrids share the "zero KV heads means
 recurrent" rule and nothing else, and `layer_shapes::ZeroKvLayer`
 names each one's block.
+`pangu-embedded` (openPangu-Embedded-1B / 7B) closed the same day out
+of the DEFERRED column, where no row had ever closed from: it had been
+filed as "embedding variant" from its name, and it is a decoder LLM
+whose graph is `llama.cpp`'s with a required `attn_output.bias`, one
+row in `proj_bias` (`tests/pangu_embedded_graphs.rs`, KL 1.5e-13).
 
 `olmo2` and `exaone4` closed TOGETHER, because they are one residual
 topology and not two. Neither has an `attn_norm` or an `ffn_norm`

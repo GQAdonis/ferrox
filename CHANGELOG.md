@@ -17,6 +17,14 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`pangu-embedded` runs: openPangu-Embedded-1B / 7B.** A decoder LLM
+  (`PanguEmbeddedForCausalLM`) that had been filed as "embedding
+  variant; deferred" in the catalog and in `embedding_model::NOT_YET`
+  from its name. `pangu-embed.cpp` is `llama.cpp`'s graph with a
+  REQUIRED `attn_output.bias` (`:37`): one `proj_bias::
+  ATTN_OUT_BIAS_CREATORS` row, NEOX RoPE. KL 1.5e-13 on three fixtures
+  (`tests/pangu_embedded_graphs.rs`, `scripts/make_pangu_fixture.py`).
+  79 audited.
 - **`lfm2` and `lfm2moe` run: LFM2-350M / 700M / 1.2B / 2.6B and
   LFM2-8B-A1B, the first hybrid rows, on the generic path.** `lfm2.cpp:192-208` is the generic layer with a
   short convolution where attention would be on the layers whose

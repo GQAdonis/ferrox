@@ -99,6 +99,24 @@ pub const PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM: &[&str] = &["dbrx"];
 /// either way, and `:185-188` apply it before the FFN residual add.
 pub const POST_NORMS_UNDER_GROK_NAMES: &[&str] = &["grok"];
 
+/// Architectures whose OPTIONAL second pre-norm `blk.N.attn_norm_2`
+/// feeds ATTENTION when present, with `attn_norm` moving to the FFN.
+///
+/// `falcon`: `falcon.cpp:35-36` create `attn_norm_2` / its bias
+/// `TENSOR_NOT_REQUIRED` (Falcon-40B and 180B have them, Falcon-7B does
+/// not), `:79-85` norm the layer input with it for attention when it is
+/// there and take `attn_norm`'s output otherwise, and `:124` hands the
+/// FFN `attn_norm(x)` either way. So a 40B layer is the two-norm
+/// parallel residual (`crate::parallel_residual`, `TwoNorms`) with the
+/// tensor NAMES crossed relative to `gptneox`: the attention slot is
+/// `attn_norm_2` and the pre-FFN slot is `attn_norm`. Decided PER LAYER
+/// by tensor presence, which is why it is [`NormSites::for_layer`] and
+/// not a row of [`NormSites::for_arch`]. Measured: `grep -l attn_norm_2
+/// src/models/*.cpp` over all 140 is `falcon`, `bert`, `jina-bert-v2`
+/// (encoders, a post-norm there), `rwkv6` / `rwkv7` / `eagle3` (other
+/// engines); one generic-path graph.
+pub const ATTN_NORM_2_FEEDS_ATTENTION: &[&str] = &["falcon"];
+
 /// A norm site whose weight the file stores.
 ///
 /// `names` are base names tried in order; each is looked up as
@@ -268,6 +286,25 @@ impl NormSites {
         sites
     }
 
+    /// This layer's row: the per-architecture row, with the two
+    /// pre-norm slots crossed for a layer that carries `attn_norm_2` on
+    /// an architecture in [`ATTN_NORM_2_FEEDS_ATTENTION`]. Every other
+    /// layer of every other architecture gets the row unchanged.
+    pub fn for_layer(&self, arch: &str, file: &impl TensorSource, layer: usize) -> Self {
+        if !ATTN_NORM_2_FEEDS_ATTENTION.contains(&arch)
+            || file
+                .find_tensor(&format!("blk.{layer}.attn_norm_2.weight"))
+                .is_none()
+        {
+            return *self;
+        }
+        Self {
+            attn: Some(StoredNorm::required(&["attn_norm_2"])),
+            ffn: Some(StoredNorm::required(&["attn_norm"])),
+            ..*self
+        }
+    }
+
     /// A pre-norm site (attention, FFN, or with `layer == None` the
     /// final norm), as the [`NormOp`] the decoder applies there.
     pub fn load_pre_norm(
@@ -301,6 +338,31 @@ impl NormSites {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Falcon's second pre-norm crosses the two slots on exactly the
+    /// layers that carry it; a 7B layer, and every layer of every other
+    /// architecture, keeps the row.
+    #[test]
+    fn attn_norm_2_crosses_the_two_pre_norm_slots_per_layer() {
+        use crate::test_source::StubSource;
+        let row = NormSites::for_arch("falcon");
+        assert_eq!(row.function, NormFunction::LayerNormBias);
+        let seven_b = StubSource::with_tensors(&["blk.0.attn_norm.weight"]);
+        assert_eq!(row.for_layer("falcon", &seven_b, 0), row);
+        let forty_b = StubSource::with_tensors(&["blk.1.attn_norm_2.weight"]);
+        assert_eq!(
+            row.for_layer("falcon", &forty_b, 0),
+            row,
+            "layer 0 has none"
+        );
+        let crossed = row.for_layer("falcon", &forty_b, 1);
+        assert_eq!(crossed.attn, Some(StoredNorm::required(&["attn_norm_2"])));
+        assert_eq!(crossed.ffn, Some(StoredNorm::required(&["attn_norm"])));
+        assert_eq!(crossed.output, row.output);
+        // The name alone does nothing on another architecture.
+        let llama = NormSites::for_arch("llama");
+        assert_eq!(llama.for_layer("llama", &forty_b, 1), llama);
+    }
 
     /// The default row is the plain pre-norm layer with both post-norms
     /// optional, which is what every architecture not named in a list

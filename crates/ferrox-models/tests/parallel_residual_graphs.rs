@@ -417,7 +417,7 @@ fn the_residual_topology_is_visible_in_the_logits() {
 /// here, in `tests/stablelm_graphs.rs` or in `tests/command_r_graphs.rs`.
 #[test]
 fn every_generic_path_row_of_the_table_has_a_golden() {
-    let with_golden = ["gptneox", "plamo", "stablelm", "command-r"];
+    let with_golden = ["gptneox", "plamo", "stablelm", "command-r", "falcon"];
     for row in PARALLEL_RESIDUAL_GRAPHS {
         let generic = matches!(
             resolve_architecture(row.arch),

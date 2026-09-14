@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **65** architectures run with
+Honest position, re-audited 2026-09-12. **66** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -767,9 +767,22 @@ and matches libllama's unscaled logits, ratio 0.0625 to the scaled
 file's). KL 1.0e-15 (`tests/command_r_graphs.rs`). Command-R+ (64
 layers) carries the per-head LayerNorm QK norm llama.cpp REQUIRES at
 that depth (`:28-31`) and is refused by name from a 64-layer fixture
-libllama runs. `cohere2`, `cohere2moe`, `falcon` and `phi2` stay
-refused with what each needs ON TOP of the residual written into the
-reason.
+libllama runs. `falcon` (Falcon-7B / 40B / 180B) followed on BOTH
+arms of the seam, and reading `falcon.cpp:79-85,124` beside
+`gptneox.cpp:149` is what the table's `second_norm` column records:
+every Falcon layer is parallel, and the OPTIONAL `attn_norm_2` that
+40B carries does not switch the residual on, it picks the ARM -- and
+it norms the layer input for ATTENTION while `attn_norm` keeps feeding
+the FFN, so the two tensor names are crossed relative to gptneox's.
+`norm_sites::ATTN_NORM_2_FEEDS_ATTENTION` crosses the two pre-norm
+slots on exactly the layers that carry it (`NormSites::for_layer`; one
+graph of 140 on the generic path, measured), and the 7B fixture proved
+the first table row wrong before any code ran: it had said "parallel
+WHEN `attn_norm_2` is present", and a 7B file refused to load its
+missing `ffn_norm`. KL 3.8e-8 and 1.9e-7 at the f16 GELU-table line
+(`tests/falcon_graphs.rs`); swapping the two slots back diverges by
+more than 1. `cohere2`, `cohere2moe` and `phi2` stay refused with what
+each needs ON TOP of the residual written into the reason.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

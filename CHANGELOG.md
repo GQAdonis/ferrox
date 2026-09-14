@@ -17,6 +17,24 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`falcon` runs: Falcon-7B, 40B and 180B, both shapes.** Every
+  Falcon layer is the parallel residual
+  (`ferrox_models::parallel_residual`); the OPTIONAL `attn_norm_2`
+  (`falcon.cpp:35-36`) picks the arm, not whether. 7B: the shared norm
+  over the biased LayerNorm, a fused multi-query `attn_qkv` with no
+  bias, the ungated GELU (`capability::uses_gelu_ungated`), NEOX over
+  the whole head. 40B / 180B: `:79-85` norm the layer input with
+  `attn_norm_2` FOR ATTENTION and `:124` keeps the FFN on
+  `attn_norm(x)`, the two-norm arm with the names crossed relative to
+  `gptneox`; `norm_sites::ATTN_NORM_2_FEEDS_ATTENTION` and
+  `NormSites::for_layer` cross the two pre-norm slots on the layers
+  that carry the tensor (one graph of 140 on the generic path,
+  measured). `ParallelResidual::second_norm` is the table column for
+  it; the first row had said "parallel when `attn_norm_2` is present",
+  and the 7B fixture refused to load before any code ran.
+  `tests/falcon_graphs.rs`: KL 3.80e-8 (7B) and 1.94e-7 (40B) at the
+  f16 GELU-table line; swapping the slots back diverges by more than
+  1. 66 audited.
 - **`command-r` runs: Command-R 35B and Aya-23.** The shared-norm
   parallel residual (`ferrox_models::parallel_residual`) over the
   weighted LayerNorm WITHOUT a bias (`command-r.cpp:68,127`,

@@ -60,16 +60,16 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **65** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **66** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`; `deepseek2` in both tensor forms, `tests/deepseek2_graphs.rs`; the real PLM-1.8B through `ferrox parity`), `Gemma4` has it on the real Gemma-4-E2B (parity MATCH, KL 5.1e-4 on Q4_K_M, against a libllama that has `gemma4.cpp`), `Glm52` and `Kimi` none |
 | Refuses as **unaudited**, now triaged | 2 |
-| Off the generic path: refuses by name, or reaches one of those 4 engines | 80 (48 `dedicated` + 32 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo` and `command-r` left the dedicated column for the generic path on 2026-09-12 and `plm` went the other way) |
+| Off the generic path: refuses by name, or reaches one of those 4 engines | 79 (47 `dedicated` + 32 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r` and `falcon` left the dedicated column for the generic path on 2026-09-12 and `plm` went the other way) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 67 generic-gqa (65 of
-them audited), 48 dedicated, 32 deferred, 3 test fixtures.
+regenerated with `ferrox archs --write`: 150 rows, 68 generic-gqa (66 of
+them audited), 47 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
 opt-in: an architecture not on the audited list stops rather than
@@ -210,10 +210,14 @@ the same day, because what it needed on top was two things that
 already existed: `dbrx`'s weighted LayerNorm without a bias, and the
 `logit_scale` multiply `grok` and `talkie` had, in an OPTIONAL form
 the graph skips at zero (`tests/command_r_graphs.rs`, KL 1.0e-15;
-Command-R+'s QK LayerNorm refused from a 64-layer fixture). `cohere2`,
-`cohere2moe`, `falcon` and `phi2` stay refused, each naming what it
-needs on top: a rotation on the sliding layers only, experts and an
-MTP block, `attn_norm_2`, `output.bias`.
+Command-R+'s QK LayerNorm refused from a 64-layer fixture). `falcon`
+followed on BOTH arms: Falcon-7B is the shared norm, and Falcon-40B's
+optional `attn_norm_2` is the two-norm arm with the tensor names
+crossed relative to `gptneox` (attention under `attn_norm_2`, the FFN
+under `attn_norm`; `norm_sites::ATTN_NORM_2_FEEDS_ATTENTION`, decided
+per layer, `tests/falcon_graphs.rs`). `cohere2`, `cohere2moe` and
+`phi2` stay refused, each naming what it needs on top: a rotation on
+the sliding layers only, experts and an MTP block, `output.bias`.
 
 `olmo2` and `exaone4` closed TOGETHER, because they are one residual
 topology and not two. Neither has an `attn_norm` or an `ffn_norm`

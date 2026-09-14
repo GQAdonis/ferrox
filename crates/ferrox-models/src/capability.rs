@@ -958,6 +958,17 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // `:28-31` REQUIRE at that depth and is refused by name from a
     // 64-layer fixture libllama runs (`crate::qk_layer_norm`).
     "command-r",
+    // tests/falcon_graphs.rs: `falcon` (Falcon-7B / 40B / 180B).
+    // `falcon.cpp:71-74,124-135` the shared-norm parallel residual over
+    // the biased LayerNorm; `:35-36,79-85` the OPTIONAL `attn_norm_2`
+    // that Falcon-40B carries, which norms the layer input FOR
+    // ATTENTION while `attn_norm` keeps feeding the FFN -- the two-norm
+    // arm with the names crossed (`norm_sites::
+    // ATTN_NORM_2_FEEDS_ATTENTION`, per layer); `:38` a fused
+    // `attn_qkv` with no bias, multi-query at 7B; `:127-131` the
+    // ungated GELU with no biases; NEOX over the whole head; `output`
+    // optional. Both shapes matched.
+    "falcon",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1123,6 +1134,8 @@ pub fn uses_weighted_layer_norm(arch: &str) -> bool {
 /// (`crate::qk_layer_norm`); `tests/stablelm_graphs.rs`. `gptneox`
 /// (`gptneox.cpp:57-58,63-64,72-73`, all six REQUIRED) followed on the
 /// parallel residual's other arm; `tests/parallel_residual_graphs.rs`.
+/// `falcon` (`falcon.cpp:20-21,32-33`, plus the OPTIONAL `attn_norm_2`
+/// pair at `:35-36`) followed it; `tests/falcon_graphs.rs`.
 ///
 /// The two the group still holds, each for something ELSE on top of
 /// this norm (the norm is done for both): `starcoder` a learned
@@ -1137,6 +1150,7 @@ pub const BIASED_LAYER_NORM: &[&str] = &[
     "jais2",
     "stablelm",
     "gptneox",
+    "falcon",
 ];
 
 /// See [`BIASED_LAYER_NORM`].
@@ -1709,6 +1723,13 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // multiply (tests/command_r_graphs.rs). NORM RoPE:
         // llama-model.cpp:2582.
         v.push(gqa_norm("command-r"));
+        // `falcon` (Falcon-7B / 40B / 180B): the shared-norm parallel
+        // residual at 7B and the two-norm one at 40B, whose second norm
+        // is `attn_norm_2` FOR ATTENTION (`norm_sites::
+        // ATTN_NORM_2_FEEDS_ATTENTION`), over the biased LayerNorm, a
+        // fused `attn_qkv` with no bias, the ungated GELU FFN
+        // (tests/falcon_graphs.rs). NEOX RoPE: llama-model.cpp:2651.
+        v.push(gqa_neox("falcon"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -2097,18 +2118,9 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                  branch's one normed input (src/models/cohere2moe.cpp:234) and an MTP block \
                  (:51-53,380-420); nothing here has run it",
             ),
-            // src/models/falcon.cpp:121-135, with the FUSED `attn_qkv`
-            // of a multi-query head count and, for Falcon-40B, the
-            // second pre-norm `attn_norm_2` (:35-36,79-85).
-            (
-                "falcon",
-                Neox,
-                StandardGqa,
-                "the shared-norm parallel residual over the biased LayerNorm \
-                 (src/models/falcon.cpp:71-74,124-135) with the ungated GELU FFN and a fused \
-                 `attn_qkv`; Falcon-40B's `attn_norm_2` (:35-36,79-85) is a second pre-norm \
-                 slot no layer here has. Not yet audited against libllama",
-            ),
+            // `falcon` was HERE; audited now on both of its shapes
+            // (tests/falcon_graphs.rs), the 40B's `attn_norm_2` through
+            // `norm_sites::ATTN_NORM_2_FEEDS_ATTENTION`.
             // src/models/phi2.cpp:116-117: the shared-norm parallel
             // residual plus an `output.bias` on the LM head (:22,136).
             (
@@ -2793,12 +2805,12 @@ pub fn uses_relu_sqr(arch: &str) -> bool {
 /// listed reach the generic path with nothing else in the way once the
 /// projection biases are served (`crate::proj_bias`); `bert` and
 /// `wavtokenizer-dec` are not decoders, `bloom` / `gpt2` / `mpt` /
-/// `starcoder` have no RoPE, `falcon` / `phi2` a parallel residual
-/// with something else on top; `gptneox` joined once the parallel
-/// residual was served (`crate::parallel_residual`). The three here
-/// map to `FfnActivation::GeluUngated`.
+/// `starcoder` have no RoPE, `phi2` a parallel residual with an
+/// `output.bias` on top; `gptneox` and `falcon` joined once the
+/// parallel residual was served (`crate::parallel_residual`). The four
+/// here map to `FfnActivation::GeluUngated`.
 pub fn uses_gelu_ungated(arch: &str) -> bool {
-    matches!(arch, "starcoder2" | "codeshell" | "gptneox")
+    matches!(arch, "starcoder2" | "codeshell" | "gptneox" | "falcon")
 }
 
 #[cfg(test)]
@@ -3889,7 +3901,7 @@ mod tests {
     /// applies them now and `tests/minicpm_graphs.rs` is the evidence.
     #[test]
     fn architectures_with_a_different_residual_topology_are_refused() {
-        for arch in ["cohere2", "cohere2moe", "falcon", "phi2"] {
+        for arch in ["cohere2", "cohere2moe", "phi2"] {
             match resolve_architecture(arch) {
                 Some(ArchPath::DedicatedOnly { reason }) => {
                     assert!(
@@ -3928,6 +3940,7 @@ mod tests {
             "gptneox",
             "plamo",
             "command-r",
+            "falcon",
         ] {
             assert!(
                 matches!(

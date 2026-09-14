@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **79** architectures run with
+Honest position, re-audited 2026-09-14. **81** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -948,6 +948,41 @@ row, one profile line, KL 1.5e-13 on three fixtures
 (`tests/pangu_embedded_graphs.rs`). Reading the converter's base
 class takes a minute; the deferred column has thirty-one rows left and
 every one of them deserves that minute.
+
+`granitehybrid` (Granite 4.0: H-Micro, H-Tiny, H-Small) closed the
+same day as the FIRST MAMBA-2 row, and it is the second recurrent seam
+in one day, which is what shows where the two differ. `granite-hybrid.
+cpp:128-142` is Granite's layer with `build_mamba2_layer`
+(`mamba-base.cpp:149-288`) where attention would be on the zero-KV
+layers, so the block is a fourth `AttnShape` (`Mamba2`,
+`ferrox-models/src/mamba2.rs`, `ferrox-core/src/mamba2.rs` for ggml's
+conv and scan steps) on the same table row `lfm2` used. What is NOT
+the same is the state: LFM2's is a window of its inputs and rode as
+the layer's KV history, which every cache consumer already knew how
+to truncate, page and fork; a Mamba state is a REDUCTION over the
+whole prefix, and `ferrox_core::recurrent_state::RecurrentState`
+beside the cache says so in the one place it matters --
+`KvCache::truncate` REFUSES a middle position (`can_truncate_to`), the
+prefix cache does not store such a cache, `--model-draft` refuses
+such a model, and the block pushes EMPTY rows so `positions()` still
+counts, because `serving/batch/row.rs` reads layer 0's cache as "how
+far this row has got" and Granite-4.0's layer 0 is a Mamba layer.
+llama.cpp's `llama_memory_recurrent::seq_rm` refuses `p0 > 0` for the
+same reason. Two measurements: `ssm_conv1d.bias` is
+`TENSOR_NOT_REQUIRED` at `granite-hybrid.cpp:63` and `ggml_add`ed
+unconditionally at `mamba-base.cpp:222`, so libllama SEGFAULTS on a
+file without it and ferrox requires it; and the Granite
+`rope.scaling.finetuned` refusal, which had said "ferrox has no way to
+express unrotated" for four days while `RopeLayers::Never` had
+existed for one, is served (`rope_finetuned::unrotated`), because
+`conversion/granite.py:253-256` writes the key FALSE for every
+Granite-4.0 hybrid export and no row could match without it. KL
+1.9e-13 (NoPE dense), 7.9e-13 (rotated, Bamba's shape), 1.0e-13 (MoE
+with the shared expert), `tests/granite_hybrid_graphs.rs`; resetting
+the state every token or dropping the `exp` from the decay turns five
+tests red. `nemotron-h` (one block per layer), `falcon-h1` (attention
+and Mamba-2 in PARALLEL), `jamba` and `plamo2` (Mamba-1) each name
+what they still need in `layer_shapes::ZeroKvLayer`.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

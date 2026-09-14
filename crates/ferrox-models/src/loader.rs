@@ -965,16 +965,15 @@ impl ModelConfig {
         .or(multipliers.attention_scale);
 
         // Granite reads `{arch}.rope.scaling.finetuned` as a switch for
-        // RoPE itself, not as a note about the scaling. A file declaring
-        // it false runs UNROTATED in llama.cpp and there is no ferrox
-        // expression for that, so it stops here.
-        if let Some(reason) = crate::rope_finetuned::unrotated_refusal(
+        // RoPE itself, not as a note about the scaling: a file declaring
+        // it false runs UNROTATED in llama.cpp (every Granite-4.0 hybrid
+        // export), which is `RopeLayers::Never` below
+        // (`crate::rope_finetuned`).
+        let rope_switched_off = crate::rope_finetuned::unrotated(
             &arch,
             file.metadata(&key("rope.scaling.finetuned"))
                 .and_then(GgufValue::as_bool),
-        ) {
-            return Err(LoadError::UnsupportedFeature(arch.clone(), reason));
-        }
+        );
 
         // OLMo-1 and DBRX clamp Q, K and V by `{arch}.attention.clamp_kqv`
         // inside the shared `build_qkv`. Resolved here for the
@@ -1400,7 +1399,11 @@ impl ModelConfig {
             // answer (`sliding_window`, not the raw key), because
             // `exaone4` decides both off the same layer count and the
             // two must not be able to disagree.
-            rope_layers: crate::rope_layers::rope_layers(&arch, n_layers, sliding_window.is_some()),
+            rope_layers: if rope_switched_off {
+                crate::rope_layers::RopeLayers::Never
+            } else {
+                crate::rope_layers::rope_layers(&arch, n_layers, sliding_window.is_some())
+            },
             router_input: crate::router_input::router_input(&arch),
             block_sub_norms: crate::sub_norms::block_sub_norms(&arch),
             parallel_residual: crate::parallel_residual::model_has_parallel_layer(
@@ -2679,6 +2682,7 @@ impl Decoder {
                             config.hidden_dim,
                         )?,
                         shortconv: None,
+                        mamba2: None,
                     };
                     crate::layer_shapes::check_gqa_projection_widths(
                         l,

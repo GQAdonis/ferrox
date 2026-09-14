@@ -414,10 +414,11 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // from drifting away from the row it aliases.
     //
     // The `rope_finetuned` half of the verdict landed as a REFUSAL
-    // (`crate::rope_finetuned`), not an implementation: granite.cpp:33-35
+    // (`crate::rope_finetuned`) and was SERVED on 2026-09-14 as
+    // `RopeLayers::Never` when Granite-4.0 needed it: granite.cpp:33-35
     // reads `{arch}.rope.scaling.finetuned` as a switch for RoPE itself,
-    // and a file declaring it false runs UNROTATED in llama.cpp, which
-    // ferrox has no way to express.
+    // and a file declaring it false runs UNROTATED, which the fixture
+    // that had evidenced the refusal now matches.
     "granite",
     "granitemoe",
     "granite-moe",
@@ -1069,6 +1070,17 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // `n_rot == n_embd_head` (`:59`), fused or split QKV, `output` tied
     // when absent. Three fixtures: split, fused, separate `output`.
     "pangu-embedded",
+    // tests/granite_hybrid_graphs.rs: `granitehybrid` (Granite-4.0-H
+    // Micro / Tiny / Small) and its ferrox alias. `granite.cpp`'s four
+    // multipliers and optional biases with a MAMBA-2 block on the
+    // zero-KV layers (`granite-hybrid.cpp:17-19,163`; `crate::mamba2`,
+    // `AttnShape::Mamba2`, the state as `RecurrentState` beside the
+    // layer's cache), dense or MoE with the shared expert, and
+    // `rope.scaling.finetuned = false` (every real export) rotating
+    // nothing. Three fixtures: NoPE dense, rotated dense (Bamba's
+    // shape), NoPE MoE with the shared expert.
+    "granitehybrid",
+    "granite-hybrid",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1768,6 +1780,25 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         for n in ["granite", "granitemoe", "granite-moe"] {
             v.push(gqa_norm(n));
         }
+        // Granite 4.0 (`granitehybrid`; `granite-hybrid` is the ferrox
+        // alias every Granite row carries). `granite-hybrid.cpp` is the
+        // Granite graph with a Mamba-2 block where `head_count_kv` is 0
+        // (`crate::mamba2`, `AttnShape::Mamba2`), and its converter
+        // writes `rope.scaling.finetuned = false` for every export with
+        // a Mamba layer, so the attention layers rotate NOTHING
+        // (`crate::rope_finetuned`, `RopeLayers::Never`). Audited on
+        // tests/granite_hybrid_graphs.rs.
+        for n in ["granitehybrid", "granite-hybrid"] {
+            v.push(prof(
+                n,
+                TextGeneration,
+                DecoderFamily::Hybrid,
+                MemoryKind::Hybrid,
+                Norm,
+                ArchPath::GenericGqa { rope: Norm },
+                WholeVector,
+            ));
+        }
         // OLMo-1 was NEW CODE in `NORM_ROPE_TRIAGED` on its
         // non-parametric LayerNorm, which `crate::norm::NormOp` now
         // implements (`tests/olmo_graphs.rs`). NORM RoPE:
@@ -2406,8 +2437,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             ("jamba", Neox),
             ("falcon-h1", Neox),
             ("plamo2", Neox),
-            ("granitehybrid", Norm),
-            ("granite-hybrid", Norm),
             ("nemotron_h", Neox),
             ("nemotron_h_moe", Neox),
             ("qwen3next", Neox),

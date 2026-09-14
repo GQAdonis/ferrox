@@ -175,6 +175,14 @@ pub struct KvCache {
     /// that eviction is *safe for this run* lives in
     /// `ferrox_models::decoder::kv_window`. See [`Self::arm_window`].
     window: Option<KvWindow>,
+    /// A recurrent layer's state (`crate::recurrent_state`), `None` for
+    /// every attention layer and for a recurrent layer's sequence that
+    /// has not run a token yet. Created by the layer's block at the
+    /// size its weights name; cloned with the cache; cleared with it;
+    /// and the reason [`Self::truncate`] can refuse
+    /// ([`Self::can_truncate_to`]). Public because the block that owns
+    /// the geometry lives in another crate.
+    pub recurrent: Option<crate::recurrent_state::RecurrentState>,
 }
 
 /// Cloning a pool-backed cache detaches the clone from pool accounting
@@ -199,6 +207,7 @@ impl Clone for KvCache {
             // and pretending otherwise would let the clone's
             // `positions` be read as a row count again.
             window: self.window,
+            recurrent: self.recurrent.clone(),
         }
     }
 }
@@ -299,6 +308,7 @@ impl KvCache {
             planned_capacity: None,
             pool_state: None,
             window: None,
+            recurrent: None,
         }
     }
 
@@ -326,6 +336,7 @@ impl KvCache {
             planned_capacity: Some(max_seq_len),
             pool_state: None,
             window: None,
+            recurrent: None,
         }
     }
 
@@ -383,6 +394,7 @@ impl KvCache {
                 blocks_held: blocks_needed,
             }),
             window: None,
+            recurrent: None,
         })
     }
 
@@ -450,6 +462,19 @@ impl KvCache {
         self.k.clear();
         self.v.clear();
         self.positions = 0;
+        self.recurrent = None;
+    }
+
+    /// Whether [`Self::truncate`] to `new_seq_len` is possible.
+    ///
+    /// Always, for an attention layer's cache: its rows are a history.
+    /// For a cache holding a recurrent state only to zero (the state
+    /// resets) or to where it already is: the state is a reduction
+    /// over the whole prefix and has no "one token ago"
+    /// (`crate::recurrent_state`). Every caller that rolls a cache back
+    /// to a middle position asks this first, or is fenced off the model.
+    pub fn can_truncate_to(&self, new_seq_len: usize) -> bool {
+        self.recurrent.is_none() || new_seq_len == 0 || new_seq_len == self.positions
     }
 
     /// Rolls the cache back to exactly `new_seq_len` positions,
@@ -486,6 +511,17 @@ impl KvCache {
              FERROX_KV_WINDOW for a workload that rolls the KV cache back this far.",
             self.window.map(|w| w.window())
         );
+        assert!(
+            self.can_truncate_to(new_seq_len),
+            "truncate target {new_seq_len} on a cache holding a recurrent state at {} positions: \
+             a Mamba state is a reduction over the whole prefix and cannot be rolled back to a \
+             middle position (`crate::recurrent_state`); the caller should have asked \
+             `can_truncate_to` or been fenced off a recurrent model",
+            self.positions
+        );
+        if new_seq_len == 0 {
+            self.recurrent = None;
+        }
         let keep_rows = rows - dropped;
         self.k.truncate(keep_rows * self.k_width());
         self.v.truncate(keep_rows * self.v_width());
@@ -754,6 +790,10 @@ impl std::error::Error for PagedStoreExhausted {}
 pub struct PagedKvCache {
     block_table: Vec<usize>,
     seq_len: usize,
+    /// A recurrent layer's state, per sequence and NOT paged: the store
+    /// holds rows and a Mamba layer has none. Same rules as
+    /// `KvCache::recurrent`.
+    pub recurrent: Option<crate::recurrent_state::RecurrentState>,
 }
 
 impl PagedKvCache {
@@ -761,7 +801,13 @@ impl PagedKvCache {
         PagedKvCache {
             block_table: Vec::new(),
             seq_len: 0,
+            recurrent: None,
         }
+    }
+
+    /// See `KvCache::can_truncate_to`.
+    pub fn can_truncate_to(&self, new_seq_len: usize) -> bool {
+        self.recurrent.is_none() || new_seq_len == 0 || new_seq_len == self.seq_len
     }
 
     pub fn seq_len(&self) -> usize {
@@ -843,6 +889,7 @@ impl PagedKvCache {
             }
         }
         self.seq_len = 0;
+        self.recurrent = None;
     }
 
     /// How many *additional* blocks appending `n_new` positions would
@@ -960,6 +1007,7 @@ impl PagedKvCache {
         // The paged store does not evict either, so its positions and
         // its rows agree and this one assignment is both.
         cache.set_positions(self.seq_len);
+        cache.recurrent = self.recurrent.clone();
         cache
     }
 

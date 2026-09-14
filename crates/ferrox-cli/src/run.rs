@@ -2005,9 +2005,23 @@ fn run_infer_speculative(
     if tokens.is_empty() {
         anyhow::bail!("--model-draft needs a prompt to continue");
     }
+    if decoder.config.has_recurrent_layers() {
+        anyhow::bail!(
+            "--model-draft cannot be used with a target model that has recurrent (Mamba) \
+             layers: a rejected draft rolls the KV caches back to the last accepted position, \
+             and a Mamba layer's state is a reduction over the whole prefix that cannot be \
+             rolled back (llama.cpp's server re-prefills such models for the same reason)"
+        );
+    }
 
     let config =
         ferrox_models::ModelConfig::from_gguf(&ferrox_gguf::ShardedGguf::open(draft_path)?)?;
+    if config.has_recurrent_layers() {
+        anyhow::bail!(
+            "--model-draft cannot be a model with recurrent (Mamba) layers: the draft cache is \
+             rolled back after every verification block"
+        );
+    }
     let draft = ferrox_models::Decoder::from_gguf(draft_path, config)?;
     eprintln!("ferrox: draft model {draft_path}");
 

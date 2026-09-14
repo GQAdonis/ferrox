@@ -214,6 +214,57 @@ const GRANITEMOE_GOLDEN: [f32; 48] = [
     0.3787539,
 ];
 
+const GRANITE_NOROPE_GOLDEN: [f32; 48] = [
+    0.23052013,
+    0.09288454,
+    0.21783777,
+    0.14887694,
+    -0.11577002,
+    -0.08765256,
+    -0.1511468,
+    0.043374788,
+    0.0828368,
+    0.008786253,
+    0.04943922,
+    0.2754695,
+    0.019775443,
+    0.09583954,
+    -0.2172904,
+    0.020783458,
+    0.18882959,
+    -0.20409067,
+    -0.1668834,
+    -0.124541715,
+    -0.12507145,
+    -0.01460816,
+    -0.107605636,
+    -0.07398244,
+    0.023462543,
+    -0.0828686,
+    -0.16141032,
+    -0.26306504,
+    -0.13297711,
+    0.059283186,
+    -0.014935446,
+    0.12299373,
+    0.11021507,
+    -0.043226868,
+    0.32263643,
+    0.13570234,
+    0.32243794,
+    -0.046138868,
+    0.049874146,
+    -0.2163964,
+    -0.24558543,
+    0.17022283,
+    -0.3291752,
+    0.056525428,
+    0.04466207,
+    0.25512132,
+    0.19062524,
+    -0.11793824,
+];
+
 /// The golden array for `arch`. The alias shares `granitemoe`'s, which
 /// is the whole claim being made about it.
 fn golden(arch: &str) -> &'static [f32] {
@@ -393,39 +444,32 @@ fn only_the_moe_rows_are_moe() {
     }
 }
 
-// --- the refusals that did NOT become implementations ---------------
+// --- the refusal that became an implementation, and the one that did not
 
-/// `{arch}.rope.scaling.finetuned = false` is refused, and the refusal
-/// is REACHABLE.
+/// `{arch}.rope.scaling.finetuned = false` runs UNROTATED, as llama.cpp
+/// runs it.
 ///
-/// This is the half of the Granite verdict that stayed a refusal.
-/// `granite.cpp:33-35` reads the key as a switch for RoPE ITSELF and
-/// `:130-133,:206-219` then build no positions and skip both
-/// `ggml_rope_ext` calls, so llama.cpp runs such a file UNROTATED. That
-/// was measured on this very fixture rather than read: the reference
-/// prints `rope_finetuned = unknown` for it and returns logits that
-/// differ from `granite_tiny.gguf`'s in the first digit. ferrox has no
-/// per-model way to express "no RoPE", so it stops.
-///
-/// The test drives a real file through the loader rather than asserting
-/// the code path exists, because this repo has shipped a refusal keyed
-/// on a GGUF spelling nothing writes and it read as coverage for
-/// months. No Granite converter writes this key either --
-/// `conversion/granite.py:253` is `GraniteHybridModel`, a different
-/// architecture string -- so what is pinned is that a file which DOES
-/// carry it is stopped, not that any real export would be.
+/// This was the half of the Granite verdict that stayed a refusal for
+/// four days: `granite.cpp:33-35` reads the key as a switch for RoPE
+/// ITSELF and `:130-133,:206-219` then build no positions and skip both
+/// `ggml_rope_ext` calls. The reference prints `rope_finetuned =
+/// unknown` for this fixture and returns logits that differ from
+/// `granite_tiny.gguf`'s in the first digit (measured, and pinned
+/// below). ferrox had no per-model way to express "no RoPE" until
+/// `gpt2` closed on `RopeLayers::Never`, and Granite-4.0's converter
+/// writes this key FALSE for every hybrid export
+/// (`conversion/granite.py:253-256`), which is what turned the refusal
+/// into `crate::rope_finetuned::unrotated`.
 #[test]
-fn a_granite_file_declaring_rope_finetuned_false_is_refused_rather_than_rotated() {
-    let path = graph_fixture_path("granite_norope");
-    let file = ferrox_gguf::GgufFile::open(&path).expect("the variant fixture parses");
-    match ModelConfig::from_gguf(&file) {
-        Err(LoadError::UnsupportedFeature(arch, msg)) => {
-            assert_eq!(arch, "granite");
-            assert!(msg.contains("granite.rope.scaling.finetuned"), "{msg}");
-            assert!(msg.contains("NO rotation"), "{msg}");
-        }
-        other => panic!("a file with rope_finetuned=false must be refused, got {other:?}"),
-    }
+fn a_granite_file_declaring_rope_finetuned_false_runs_unrotated_as_llama_cpp_does() {
+    assert_all_three_paths_match("granite_norope", &GRANITE_NOROPE_GOLDEN);
+    let d = load_graph_fixture("granite_norope");
+    assert_eq!(
+        d.config.rope_layers,
+        ferrox_models::rope_layers::RopeLayers::Never
+    );
+    // The switch is visible: the rotated file's golden is elsewhere.
+    assert!(worst_vs(&GRANITE_NOROPE_GOLDEN, &GRANITE_GOLDEN) > 1e-1);
 }
 
 /// ... and the same fixture WITHOUT that key loads, so the refusal is

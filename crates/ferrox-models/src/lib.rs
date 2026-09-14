@@ -61,6 +61,7 @@ pub mod llama4_engine;
 pub mod loader;
 pub mod lora;
 pub mod lora_attach;
+pub mod mamba2;
 pub mod minimax_engine;
 pub mod mla;
 pub mod mla_arch;

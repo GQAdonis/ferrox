@@ -275,11 +275,12 @@ fn a_ferrox_only_name_on_the_generic_path_is_declared() {
     //    `tests/glm4_graphs.rs`).
     //  * `granite-hybrid` -- the same ferrox-only alias as `granite-moe`,
     //    of `granitehybrid` (`llama-arch.cpp:102`); NORM like its row.
-    //  * `qwen35` -- `llama_model_rope_type` answers `IMROPE`
-    //    (`llama-model.cpp:2694-2696`) unconditionally, a layout this
-    //    table has no column for. On text positions it is NEOX band for
-    //    band (`ferrox_models::mrope`), which `tests/qwen35_graphs.rs`
-    //    pins against libllama with the sections in the file.
+    //  * `qwen35`, `qwen35moe` -- `llama_model_rope_type` answers
+    //    `IMROPE` (`llama-model.cpp:2694-2696`) unconditionally, a
+    //    layout this table has no column for. On text positions it is
+    //    NEOX band for band (`ferrox_models::mrope`), which
+    //    `tests/qwen35_graphs.rs` pins against libllama with the
+    //    sections in the file.
     const DECLARED: &[&str] = &[
         "phi4",
         "granite-moe",
@@ -287,6 +288,7 @@ fn a_ferrox_only_name_on_the_generic_path_is_declared() {
         "glm4moe",
         "glm4",
         "qwen35",
+        "qwen35moe",
     ];
     let mut undeclared = Vec::new();
     for p in architecture_catalog() {

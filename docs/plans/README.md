@@ -60,16 +60,16 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **88** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **89** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`; `deepseek2` in both tensor forms, `tests/deepseek2_graphs.rs`; the real PLM-1.8B through `ferrox parity`), `Gemma4` has it on the real Gemma-4-E2B (parity MATCH, KL 5.1e-4 on Q4_K_M, against a libllama that has `gemma4.cpp`), `Glm52` and `Kimi` none |
 | Refuses as **unaudited**, now triaged | 2 |
-| Off the generic path: refuses by name, or reaches one of those 4 engines | 57 (26 `dedicated` + 31 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `refact`, `bloom`, `mpt`, `jais`, `minimax-m2`, `lfm2`, `lfm2moe`, `granitehybrid`, `granite-hybrid`, `nemotron_h`, `nemotron_h_moe`, `falcon-h1`, `jamba`, `mamba`, `mamba2` and `qwen35` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
+| Off the generic path: refuses by name, or reaches one of those 4 engines | 56 (25 `dedicated` + 31 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `refact`, `bloom`, `mpt`, `jais`, `minimax-m2`, `lfm2`, `lfm2moe`, `granitehybrid`, `granite-hybrid`, `nemotron_h`, `nemotron_h_moe`, `falcon-h1`, `jamba`, `mamba`, `mamba2`, `qwen35` and `qwen35moe` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 90 generic-gqa (88 of
-them audited), 26 dedicated, 31 deferred, 3 test fixtures.
+regenerated with `ferrox archs --write`: 150 rows, 91 generic-gqa (89 of
+them audited), 25 dedicated, 31 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
 opt-in: an architecture not on the audited list stops rather than
@@ -322,6 +322,8 @@ layers' interleaved `wq` gate is split after the projection, and the
 libllama are deleted. KL 4.1e-13 on the first run
 (`tests/qwen35_graphs.rs`); grouping the V heads instead of tiling
 them, or dropping the gate's sigmoid, each turns five tests red.
+`qwen35moe` followed with no code: `qwen2moe`'s FFN under Qwen3.5's
+layers, KL 2.9e-11.
 
 `olmo2` and `exaone4` closed TOGETHER, because they are one residual
 topology and not two. Neither has an `attn_norm` or an `ffn_norm`

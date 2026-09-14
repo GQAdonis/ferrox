@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **88** architectures run with
+Honest position, re-audited 2026-09-14. **89** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -1091,8 +1091,12 @@ band on text positions (`mrope::MROPE_READERS`), pinned by the golden
 with the sections in the file. KL 4.1e-13 on the first run
 (`tests/qwen35_graphs.rs`); grouping the heads or dropping the
 sigmoid each turns five tests red. The scaffold is deleted.
-`qwen35moe` needs its MoE half and `qwen3next` its grouped heads and
-fused projections; both say so.
+`qwen35moe` (Qwen3.5-35B-A3B, 122B-A10B, 397B-A17B) followed in the
+next PR with NO code: `qwen35moe.cpp:496-538` is `qwen2moe`'s FFN --
+softmax, `norm_w = true`, the shared expert scaled by its own sigmoid
+gate -- under Qwen3.5's layers, KL 2.9e-11 at the `orion` tolerance.
+`qwen3next` needs its grouped heads and fused projections and says
+so.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

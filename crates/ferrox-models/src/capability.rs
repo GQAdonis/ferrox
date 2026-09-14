@@ -1131,6 +1131,11 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // `nextn_predict_layers` skipped as an MTP block. Three fixtures:
     // the interval, the array, a separate `output.weight`.
     "qwen35",
+    // tests/qwen35_graphs.rs: `qwen35moe` (Qwen3.5-35B-A3B and up), the
+    // same layers with `qwen2moe`'s FFN on every one
+    // (`qwen35moe.cpp:98-107,496-538`: softmax, `norm_w = true`, a
+    // shared expert scaled by `sigmoid(ffn_gate_inp_shexp . x)`).
+    "qwen35moe",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -2534,15 +2539,21 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // (NEOX on text positions, `crate::mrope`), the pre-FFN norm
         // under `post_attention_norm` (`norm_sites`). Audited on
         // tests/qwen35_graphs.rs.
-        v.push(prof(
-            "qwen35",
-            TextGeneration,
-            DecoderFamily::Hybrid,
-            MemoryKind::Hybrid,
-            Neox,
-            ArchPath::GenericGqa { rope: Neox },
-            PerHead,
-        ));
+        // `qwen35moe` (Qwen3.5-35B-A3B, 122B-A10B, 397B-A17B) is the same
+        // layers with `qwen2moe`'s FFN (`qwen35moe.cpp:496-538`: softmax,
+        // `norm_w = true`, the shared expert scaled by its own sigmoid
+        // gate), which the generic path has served since OLMoE.
+        for n in ["qwen35", "qwen35moe"] {
+            v.push(prof(
+                n,
+                TextGeneration,
+                DecoderFamily::Hybrid,
+                MemoryKind::Hybrid,
+                Neox,
+                ArchPath::GenericGqa { rope: Neox },
+                PerHead,
+            ));
+        }
         for (n, rope, qk, reason) in [
             (
                 "plamo2",
@@ -2559,13 +2570,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                  `HeadMap::Grouped`) and the legacy fused `ssm_in` / `ssm_ba` projections \
                  (qwen3next.cpp:88-95), plus its MoE; `crate::gdn` serves Qwen3.5's tiled \
                  split layout",
-            ),
-            (
-                "qwen35moe",
-                Neox,
-                PerHead,
-                "Qwen3.5-MoE: `qwen35`'s layers with a shared-expert MoE FFN (qwen35moe.cpp); \
-                 the delta net and the gated attention are served, the MoE half is next",
             ),
         ] {
             v.push(prof(

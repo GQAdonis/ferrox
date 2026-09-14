@@ -24,6 +24,7 @@
 //! | `qwen35` | see `report_kl_against_llama_cpp` | |
 //! | `qwen35_array` | (`attention.recurrent_layers`; libllama byte-identical to `qwen35`) | |
 //! | `qwen35_output` | (a separate `output.weight`) | |
+//! | `qwen35moe` | (`qwen35moe`: `qwen2moe`'s FFN, softmax, a sigmoid-gated shared expert) | |
 //!
 //! ```text
 //! PYTHONPATH=$LLAMA/gguf-py python3 scripts/make_qwen35_fixture.py \
@@ -33,8 +34,9 @@
 
 mod common;
 use common::{
-    assert_all_three_paths_match, assert_decoder_matches_on_all_three_paths, graph_caches,
-    kl_vs_golden, load_graph_fixture, worst_vs, GRAPH_PROMPT, GRAPH_TOL,
+    assert_all_three_paths_match, assert_all_three_paths_match_within,
+    assert_decoder_matches_on_all_three_paths, graph_caches, kl_vs_golden, load_graph_fixture,
+    worst_vs, GRAPH_PROMPT, GRAPH_TOL,
 };
 use ferrox_models::capability::{resolve_architecture, ArchPath, QkNormStyle};
 use ferrox_models::config::RopeLayout;
@@ -45,6 +47,14 @@ use ferrox_models::Decoder;
 const Q35: &str = "qwen35";
 const Q35_ARRAY: &str = "qwen35_array";
 const Q35_OUTPUT: &str = "qwen35_output";
+const Q35MOE: &str = "qwen35moe";
+
+/// The MoE row sits at 2e-5 max delta against libllama (KL 2.9e-11),
+/// with the differences of either sign: the four routed SwiGLU experts
+/// and the shared expert accumulate in a different order from ggml's
+/// `mul_mat_id`. The `phimoe` / `orion` class; the dense rows stay at
+/// `GRAPH_TOL`.
+const Q35MOE_TOL: f32 = 5e-5;
 
 const Q35_GOLDEN: [f32; 48] = [
     1.1752617,
@@ -148,6 +158,57 @@ const Q35_OUTPUT_GOLDEN: [f32; 48] = [
     0.025140703,
 ];
 
+const Q35MOE_GOLDEN: [f32; 48] = [
+    0.22360724,
+    -0.6776414,
+    1.4371357,
+    1.2821944,
+    -1.5060322,
+    -1.1283274,
+    0.3802011,
+    -0.56525075,
+    1.2369745,
+    -0.1832807,
+    -1.6393037,
+    3.4682975,
+    -1.5699571,
+    1.0261061,
+    2.4505923,
+    2.7590377,
+    1.3118783,
+    1.7313827,
+    1.026756,
+    1.170905,
+    0.34071773,
+    0.7808708,
+    -0.69619524,
+    1.2979344,
+    1.1081562,
+    -1.7758526,
+    0.59420073,
+    0.89650184,
+    -0.336622,
+    -0.6407294,
+    1.7617202,
+    -2.418144,
+    0.1003468,
+    -1.8583033,
+    -1.1456127,
+    0.50612867,
+    0.059143424,
+    1.0522888,
+    -2.314548,
+    0.1743792,
+    -0.29793173,
+    2.1630657,
+    -0.3102206,
+    -0.71420944,
+    -0.21808052,
+    0.2306974,
+    0.037070632,
+    0.87471986,
+];
+
 fn decode(decoder: &Decoder) -> Vec<f32> {
     let mut kv = graph_caches(decoder);
     let mut out = Vec::new();
@@ -174,12 +235,35 @@ fn a_separate_output_weight_matches_llama_cpp() {
     assert_all_three_paths_match(Q35_OUTPUT, &Q35_OUTPUT_GOLDEN);
 }
 
+/// `qwen35moe`: the same layers with `qwen2moe`'s FFN
+/// (`qwen35moe.cpp:496-538`): softmax over four experts, two used,
+/// renormalised, plus a shared expert scaled by the sigmoid of its own
+/// one-logit gate.
+#[test]
+fn qwen35moe_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match_within(Q35MOE, &Q35MOE_GOLDEN, Q35MOE_TOL);
+    let d = load_graph_fixture(Q35MOE);
+    assert!(matches!(
+        resolve_architecture("qwen35moe"),
+        Some(ArchPath::GenericGqa { .. })
+    ));
+    assert_eq!(d.config.moe.n_experts, 4);
+    assert_eq!(d.config.moe.n_shared_experts, 1);
+    assert!(d.config.moe.norm_topk_prob);
+    assert!(
+        d.layers[0].moe.shared_expert_gate.is_some(),
+        "ffn_gate_inp_shexp"
+    );
+    assert_eq!(d.config.layer_shape(0).attention, AttnShape::Gdn);
+}
+
 #[test]
 fn report_kl_against_llama_cpp() {
     for (name, golden) in [
         (Q35, &Q35_GOLDEN),
         (Q35_ARRAY, &Q35_GOLDEN),
         (Q35_OUTPUT, &Q35_OUTPUT_GOLDEN),
+        (Q35MOE, &Q35MOE_GOLDEN),
     ] {
         let out = decode(&load_graph_fixture(name));
         println!(

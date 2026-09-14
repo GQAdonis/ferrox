@@ -72,6 +72,11 @@ pub const MROPE_READERS: &[(&str, MropeOnText, &str)] = &[
         MropeOnText::SameAsNeox,
         "src/models/qwen35.cpp:5,213-222; llama-model.cpp:2694-2696",
     ),
+    (
+        "qwen35moe",
+        MropeOnText::SameAsNeox,
+        "src/models/qwen35moe.cpp:9; llama-model.cpp:2694-2696",
+    ),
 ];
 
 /// `llama_hparams::use_mrope()` for a file.

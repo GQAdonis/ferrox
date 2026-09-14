@@ -922,6 +922,7 @@ mod tests {
             sliding_window: None,
             moe: ferrox_moe::MoeLayerConfig {
                 expert_weights_scale: 1.0,
+                routed_weight_before_ffn: false,
                 n_experts: d.n_experts,
                 n_experts_active: d.n_experts,
                 n_shared_experts: d.num_shared_experts,
@@ -933,6 +934,7 @@ mod tests {
                 expert_group_used_count: None,
             },
             n_dense_leading_layers: 1,
+            moe_interleave_step: None,
             attention: crate::config::AttentionKind::KimiHybrid(
                 crate::config::KimiHybridAttention {
                     kda_layers: vec![1],
@@ -982,6 +984,8 @@ mod tests {
             layer_loops: None,
             skip_stream: false,
             parallel_ssm: false,
+            swa_chunked: false,
+            weightless_qk_norm: false,
             logit_multiplier: None,
             attention_scale: None,
             rope_theta_swa: None,

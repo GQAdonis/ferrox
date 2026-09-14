@@ -238,8 +238,10 @@ this is stale.
 
 - Gemma-4 tokenizer (`gemma4`) plus an end-to-end chat smoke test (the
   engine loads today)
-- HybridEngine and Qwen3.5
-- Llama 4 and MiniMax engines
+- Qwen3.5 (`qwen35`, `qwen35moe`, `qwen3next`) and Llama 4 run on
+  the generic path since 2026-09-14 (`tests/qwen35_graphs.rs`,
+  `tests/llama4_graphs.rs`); no engine for either
+- MiniMax-M3's sparse attention (`minimax-m2` runs on the generic path)
 - Vision (projector plus generate)
 - Real GLM-5.2, DeepSeek V4 and full Kimi, run end to end
 - MTP draft heads

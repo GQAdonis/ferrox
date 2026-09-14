@@ -60,16 +60,16 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **90** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **91** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`; `deepseek2` in both tensor forms, `tests/deepseek2_graphs.rs`; the real PLM-1.8B through `ferrox parity`), `Gemma4` has it on the real Gemma-4-E2B (parity MATCH, KL 5.1e-4 on Q4_K_M, against a libllama that has `gemma4.cpp`), `Glm52` and `Kimi` none |
 | Refuses as **unaudited**, now triaged | 2 |
-| Off the generic path: refuses by name, or reaches one of those 4 engines | 55 (24 `dedicated` + 31 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `refact`, `bloom`, `mpt`, `jais`, `minimax-m2`, `lfm2`, `lfm2moe`, `granitehybrid`, `granite-hybrid`, `nemotron_h`, `nemotron_h_moe`, `falcon-h1`, `jamba`, `mamba`, `mamba2`, `qwen35`, `qwen35moe` and `qwen3next` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
+| Off the generic path: refuses by name, or reaches one of those 4 engines | 54 (23 `dedicated` + 31 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `refact`, `bloom`, `mpt`, `jais`, `minimax-m2`, `lfm2`, `lfm2moe`, `granitehybrid`, `granite-hybrid`, `nemotron_h`, `nemotron_h_moe`, `falcon-h1`, `jamba`, `mamba`, `mamba2`, `qwen35`, `qwen35moe`, `qwen3next` and `llama4` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 92 generic-gqa (90 of
-them audited), 24 dedicated, 31 deferred, 3 test fixtures.
+regenerated with `ferrox archs --write`: 150 rows, 93 generic-gqa (91 of
+them audited), 23 dedicated, 31 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
 opt-in: an architecture not on the audited list stops rather than
@@ -329,6 +329,32 @@ projection, KL 8.7e-12. Every gated-delta-net graph in llama.cpp is
 served; of the hybrid family only `plamo2`'s Mamba-1 spelling is
 left.
 
+`llama4` (Scout, Maverick) closed on 2026-09-14 on four seams, three
+of them a per-layer gate on a seam that existed. The new one is
+`ferrox-models/src/chunked_swa.rs`: `llama4.cpp:13-14` set
+`LLAMA_SWA_TYPE_CHUNKED` at a literal 8192 and `llama-hparams.h:
+419-425` mask every key before the query's own chunk, so a query at
+`p` sees `p % 8192 + 1` positions where a sliding layer sees a
+constant; `ModelConfig::layer_window_for_query` is that number, the
+batched prefill takes a per-query arm when a batch straddles a
+boundary (`BatchWindow`), eviction keeps the last 8192 rows (a
+superset of any chunk), and the fused Metal launches refuse the
+model. The temperature is the literal row of `attn_temperature` with
+`unrotated_layers_only`; the weightless per-head QK norm after RoPE
+on the rotating layers is a `bool` (`weightless_qk_norm`, one
+reachable graph of 140); the interleave step is honoured because
+`llama4.cpp:64` is the ONE tensor loader that branches on it. The
+fourth was not in `llama4.cpp` at all: `llama-graph.cpp:1947`
+multiplies the sigmoid weight into the expert's INPUT for
+`LLM_ARCH_LLAMA4` alone (`routed_weight_site`), and the fixture's
+logits move by 0.86 between the two sites. Building it found
+`route_top_k_sigmoid` renormalising whatever `norm_topk_prob` said
+(every sigmoid row so far had declared the key true). KL 1.1e-12 on
+both shapes and at the last of 8200 positions across the chunk
+boundary, on the prefill and row bodies; `--noswa` (libllama aborts,
+`llama-graph.cpp:159`) and `--dense` (libllama refuses) are refusals
+by name.
+
 `olmo2` and `exaone4` closed TOGETHER, because they are one residual
 topology and not two. Neither has an `attn_norm` or an `ffn_norm`
 tensor; both read the raw residual at each sublayer and norm each
@@ -366,8 +392,8 @@ NONE`, `exaone-moe.cpp:136,155-161` is `is_swa(il)` around the same two
 similar. `smollm3.cpp:5,69` is a different variant of the same enum
 (`(il + 1) % 4 != 0`, no window). `ferrox_models::rope_layers` is one
 table for all six architectures llama.cpp gates this way, with
-`smallthinker`, `afmoe` and `llama4` in it; the first two closed later
-on other seams and `llama4` is still refused for other things. The durable part is the type: `ModelConfig::layer_rope` returns
+`smallthinker`, `afmoe` and `llama4` in it; all three closed later
+on other seams. The durable part is the type: `ModelConfig::layer_rope` returns
 `Option<(base, divisors)>`, so a rotation site cannot take the pair
 without answering whether to rotate, and the Metal stacks take an
 `Option<LayerRope>` per layer -- their RoPE dispatch had been written in

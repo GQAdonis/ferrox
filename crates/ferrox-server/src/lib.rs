@@ -8650,6 +8650,7 @@ pub(crate) mod tests {
             sliding_window: None,
             moe: MoeLayerConfig {
                 expert_weights_scale: 1.0,
+                routed_weight_before_ffn: false,
                 n_experts: 1,
                 n_experts_active: 1,
                 n_shared_experts: 0,
@@ -8665,6 +8666,7 @@ pub(crate) mod tests {
             // 1-indexed `kda_layers`/`full_attn_layers` convention is
             // `ModelConfig::layer_attention_kind`'s, not this test's.
             n_dense_leading_layers: 1,
+            moe_interleave_step: None,
             attention: AttentionKind::KimiHybrid(KimiHybridAttention {
                 kda_layers: vec![1],
                 full_attn_layers: vec![],
@@ -8711,6 +8713,8 @@ pub(crate) mod tests {
             layer_loops: None,
             skip_stream: false,
             parallel_ssm: false,
+            swa_chunked: false,
+            weightless_qk_norm: false,
             logit_multiplier: None,
             attention_scale: None,
             rope_theta_swa: None,

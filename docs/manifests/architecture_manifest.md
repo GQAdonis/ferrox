@@ -90,7 +90,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `minicpm` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `phi3` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
 | `phi4` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
-| `llama4` | TextGeneration | Dedicated | KvGqa | dedicated |
+| `llama4` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `minimax-m2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `pangu-embedded` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `minimax-m3` | TextGeneration | Dedicated | KvGqa | dedicated |

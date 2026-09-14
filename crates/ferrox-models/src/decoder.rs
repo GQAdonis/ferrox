@@ -1040,6 +1040,12 @@ impl Decoder {
             // Every fused launch runs attention alone on its layer; a
             // parallel Mamba-2 block (`crate::mamba2`) has no kernel.
             && !config.parallel_ssm
+            // Every fused launch takes ONE sliding window per layer; a
+            // chunked layer's window is per query
+            // (`crate::chunked_swa`), and no fused kernel norms Q and K
+            // without a weight after RoPE (`crate::weightless_qk_norm`).
+            && !config.swa_chunked
+            && !config.weightless_qk_norm
             // No fused kernel adds a per-key bias (`crate::alibi`).
             && config.alibi_max_bias.is_none()
             // Every fused launch takes ONE head width for K and V (the
@@ -3441,16 +3447,23 @@ impl Decoder {
     }
 
     /// Fallback: serial top-k with shared Q8 act (pre-mul_mat_id path).
+    ///
+    /// `weight_before_ffn` (`crate::routed_weight_site`): each slot
+    /// reads its own scaled input and the shared activation is not
+    /// built.
     fn cpu_moe_serial_experts(
         layer: &LayerWeights,
         normed2: &[f32],
         decision: &ferrox_moe::RoutingDecision,
         plan: Option<&PlacementPlan>,
         act: GluAct,
+        weight_before_ffn: bool,
     ) -> Vec<(Vec<f32>, f32)> {
-        let shared_act = if ferrox_core::weight_matrix::cpu_int_dot_for(
-            ferrox_core::weight_matrix::IntDotShape::Matvec,
-        ) && normed2.len().is_multiple_of(32)
+        let shared_act = if !weight_before_ffn
+            && ferrox_core::weight_matrix::cpu_int_dot_for(
+                ferrox_core::weight_matrix::IntDotShape::Matvec,
+            )
+            && normed2.len().is_multiple_of(32)
             && plan
                 .map(|p| {
                     decision
@@ -3472,6 +3485,8 @@ impl Decoder {
                 let placement = plan
                     .map(|p| p.placement_for(eid))
                     .unwrap_or(ExpertPlacement::Cpu);
+                let (input, w) =
+                    crate::routed_weight_site::routed_slot(normed2, w, weight_before_ffn);
                 let out = layer.moe.with_expert(eid, |ex| {
                     if let Some(ref q8) = shared_act {
                         if let (Some(gate), Some(up)) =
@@ -3481,7 +3496,7 @@ impl Decoder {
                             return ex.down.apply(&activated);
                         }
                     }
-                    run_expert_placed(normed2, ex, placement, act)
+                    run_expert_placed(&input, ex, placement, act)
                 });
                 (out, w)
             })
@@ -3622,7 +3637,13 @@ impl Decoder {
                         .all(|&eid| matches!(p.placement_for(eid), ExpertPlacement::Cpu))
                 })
                 .unwrap_or(true);
-            if let (true, ExpertBacking::Resident(experts)) = (all_cpu, &layer.moe.experts) {
+            // The parallel-slot kernel quantises ONE input for every
+            // slot; a model that weights the input per slot
+            // (`crate::routed_weight_site`) takes the serial site.
+            let before = config.moe.routed_weight_before_ffn;
+            if let (true, false, ExpertBacking::Resident(experts)) =
+                (all_cpu, before, &layer.moe.experts)
+            {
                 if let Some(outs) = Self::cpu_moe_topk_parallel_slots(
                     experts,
                     routed_input,
@@ -3632,10 +3653,10 @@ impl Decoder {
                 ) {
                     outs
                 } else {
-                    Self::cpu_moe_serial_experts(layer, routed_input, &decision, plan, act)
+                    Self::cpu_moe_serial_experts(layer, routed_input, &decision, plan, act, before)
                 }
             } else {
-                Self::cpu_moe_serial_experts(layer, routed_input, &decision, plan, act)
+                Self::cpu_moe_serial_experts(layer, routed_input, &decision, plan, act, before)
             }
         };
         // Shared experts fire on every token regardless of routing, so
@@ -3858,9 +3879,18 @@ impl Decoder {
             }
             let n = toks.len();
             let mut gathered = vec![0f32; n * hidden_dim];
-            for (i, &(tok, _)) in toks.iter().enumerate() {
-                gathered[i * hidden_dim..(i + 1) * hidden_dim]
-                    .copy_from_slice(&routed_batch[tok * hidden_dim..(tok + 1) * hidden_dim]);
+            // Each gathered row is one (token, slot): the slot's input
+            // and the weight its output carries come from the one
+            // helper the row body uses (`crate::routed_weight_site`).
+            let mut out_weights = Vec::with_capacity(n);
+            for (i, &(tok, w)) in toks.iter().enumerate() {
+                let (input, w) = crate::routed_weight_site::routed_slot(
+                    &routed_batch[tok * hidden_dim..(tok + 1) * hidden_dim],
+                    w,
+                    config.moe.routed_weight_before_ffn,
+                );
+                gathered[i * hidden_dim..(i + 1) * hidden_dim].copy_from_slice(&input);
+                out_weights.push(w);
             }
             let ex = &experts[eid];
             let ffn_acts = ex.gate.quantize_batch_acts(&gathered, n);
@@ -3870,7 +3900,7 @@ impl Decoder {
             let up = ex.up.apply_batch_with_acts(&gathered, n, ffn_acts.as_ref());
             let activated = act.apply(&gate, &up);
             let down = ex.down.apply_batch(&activated, n);
-            for (i, &(tok, w)) in toks.iter().enumerate() {
+            for (i, (&(tok, _), &w)) in toks.iter().zip(out_weights.iter()).enumerate() {
                 let out = &down[i * hidden_dim..(i + 1) * hidden_dim];
                 let row = &mut acc[tok * hidden_dim..(tok + 1) * hidden_dim];
                 for (a, &o) in row.iter_mut().zip(out.iter()) {
@@ -4665,7 +4695,14 @@ impl Decoder {
                 // `layer_supports_metal_attn` refuses the layer outright
                 // rather than letting the Metal arms above consume a batch
                 // that has not been normed yet.
-                self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
+                self.apply_qk_norms_post_rope(
+                    layer,
+                    l,
+                    &mut q_batch,
+                    &mut k_batch,
+                    q_width,
+                    kv_width,
+                );
                 // Elementwise, so the whole Q batch in one call. Like the
                 // multi-sequence path, this body did not apply it at all
                 // until the decoration audit. It is placed AFTER the Metal
@@ -4679,7 +4716,7 @@ impl Decoder {
                 // Same placement and same fence, per row: row `b` of this
                 // batch is position `start_pos + b`, which is what the
                 // RoPE loop above used for it.
-                self.apply_attn_temperature(&mut q_batch, q_width, |b| start_pos + b);
+                self.apply_attn_temperature(l, &mut q_batch, q_width, |b| start_pos + b);
 
                 // ROWS, not positions: it is added to `b + 1` below to give
                 // each query in the batch the length of the KV it attends
@@ -4701,9 +4738,12 @@ impl Decoder {
                 let cache_k = &cache.k;
                 let cache_v = &cache.v;
                 let softcap = self.config.attn_logit_softcap;
-                let window = self.config.layer_sliding_window(l);
+                let batch_window = self.config.batch_window(l, start_pos, batch_size);
                 // A layer with sinks takes the per-query path, windowed
-                // or not: the blocked kernel has no sink term. Everything
+                // or not: the blocked kernel has no sink term. So does a
+                // chunked layer whose queries straddle a chunk boundary
+                // (`crate::chunked_swa`): the blocked kernel takes ONE
+                // window. Everything
                 // else goes through the blocked kernel, which is Rayon over
                 // `[query-block x head]` against one shared KV buffer,
                 // windowed or not. SWA layers used to take a per-query
@@ -4714,31 +4754,14 @@ impl Decoder {
                 // are SWA) that arm was 19.6% of non-idle CPU `pp512`
                 // samples while doing the *same* KV work as this one - at
                 // `pp512` the 512-wide window covers the whole prompt.
-                let mut attn_out_batch = if let Some(sinks) = layer.attn.sinks.as_deref() {
-                    let mut out = vec![0f32; batch_size * out_width];
-                    out.par_chunks_mut(out_width)
-                        .enumerate()
-                        .for_each(|(b, dest)| {
-                            let seq_len_b = base_seq_len + b + 1;
-                            let attn_out = causal_gqa_attention_row(
-                                &q_batch[b * q_width..(b + 1) * q_width],
-                                &cache_k[..seq_len_b * kv_width],
-                                &cache_v[..seq_len_b * v_width],
-                                n_heads,
-                                n_kv_heads,
-                                head_dim,
-                                v_head_dim,
-                                seq_len_b,
-                                window,
-                                Some(sinks),
-                                None,
-                                self.alibi_slopes.as_deref(),
-                            );
-                            dest.copy_from_slice(&attn_out);
-                        });
-                    out
-                } else {
-                    causal_gqa_attention_prefill_shared_kv_split(
+                let sinks = layer.attn.sinks.as_deref();
+                let blocked = match (batch_window, sinks) {
+                    (crate::config::BatchWindow::Uniform(window), None) => Some(window),
+                    (crate::config::BatchWindow::Uniform(_), Some(_))
+                    | (crate::config::BatchWindow::PerQuery, _) => None,
+                };
+                let mut attn_out_batch = match blocked {
+                    Some(window) => causal_gqa_attention_prefill_shared_kv_split(
                         &q_batch,
                         cache_k,
                         cache_v,
@@ -4751,7 +4774,35 @@ impl Decoder {
                         softcap,
                         window,
                         self.alibi_slopes.as_deref(),
-                    )
+                    ),
+                    None => {
+                        let mut out = vec![0f32; batch_size * out_width];
+                        out.par_chunks_mut(out_width)
+                            .enumerate()
+                            .for_each(|(b, dest)| {
+                                let seq_len_b = base_seq_len + b + 1;
+                                let attn_out = causal_gqa_attention_row(
+                                    &q_batch[b * q_width..(b + 1) * q_width],
+                                    &cache_k[..seq_len_b * kv_width],
+                                    &cache_v[..seq_len_b * v_width],
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    v_head_dim,
+                                    seq_len_b,
+                                    // Row `b` is position `start_pos + b`,
+                                    // as the RoPE loop above had it.
+                                    self.config.layer_window_for_query(l, start_pos + b),
+                                    sinks,
+                                    // The sink arm carries no softcap, as
+                                    // `push_and_attend_row` has it.
+                                    if sinks.is_some() { None } else { softcap },
+                                    self.alibi_slopes.as_deref(),
+                                );
+                                dest.copy_from_slice(&attn_out);
+                            });
+                        out
+                    }
                 };
 
                 // Every query in this batch has now been answered, so the
@@ -5000,7 +5051,14 @@ impl Decoder {
                         );
                     }
                 }
-                self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
+                self.apply_qk_norms_post_rope(
+                    layer,
+                    l,
+                    &mut q_batch,
+                    &mut k_batch,
+                    q_width,
+                    kv_width,
+                );
                 // Applied to the whole Q batch at once because it is
                 // elementwise. This path did not apply it at all until the
                 // decoration audit: `attention_scale` reached only
@@ -5008,7 +5066,7 @@ impl Decoder {
                 // checkpoint carrying one answered at one temperature when
                 // decoded alone and another when batched with its neighbours.
                 self.apply_attention_scale(&mut q_batch);
-                self.apply_attn_temperature(&mut q_batch, q_width, |b| positions[b]);
+                self.apply_attn_temperature(l, &mut q_batch, q_width, |b| positions[b]);
 
                 let mut attn_out_batch = vec![0f32; batch_size * out_width];
                 for b in 0..batch_size {
@@ -7195,6 +7253,7 @@ mod metal_rope_tests {
             scale: 0.5,
             floor_scale: std::num::NonZeroU32::new(2).unwrap(),
             offset: 0.0,
+            unrotated_layers_only: false,
         });
         let d = Decoder::new_random_small(tempered.clone(), 1, 32);
         assert!(
@@ -7286,6 +7345,24 @@ mod metal_rope_tests {
             false
         ));
         assert!(!Decoder::metal_can_serve_model(&parallel, false));
+    }
+
+    /// Llama 4's two facts (`crate::chunked_swa`,
+    /// `crate::weightless_qk_norm`) each keep the model off every fused
+    /// launch: one window per layer, no weightless post-RoPE QK norm.
+    #[test]
+    fn a_chunked_window_and_the_weightless_qk_norm_each_keep_the_model_on_the_host() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        assert!(Decoder::metal_can_serve_model(&plain, false));
+        let mut chunked = plain.clone();
+        chunked.sliding_window = Some(8192);
+        chunked.swa_chunked = true;
+        assert!(!Decoder::metal_can_serve_model(&chunked, false));
+        let mut normed = plain;
+        normed.weightless_qk_norm = true;
+        assert!(!Decoder::metal_can_serve_model(&normed, false));
     }
 
     #[test]

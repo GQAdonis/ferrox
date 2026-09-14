@@ -89,6 +89,12 @@ pub struct MoeLayerConfig {
     /// bailingmoe2, hunyuan-moe, …) set it to values like 2.5, and
     /// ignoring it scales every routed contribution wrong.
     pub expert_weights_scale: f32,
+    /// The routing weight multiplies the expert's INPUT rather than its
+    /// output (`llama-graph.cpp:1947`, `weight_before_ffn`: Llama 4
+    /// alone; `ferrox_models::routed_weight_site`). The host sites
+    /// that gather a routed expert's input scale the row and carry a
+    /// weight of 1 through the output sum.
+    pub routed_weight_before_ffn: bool,
 }
 
 /// Router output for one token: which experts fire, and their
@@ -168,7 +174,7 @@ pub fn route_top_k(
 ) -> RoutingDecision {
     match gating {
         GatingFunction::Softmax => route_top_k_softmax(logits, k, norm_topk_prob),
-        GatingFunction::Sigmoid => route_top_k_sigmoid(logits, k),
+        GatingFunction::Sigmoid => route_top_k_sigmoid(logits, k, norm_topk_prob),
         GatingFunction::SqrtSoftplus => route_top_k_sqrtsoftplus(logits, k, norm_topk_prob),
     }
 }
@@ -571,28 +577,37 @@ pub fn route_top_k_softmax(logits: &[f32], k: usize, norm_topk_prob: bool) -> Ro
     }
 }
 
-/// sigmoid-then-renormalize top-k routing: score every expert with
-/// `sigmoid(logit)` (independently per expert, not a joint softmax
-/// distribution), pick the top-k by that score, then renormalize just
-/// the selected experts' sigmoid scores to sum to one. This is the
-/// DeepSeek-V3 / GLM4-MoE convention found in ik_llama.cpp's real GGUF
-/// hparams-loading source.
-pub fn route_top_k_sigmoid(logits: &[f32], k: usize) -> RoutingDecision {
+/// Sigmoid top-k routing: score every expert with `sigmoid(logit)`
+/// (independently per expert, not a joint softmax distribution), pick
+/// the top-k by that score, and renormalize just the selected experts'
+/// scores to sum to one WHEN `norm_topk_prob` says so -- llama.cpp's
+/// `build_moe_ffn` (`llama-graph.cpp`) applies `norm_w` after either
+/// gating function, the same way. DeepSeek-V3 / GLM4-MoE renormalise
+/// (`expert_weights_norm = true`); `llama4.cpp:228` passes `false`
+/// beside its SIGMOID literal, and until it did this body renormalised
+/// UNCONDITIONALLY: every sigmoid row that had reached it declared the
+/// key true, so the ignored argument had never changed an answer.
+pub fn route_top_k_sigmoid(logits: &[f32], k: usize, norm_topk_prob: bool) -> RoutingDecision {
     let scores: Vec<f32> = logits.iter().map(|&l| sigmoid(l)).collect();
 
     let mut idx: Vec<usize> = (0..scores.len()).collect();
     idx.sort_unstable_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
     let top = &idx[..k.min(idx.len())];
 
-    let sum: f32 = top.iter().map(|&i| scores[i]).sum();
-    let weights: Vec<f32> = if sum > 0.0 {
-        top.iter().map(|&i| scores[i] / sum).collect()
-    } else {
-        // Degenerate case (all selected scores are exactly zero,
-        // essentially never in practice for a real trained router):
-        // fall back to a uniform split rather than dividing by zero.
-        vec![1.0 / top.len() as f32; top.len()]
-    };
+    let mut weights: Vec<f32> = top.iter().map(|&i| scores[i]).collect();
+    if norm_topk_prob {
+        let sum: f32 = weights.iter().sum();
+        if sum > 0.0 {
+            for w in weights.iter_mut() {
+                *w /= sum;
+            }
+        } else {
+            // Degenerate case (all selected scores are exactly zero,
+            // essentially never in practice for a real trained router):
+            // fall back to a uniform split rather than dividing by zero.
+            weights = vec![1.0 / top.len() as f32; top.len()];
+        }
+    }
 
     RoutingDecision {
         expert_ids: top.to_vec(),
@@ -1310,6 +1325,19 @@ mod tests {
             let sum: f32 = decision.weights.iter().sum();
             assert!((sum - 1.0).abs() < 1e-5, "k={k} sum={sum}");
         }
+    }
+
+    /// `norm_w = false` under sigmoid gating (`llama4.cpp:228`): the
+    /// selected experts keep their raw sigmoid scores. This body used
+    /// to renormalise whatever the flag said.
+    #[test]
+    fn sigmoid_gating_without_renormalisation_keeps_the_raw_scores() {
+        let logits = vec![-2.0, 0.5, 3.0, 1.2, -0.3, 4.0, 0.0, -1.5];
+        let decision = route_top_k(&logits, 2, GatingFunction::Sigmoid, false);
+        assert_eq!(decision.expert_ids, vec![5, 2]);
+        assert_eq!(decision.weights, vec![sigmoid(4.0), sigmoid(3.0)]);
+        let one = route_top_k(&logits, 1, GatingFunction::Sigmoid, false);
+        assert_eq!(one.weights, vec![sigmoid(4.0)], "top-1 is NOT 1.0");
     }
 
     #[test]

@@ -17,6 +17,22 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`phimoe` runs: Phi-3.5-MoE.** `phi3`'s graph (`models.h:632`) on
+  `phimoe.cpp`'s tensors, which differ from a Phi-3 file in biases
+  only: an RMSNorm WITH a bias at every norm site (`phi3.cpp:99-102,
+  137-139,174-177` under `LLM_NORM_RMS`; `NormOp::RmsBias`,
+  `NormFunction::RmsBias`, `capability::BIASED_RMS_NORM`, one graph of
+  140 on the generic path, measured) plus `attn_output.bias` and
+  `output.bias`, slots that already existed. The old refusal had
+  called the norm biases LayerNorm biases. `capability::
+  swa_window_override` drops its window key as `phi3`'s
+  (`phimoe.cpp:3-10` never read it; libllama `n_swa = 0` on a file
+  declaring one, measured) where a test had asserted the opposite. The
+  loader's norm-function census covers all five function lists now
+  (it listed two). `tests/phimoe_graphs.rs`: KL 1.91e-11 with the
+  LongRoPE long pair in use (`attn_factor 1.0955`), 1.86e-12 plain, at
+  the `orion` tolerance; zeroing the norm bias, reading it as a
+  LayerNorm bias, or dropping the output bias each diverge. 69 audited.
 - **`cohere2` runs: Command-R7B and Command-A.** `command-r`'s graph
   with a REQUIRED sliding window whose SLIDING layers alone are rotated
   (`cohere2.cpp:72,91`, `if (is_swa)` around `ggml_rope_ext`): that is

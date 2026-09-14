@@ -273,7 +273,8 @@ fn creates_projection_bias(arch: &str, bias: &str) -> bool {
 fn applied(arch: &str, bias: &str) -> bool {
     GENERIC_DECODER_APPLIES.contains(&bias)
         || (LAYER_NORM_BIASES.contains(&bias)
-            && ferrox_models::capability::uses_biased_layer_norm(arch))
+            && (ferrox_models::capability::uses_biased_layer_norm(arch)
+                || ferrox_models::capability::uses_biased_rms_norm(arch)))
         || (PROJECTION_BIASES.contains(&bias) && creates_projection_bias(arch, bias))
 }
 
@@ -432,9 +433,9 @@ fn an_architecture_whose_required_bias_ferrox_drops_is_not_on_the_generic_path()
 /// moment that other reason is fixed.
 #[test]
 fn the_bias_refusals_name_the_bias() {
-    // `nemotron`, `orion`, `codeshell`, `jais2`, `starcoder2` and
-    // `stablelm` were here; their biases are applied now.
-    for arch in ["starcoder", "phimoe"] {
+    // `nemotron`, `orion`, `codeshell`, `jais2`, `starcoder2`,
+    // `stablelm` and `phimoe` were here; their biases are applied now.
+    for arch in ["starcoder"] {
         match resolve_profile(arch).map(|p| p.path) {
             Some(ArchPath::DedicatedOnly { reason }) => assert!(
                 reason.contains("bias"),

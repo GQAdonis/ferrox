@@ -1028,6 +1028,9 @@ impl Decoder {
             // The GPU embedding gather has no add and no stack sees
             // `pos` for it (`crate::position_embd`).
             && !config.learned_positions
+            // Every fused launch runs attention alone on its layer; a
+            // parallel Mamba-2 block (`crate::mamba2`) has no kernel.
+            && !config.parallel_ssm
             // No fused kernel adds a per-key bias (`crate::alibi`).
             && config.alibi_max_bias.is_none()
             // Every fused launch takes ONE head width for K and V (the
@@ -4452,6 +4455,15 @@ impl Decoder {
                     crate::layer_shapes::AttnShape::Gqa { .. } => {}
                 }
 
+                // falcon-h1.cpp:156-160: the parallel Mamba-2 block over the
+                // same normed rows, on this layer's cache, before the push.
+                let parallel_ssm = self.parallel_ssm_rows(
+                    l,
+                    layer,
+                    &normed_batch,
+                    batch_size,
+                    &mut cache.recurrent,
+                );
                 // One shared activation-quant pass for q/k/v (plan 1e): the
                 // three projections read the same normed batch, so quantize it
                 // once instead of once per projection. A kind mismatch inside
@@ -4735,12 +4747,13 @@ impl Decoder {
                 // instead of every windowed layer's at once.
                 self.evict_layer_kv(l, cache);
 
-                let projected_batch = self.attn_out_to_residual_rows(
+                let mut projected_batch = self.attn_out_to_residual_rows(
                     layer,
                     &normed_batch,
                     &mut attn_out_batch,
                     batch_size,
                 );
+                Self::add_parallel_ssm(&mut projected_batch, parallel_ssm);
                 residual_add(
                     &mut hidden_batch,
                     &projected_batch,
@@ -4872,6 +4885,25 @@ impl Decoder {
                     crate::layer_shapes::AttnShape::Gqa { .. } => {}
                 }
 
+                // falcon-h1.cpp:156-160: the parallel Mamba-2 block, each
+                // row on its own sequence's cache, before the push.
+                let parallel_ssm = layer.attn.mamba2.as_ref().map(|_| {
+                    let mut out = Vec::with_capacity(batch_size * hidden_dim);
+                    for b in 0..batch_size {
+                        let mut step = kv.step(b, l);
+                        out.extend(
+                            self.parallel_ssm_rows(
+                                l,
+                                layer,
+                                &normed_batch[b * hidden_dim..(b + 1) * hidden_dim],
+                                1,
+                                step.recurrent_slot(),
+                            )
+                            .expect("the layer has the block"),
+                        );
+                    }
+                    out
+                });
                 // One shared activation-quant pass for q/k/v (plan 1e): the
                 // three projections read the same normed batch, so quantize it
                 // once instead of once per projection. A kind mismatch inside
@@ -4958,12 +4990,13 @@ impl Decoder {
                     attn_out_batch[b * out_width..(b + 1) * out_width].copy_from_slice(&attn_out);
                 }
 
-                let projected_batch = self.attn_out_to_residual_rows(
+                let mut projected_batch = self.attn_out_to_residual_rows(
                     layer,
                     &normed_batch,
                     &mut attn_out_batch,
                     batch_size,
                 );
+                Self::add_parallel_ssm(&mut projected_batch, parallel_ssm);
                 residual_add(
                     &mut hidden_batch,
                     &projected_batch,

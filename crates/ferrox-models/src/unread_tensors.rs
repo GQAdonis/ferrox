@@ -32,8 +32,15 @@ use ferrox_gguf::ShardedGguf;
 ///   `tests/fixtures/apertus_qknorm_bias_tiny.gguf` does, and
 ///   libllama's logits for it are byte-identical to the base file's
 ///   (`tests/per_layer_activation_graphs.rs`).
-pub const UNREAD_LAYER_TENSORS: &[(&str, &[&str])] =
-    &[("apertus", &["attn_q_norm.bias", "attn_k_norm.bias"])];
+///
+/// * `falcon-h1`: `falcon-h1.cpp:76` creates `attn_output.bias`
+///   (`TENSOR_NOT_REQUIRED`) and `:154` passes `NULL` as `wo_b` into
+///   `build_attn`, so a file that carries it is loaded and never adds
+///   it. `conversion/falcon_h1.py` writes no attention bias.
+pub const UNREAD_LAYER_TENSORS: &[(&str, &[&str])] = &[
+    ("apertus", &["attn_q_norm.bias", "attn_k_norm.bias"]),
+    ("falcon-h1", &["attn_output.bias"]),
+];
 
 /// The suffixes llama.cpp leaves unread for `arch`, or an empty slice.
 pub fn unread_layer_tensors(arch: &str) -> &'static [&'static str] {

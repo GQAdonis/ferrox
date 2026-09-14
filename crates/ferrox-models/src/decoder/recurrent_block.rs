@@ -84,10 +84,9 @@ impl Decoder {
         }
     }
 
-    /// The Mamba-2 block. The state is the cache's `recurrent` slot,
-    /// created at this layer's size on the sequence's first token
-    /// (zeros, as `build_rs` zeroes a new sequence's); after the rows
-    /// run, the cache is advanced by `rows` EMPTY positions so its
+    /// The Mamba-2 block where attention would be. The state is the
+    /// cache's `recurrent` slot ([`Self::mamba2_state_step`]); after the
+    /// rows run, the cache is advanced by `rows` EMPTY positions so its
     /// `positions()` / `seq_len()` still says how far the sequence has
     /// got, which is what every consumer of a per-layer cache reads.
     fn mamba2_block(
@@ -96,35 +95,78 @@ impl Decoder {
         layer: &LayerWeights,
         normed: &[f32],
         rows: usize,
-        kv: KvStep<'_>,
+        mut kv: KvStep<'_>,
     ) -> Vec<f32> {
-        let block = layer
-            .attn
-            .mamba2
-            .as_ref()
-            .unwrap_or_else(|| panic!("layer {layer_idx} is Mamba2-shaped but has no weights"));
-        let eps = self.config.rms_norm_eps;
-        let run = |state: &mut Option<RecurrentState>| {
-            let state = state.get_or_insert_with(|| block.zero_state());
-            block.forward_rows(normed, rows, state, eps)
-        };
+        let out = self.mamba2_state_step(layer_idx, layer, normed, rows, kv.recurrent_slot());
         match kv {
             KvStep::Decode(cache) | KvStep::Batched(cache) => {
-                let out = run(&mut cache.recurrent);
                 cache
                     .advance_len(rows)
                     .expect("unbounded/planned KvCache growth is infallible");
-                out
             }
             KvStep::Paged { cache, stores } => {
-                let out = run(&mut cache.recurrent);
                 let mut store = stores.write(layer_idx);
                 for _ in 0..rows {
                     cache
                         .push(&mut store, &[], &[])
                         .expect("every caller reserves this row's pages before the stack runs");
                 }
-                out
+            }
+        }
+        out
+    }
+
+    /// The Mamba-2 arithmetic over `rows` rows of ONE sequence, on the
+    /// state in `slot`, created at this layer's size on the sequence's
+    /// first token (zeros, as `build_rs` zeroes a new sequence's). Counts
+    /// no positions: the zero-KV arm above does that, and the parallel
+    /// arm ([`Self::add_parallel_ssm`]) leaves it to attention.
+    pub(crate) fn mamba2_state_step(
+        &self,
+        layer_idx: usize,
+        layer: &LayerWeights,
+        normed: &[f32],
+        rows: usize,
+        slot: &mut Option<RecurrentState>,
+    ) -> Vec<f32> {
+        let block =
+            layer.attn.mamba2.as_ref().unwrap_or_else(|| {
+                panic!("layer {layer_idx} runs a Mamba-2 block but has no weights")
+            });
+        let state = slot.get_or_insert_with(|| block.zero_state());
+        block.forward_rows(normed, rows, state, self.config.rms_norm_eps)
+    }
+
+    /// `falcon-h1.cpp:156-158`: on an attention layer that ALSO runs the
+    /// Mamba-2 block (`crate::mamba2::PARALLEL_WITH_ATTENTION`), the
+    /// block's output over the same `normed` rows attention reads, or
+    /// `None` for a layer without the block. Run BEFORE the attention
+    /// push so the two never disagree about which token the state saw;
+    /// [`Self::add_parallel_ssm`] sums it into the attention branch.
+    /// ONE pair for the row body and both batched bodies.
+    pub(crate) fn parallel_ssm_rows(
+        &self,
+        layer_idx: usize,
+        layer: &LayerWeights,
+        normed: &[f32],
+        rows: usize,
+        slot: &mut Option<RecurrentState>,
+    ) -> Option<Vec<f32>> {
+        if layer.attn.mamba2.is_none()
+            || self.config.layer_shape(layer_idx).attention.is_recurrent()
+        {
+            return None;
+        }
+        Some(self.mamba2_state_step(layer_idx, layer, normed, rows, slot))
+    }
+
+    /// `falcon-h1.cpp:160`: `attn_out + ssm_out`, before the one residual
+    /// add. A no-op for `None`.
+    pub(crate) fn add_parallel_ssm(projected: &mut [f32], ssm: Option<Vec<f32>>) {
+        if let Some(ssm) = ssm {
+            assert_eq!(ssm.len(), projected.len());
+            for (p, s) in projected.iter_mut().zip(&ssm) {
+                *p += s;
             }
         }
     }

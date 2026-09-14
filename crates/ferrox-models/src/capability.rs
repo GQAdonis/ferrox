@@ -1098,6 +1098,16 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // as the dense ungated FFN's is. `moe_latent_size` (Nemotron-3
     // Super) is refused by name.
     "nemotron_h_moe",
+    // tests/falcon_h1_graphs.rs: `falcon-h1` (Falcon-H1 0.5B to 34B).
+    // Attention and the Mamba-2 block IN PARALLEL on every layer, both
+    // reading `attn_norm(x)`, summed before the one residual add
+    // (`falcon-h1.cpp:137-161`); NEOX RoPE; `ssm_norm` optional (`:70`);
+    // `attn_output.bias` created and never read (`:76,154`,
+    // `crate::unread_tensors`); `ffn_norm` under the two-argument
+    // `LLM_TN` spelling (`:80`, no `.weight`). Every multiplier is folded
+    // into the weights by the converter. Three fixtures: plain, without
+    // `ssm_norm`, a separate `output.weight`.
+    "falcon-h1",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1842,6 +1852,22 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 WholeVector,
             ));
         }
+        // Falcon-H1 (`falcon-h1`: 0.5B / 1.5B / 3B / 7B / 34B): attention
+        // AND the Mamba-2 block on EVERY layer, in parallel on the same
+        // `attn_norm` output, summed before the residual
+        // (`falcon-h1.cpp:137-161`; `crate::mamba2::
+        // PARALLEL_WITH_ATTENTION`, `ModelConfig::parallel_ssm`). NEOX
+        // RoPE (llama-model.cpp:2615). Audited on
+        // tests/falcon_h1_graphs.rs.
+        v.push(prof(
+            "falcon-h1",
+            TextGeneration,
+            DecoderFamily::Hybrid,
+            MemoryKind::Hybrid,
+            Neox,
+            ArchPath::GenericGqa { rope: Neox },
+            WholeVector,
+        ));
         // OLMo-1 was NEW CODE in `NORM_ROPE_TRIAGED` on its
         // non-parametric LayerNorm, which `crate::norm::NormOp` now
         // implements (`tests/olmo_graphs.rs`). NORM RoPE:
@@ -2478,7 +2504,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         ));
         for (n, rope) in [
             ("jamba", Neox),
-            ("falcon-h1", Neox),
             ("plamo2", Neox),
             ("qwen3next", Neox),
             ("qwen35", Neox),

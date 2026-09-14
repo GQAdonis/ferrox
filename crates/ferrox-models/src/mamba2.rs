@@ -49,6 +49,22 @@
 //! loaded.
 
 use ferrox_core::mamba2::{conv_step, scan_step, ScanDims};
+
+/// Architectures that run the Mamba-2 block IN PARALLEL with attention
+/// on every layer, both reading the same `attn_norm` output, the two
+/// outputs summed before the residual add: `falcon-h1.cpp:137-161`
+/// (`:12` marks every layer recurrent AND every layer has heads). One
+/// graph of 140 (measured: the other three `build_mamba2_layer` callers
+/// branch on the layer kind). Such a layer is `AttnShape::Gqa` with
+/// `AttnWeights::mamba2` set, and the block keeps its state on the
+/// same cache the attention rows live in without counting positions
+/// (attention counts them).
+pub const PARALLEL_WITH_ATTENTION: &[&str] = &["falcon-h1"];
+
+/// True when every attention layer of `arch` also runs the block.
+pub fn parallel_with_attention(arch: &str) -> bool {
+    PARALLEL_WITH_ATTENTION.contains(&arch)
+}
 use ferrox_core::recurrent_state::RecurrentState;
 use ferrox_core::weight_matrix::WeightMatrix;
 use ferrox_gguf::TensorSource;

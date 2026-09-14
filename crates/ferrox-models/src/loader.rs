@@ -1389,6 +1389,7 @@ impl ModelConfig {
             n_mtp_blocks: trunk.n_mtp_blocks,
             layer_loops,
             skip_stream: crate::skip_stream::has_skip_stream(&arch),
+            parallel_ssm: crate::mamba2::parallel_with_attention(&arch),
             hidden_dim,
             n_heads,
             n_kv_heads,
@@ -2690,7 +2691,19 @@ impl Decoder {
                             config.hidden_dim,
                         )?,
                         shortconv: None,
-                        mamba2: None,
+                        // falcon-h1.cpp:55-71: the Mamba-2 block beside
+                        // attention on every layer (`crate::mamba2::
+                        // PARALLEL_WITH_ATTENTION`).
+                        mamba2: if config.parallel_ssm {
+                            Some(crate::mamba2::Mamba2::load(
+                                &file,
+                                &arch,
+                                l,
+                                config.hidden_dim,
+                            )?)
+                        } else {
+                            None
+                        },
                     };
                     crate::layer_shapes::check_gqa_projection_widths(
                         l,

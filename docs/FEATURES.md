@@ -110,6 +110,19 @@ is faster.
   `_scale` read from the file, plus an ungated ReLU-squared shared
   expert (KL 3.6e-13). Its latent variant (`moe_latent_size`,
   Nemotron-3 Super) is refused by name.
+- **Falcon-H1** (`falcon-h1`: 0.5B / 1.5B / 3B / 7B / 34B), audited
+  against libllama on 2026-09-14 (`tests/falcon_h1_graphs.rs`, KL
+  1.3e-13 / 6.2e-13 / 3.2e-13). Attention AND the Mamba-2 block on
+  every layer, in parallel on the same `attn_norm` output, summed
+  before the residual (`falcon-h1.cpp:137-161`;
+  `ferrox_models::mamba2::PARALLEL_WITH_ATTENTION`,
+  `ModelConfig::parallel_ssm`): the layer's cache holds the attention
+  rows and the block's state, attention counts the positions, and
+  `Decoder::parallel_ssm_rows` / `add_parallel_ssm` are the one pair
+  the row body and both batched bodies call. `attn_output.bias` is
+  created and never read upstream (`crate::unread_tensors`); `ffn_norm`
+  is stored without `.weight` (the two-argument `LLM_TN`, measured:
+  libllama refuses the `.weight` spelling).
 - **openPangu-Embedded** (`pangu-embedded`: 1B / 7B), audited against
   libllama on 2026-09-14 (`tests/pangu_embedded_graphs.rs`, KL 1.5e-13).
   A decoder LLM ("Embedded" as in edge devices) that had been filed as

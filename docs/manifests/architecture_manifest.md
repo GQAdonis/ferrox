@@ -39,6 +39,8 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `phi2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `cohere2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `phimoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `gpt2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `starcoder` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `olmoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `qwen2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `qwen2moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
@@ -68,12 +70,10 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `talkie` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `glm4moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `grovemoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `gpt2` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `mpt` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `refact` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `bloom` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `jais` | TextGeneration | StandardGqa | KvGqa | dedicated |
-| `starcoder` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `qwen3` | TextGeneration | Qwen3Family | KvGqa | generic-gqa |
 | `qwen3moe` | TextGeneration | Qwen3Family | KvGqa | generic-gqa |
 | `gemma` | TextGeneration | GemmaFamily | KvGqa | generic-gqa |

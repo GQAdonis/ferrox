@@ -1399,6 +1399,7 @@ impl ModelConfig {
             parallel_residual: crate::parallel_residual::model_has_parallel_layer(
                 file, &arch, n_layers,
             ),
+            learned_positions: crate::position_embd::learned_positions(&arch),
             attn_value_scale: crate::attn_value_scale::resolve_attn_value_scale(
                 &arch,
                 file.metadata_f32(&key("attention.value_scale")),
@@ -2498,6 +2499,14 @@ impl Decoder {
         // dequantizes one row via `WeightMatrix::dequant_row`, instead
         // of the whole vocabulary tensor being widened to f32 up front.
         let embedding = load_weight_matrix(&file, "token_embd.weight")?;
+        // The learned position table (`crate::position_embd`), one row
+        // per trained position, for the graphs that add one.
+        let position_embd = crate::position_embd::load_position_embd(
+            &file,
+            &arch,
+            config.hidden_dim,
+            metadata_u64_any(&file, &[format!("{arch}.context_length")]).map(|v| v as usize),
+        )?;
 
         // PHYSICAL layers: the blocks the file holds tensors for. A
         // looped model (`crate::layer_loops`) has more logical layers
@@ -3065,6 +3074,7 @@ impl Decoder {
         let decoder = Decoder {
             config,
             embedding,
+            position_embd,
             layers,
             final_norm,
             output_head,
@@ -3924,16 +3934,17 @@ mod tests {
 
     /// A NAMED problem must outrank "unaudited".
     ///
-    /// `gpt2` uses learned absolute position embeddings, and that is
-    /// what its refusal should say. Reporting "unaudited" instead would
-    /// be true and far less useful, and it is the ordering the loader's
-    /// own comment claims. Nothing checked that claim.
+    /// `bloom` uses ALiBi, and that is what its refusal should say.
+    /// Reporting "unaudited" instead would be true and far less useful,
+    /// and it is the ordering the loader's own comment claims. Nothing
+    /// checked that claim. (`gpt2` was the example until its learned
+    /// positions were served, `crate::position_embd`.)
     #[test]
     fn a_named_refusal_outranks_the_unaudited_one() {
-        let err = config_for_arch("gpt2").expect_err("gpt2 must refuse");
+        let err = config_for_arch("bloom").expect_err("bloom must refuse");
         assert!(
             !matches!(err, LoadError::UnauditedArchitecture(..)),
-            "gpt2 should report its own reason, not that nobody audited it: {err:?}"
+            "bloom should report its own reason, not that nobody audited it: {err:?}"
         );
     }
 
@@ -4998,9 +5009,14 @@ mod tests {
     /// no tensor the generic loader fails to consume, so
     /// `assert_every_tensor_consumed` sees nothing either. It would have
     /// loaded, run at full speed, and answered from rotated positions.
+    ///
+    /// `gpt2` left this list on 2026-09-14: its learned positions are
+    /// served (`crate::position_embd`) and it rotates nothing
+    /// (`rope_layers::RopeLayers::Never`), which is what the finding
+    /// asked for; `tests/position_embd_graphs.rs` is its evidence.
     #[test]
     fn an_architecture_with_no_rope_is_refused_by_name() {
-        for arch in ["gpt2", "mpt", "refact", "bloom", "jais"] {
+        for arch in ["mpt", "refact", "bloom", "jais"] {
             let file = open_metadata_gguf(
                 &format!("norope_{arch}"),
                 &[("general.architecture", Kv::Str(arch))],

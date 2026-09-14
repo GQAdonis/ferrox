@@ -86,6 +86,14 @@ pub enum RopeLayers {
     /// Every layer rotates: llama.cpp writes no gate at all.
     #[default]
     All,
+    /// NO layer rotates: the graph calls no `ggml_rope` at all and the
+    /// position enters some other way. `gpt2` and `starcoder` add a
+    /// learned table to the embeddings (`crate::position_embd`);
+    /// `llama_model_rope_type` answers `LLAMA_ROPE_TYPE_NONE` for the
+    /// first and NORM for the second, and neither graph reads the answer.
+    /// Not `SlidingOnly` with nothing sliding: that spelling would rotate
+    /// the day such a file declared a window.
+    Never,
     /// Only the SLIDING-WINDOW layers rotate; the full-attention layers
     /// get no rotation. `exaone4` (when its SWA is on) and `exaone-moe`.
     ///
@@ -119,6 +127,7 @@ impl RopeLayers {
     pub fn rotates(self, layer_idx: usize, layer_slides: bool) -> bool {
         match self {
             Self::All => true,
+            Self::Never => false,
             Self::SlidingOnly => layer_slides,
             Self::NoRopeEvery { step, phase } => {
                 let step = step.get();
@@ -200,6 +209,10 @@ pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> Rop
         // variant this enum does not have; that row is on no engine and
         // its arm comes with it.
         "cohere2" => RopeLayers::SlidingOnly,
+        // `gpt2.cpp` and `starcoder.cpp` call no `ggml_rope`: a learned
+        // position table is added to the embeddings instead
+        // (`crate::position_embd`).
+        "gpt2" | "starcoder" => RopeLayers::Never,
         // `smollm3.cpp:5` assigns the step unconditionally, so this is
         // every SmolLM3 file: 9 of a 36-layer SmolLM3-3B's layers get no
         // rotation.

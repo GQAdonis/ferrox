@@ -182,10 +182,12 @@ The error always names the reason. Six things cause it:
    the first census had missed (`tests/cohere2_graphs.rs`, KL 1.0e-14).
 
 5. **The architecture encodes position some other way than RoPE.** The
-   generic decoder rotates every Q and K head of every layer. `gpt2`
-   uses a learned absolute position table instead; `mpt`, `refact`,
-   `bloom` and `jais` use ALiBi. All five stop with the reason named.
-   This is the least visible failure of the five: `bloom` and `refact`
+   generic decoder rotates every Q and K head of every layer unless
+   `rope_layers` says otherwise. `gpt2` and `starcoder` use a learned
+   absolute position table instead, and run since 2026-09-14
+   (`ferrox_models::position_embd`, `RopeLayers::Never`); `mpt`,
+   `refact`, `bloom` and `jais` use ALiBi and stop with the reason
+   named. This is the least visible failure: `bloom` and `refact`
    hardcode their ALiBi slope in llama.cpp's own loader and carry no
    GGUF key at all, and `mpt` leaves no unread tensor behind, so neither
    check 3 nor check 4 could ever see them. `baichuan` is the same
@@ -198,7 +200,7 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; **69** do
+   logit comparison against real `libllama`, or a fixture; **71** do
    today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
    `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
    `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
@@ -209,8 +211,8 @@ The error always names the reason. Six things cause it:
    `mistral3`, `smallthinker`, `bitnet`, `mimo2`, `nanbeige`, `talkie`,
    `arctic`, `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`,
    `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`,
-   `falcon`, `phi2`, `cohere2`, `phimoe`, `gemma`, `gemma2`, `gemma3`,
-   `phi3`, `gpt-oss`, `dots1`).
+   `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `gemma`,
+   `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`).
    The other **2** stop with `UnauditedArchitecture`. (`plm` is not in
    the 54 and not in the 2: it runs on the MLA engine, `DedicatedOnly`,
    with its own golden.)
@@ -1179,8 +1181,9 @@ name, as libllama refuses it (`wrong number of tensors; expected 21, got
 |---|---|
 | Per-layer head counts or FFN width | CLOSED (`ferrox_models::layer_shapes`): `deci`, `openelm`, `laguna`, `step35` and `mimo2` run on it |
 | A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | CLOSED: `olmo`, `olmo2`, `exaone4`, `dbrx`, `bitnet` and `talkie` were all here; `bitnet`'s two INNER norms are `ferrox_models::sub_norms`, `talkie`'s weightless RMS is `NormOp::RmsNoParams` and its skip stream `ferrox_models::skip_stream`; the LayerNorm WITH a bias is `NormOp::LayerNormBias`, on which `orion` and `nemotron` closed (`tests/biased_layer_norm_graphs.rs`) |
-| Required `attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` with no slot on the dense path | CLOSED (`ferrox_models::proj_bias`): `starcoder2`, `codeshell` and `jais2` run on it, a `llama` file with the optional biases runs where it was refused as unread, and gpt-oss's `o_bias` moved onto the same slot; `output.bias` on the LM head is a slot too (`proj_bias::OUTPUT_BIAS_CREATORS`; `phi2` runs on it); `phimoe` runs on both slots; `starcoder` (learned positions) still refuses for the rest |
-| LayerNorm rather than RMSNorm | CLOSED for the weightless (`olmo`), weighted (`dbrx`, `command-r`, `cohere2`) and biased (`orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `falcon`, `phi2`) forms, and for the biased RMSNorm (`phimoe`, `NormOp::RmsBias`); `starcoder` still refuses for more than the norm |
+| Required `attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` with no slot on the dense path | CLOSED (`ferrox_models::proj_bias`): `starcoder2`, `codeshell` and `jais2` run on it, a `llama` file with the optional biases runs where it was refused as unread, and gpt-oss's `o_bias` moved onto the same slot; `output.bias` on the LM head is a slot too (`proj_bias::OUTPUT_BIAS_CREATORS`; `phi2` runs on it); `phimoe` runs on both slots and `starcoder` on the same tables with its learned positions; the group is empty |
+| LayerNorm rather than RMSNorm | CLOSED for the weightless (`olmo`), weighted (`dbrx`, `command-r`, `cohere2`) and biased (`orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `falcon`, `phi2`, `gpt2`, `starcoder`) forms, and for the biased RMSNorm (`phimoe`, `NormOp::RmsBias`) |
+| A learned absolute position table added to the embeddings, no rotation | CLOSED (`ferrox_models::position_embd`, `rope_layers::RopeLayers::Never`): `gpt2` and `starcoder` run on it; `mpt`'s optional table is recorded and the row still refuses for its ALiBi |
 | A parallel residual, `x + attn(norm(x)) + ffn(norm(x))` | CLOSED (`ferrox_models::parallel_residual`): `gptneox` (Pythia; two norms under `use_parallel_residual`, both values matched) and `plamo` (one shared norm) run on it, and the `stablelm` layer without `ffn_norm` matches where it was refused; eight of 140 graphs build the shape in two spellings and the table names each with its deciding rule; `command-r` (Command-R 35B, Aya-23) followed on it with the weighted LayerNorm and its `logit_scale` multiply; `falcon` runs on both arms, Falcon-40B's `attn_norm_2` crossing the two pre-norm slots per layer (`norm_sites::ATTN_NORM_2_FEEDS_ATTENTION`); `phi2` runs on it with the `output.bias` slot (`Decoder::output_bias`); `cohere2` (Command-R7B) runs on it with its sliding-only rotation (`rope_layers::SlidingOnly`); `cohere2moe` still refuses for its experts and MTP block |
 | A per-head LayerNorm on Q and K with a distinct weight per head (`{n_embd_head_k, n_head}`, `LLM_NORM`) | REFUSED by name (`ferrox_models::qk_layer_norm`), from a `stablelm` fixture libllama runs (8.73); `stablelm` (12B), `command-r` (64 layers), `chameleon` build it |
 | Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | CLOSED for seven of eight (`ferrox_models::rope_layers`; the first census counted six, `cohere2` and `cohere2moe` spell the gate `if (is_swa)`): `exaone-moe`, `smollm3`, EXAONE-4 32B, `afmoe`, `smallthinker` and `cohere2` run on it; `cohere2moe`'s `|| il < n_layer_dense_lead` variant comes with that row |

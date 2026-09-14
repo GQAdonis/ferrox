@@ -182,6 +182,22 @@ is faster.
   metadata as for `phi3` (libllama `n_swa = 0`, measured, and the
   table said the opposite until this row). `tests/phimoe_graphs.rs`:
   KL 1.9e-11 (LongRoPE) and 1.9e-12 (plain) at the `orion` line.
+- **GPT-2 (`gpt2`) and StarCoder / SantaCoder (`starcoder`) run: the
+  learned position table.** `position_embd.weight` `{n_embd,
+  n_ctx_train}` is gathered at the position and ADDED to the token
+  embedding before layer 0 (`gpt2.cpp:19,74-77`), and the graph calls
+  no `ggml_rope`: `ferrox_models::position_embd` (three graphs of 140
+  create the tensor on the generic path, `mpt`'s optional beside its
+  ALiBi) adds row `pos` at the one embedding site, and
+  `rope_layers::RopeLayers::Never` is the rule that rotates nothing (not
+  `SlidingOnly` with no window, which would rotate the day a file
+  declared one). Every fused Metal launch is fenced off such a model;
+  the GPU embedding gather has no add. The two graphs are one: the
+  biased LayerNorm, a fused `attn_qkv` with bias, the required
+  projection biases, the ungated GELU; StarCoder is multi-query.
+  `tests/position_embd_graphs.rs`: KL 1.9e-7 each at the f16 GELU-table
+  line; dropping the table or rotating the layers diverges by more
+  than 1.
 - **The LayerNorm with a bias, and with it Orion-14B (`orion`) and
   Nemotron-4 / Minitron (`nemotron`).** `NormOp::LayerNormBias` is
   `build_norm(x, w, b, LLM_NORM)`, the variant the eight-row

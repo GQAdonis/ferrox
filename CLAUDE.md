@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **69** architectures run with
+Honest position, re-audited 2026-09-14. **71** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -830,6 +830,29 @@ pair in use, attn factor 1.0955) and 1.9e-12 (plain), at the `orion`
 line for the same reason (`tests/phimoe_graphs.rs`). The loader's
 norm-function census listed two of five function lists; it lists all
 five now.
+
+`gpt2` and `starcoder` closed together on `ferrox-models/src/
+position_embd.rs`, and they are ONE graph read side by side (`diff
+gpt2.cpp starcoder.cpp` is a size table and `head_count_kv 1`): the
+`gptneox` sequential layer with a learned `position_embd.weight`
+`{n_embd, n_ctx_train}` gathered at `inp_pos` and ADDED to the token
+embedding before layer 0 (`gpt2.cpp:19,74-77`), and no `ggml_rope`
+anywhere. Reach measured over the 140: three generic-path graphs
+create the tensor (`mpt`'s OPTIONAL beside its ALiBi, recorded), four
+encoders. The seam is two facts: the table added at the ONE embedding
+site (`Decoder::embed_token` takes `pos` now, so no caller can embed
+without saying where), and `rope_layers::RopeLayers::Never`, a rule
+that rotates nothing -- deliberately NOT `SlidingOnly` with no window,
+which would start rotating the day such a file declared one. The
+`LLAMA_NO_ROPE` test that had pinned `gpt2` off the generic path pins
+it on it now under exactly that rule, and the four ALiBi rows stay
+where they were. Every fused Metal launch is fenced off a model with a
+table, because the GPU embedding gather has no add. KL 1.9e-7 each at
+the f16 GELU-table line (`tests/position_embd_graphs.rs`); dropping
+the table or rotating every layer -- what the generic path used to do
+to GPT-2 -- diverges by more than 1. The "LayerNorm-with-bias group"
+of `tests/attn_bias.rs` is EMPTY: nine rows, nine closures, each by the
+dropped bias being implemented rather than the row being edited.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

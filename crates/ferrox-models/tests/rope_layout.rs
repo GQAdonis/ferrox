@@ -282,6 +282,15 @@ fn a_ferrox_only_name_on_the_generic_path_is_declared() {
         if known.contains_key(p.gguf_name) || DECLARED.contains(&p.gguf_name) {
             continue;
         }
+        // A `LLAMA_ROPE_TYPE_NONE` row on the generic path rotates
+        // nothing (`gpt2`, `ferrox_models::position_embd`); the layout
+        // it carries is a filler, and `no_rope_architectures_never_
+        // reach_a_rotating_path` below is the test that pins that.
+        if ferrox_models::rope_layers::rope_layers(p.gguf_name, 12, false)
+            == ferrox_models::rope_layers::RopeLayers::Never
+        {
+            continue;
+        }
         undeclared.push(format!("{}: ferrox rotates it as {rope:?}", p.gguf_name));
     }
     assert!(
@@ -311,8 +320,16 @@ fn no_rope_architectures_never_reach_a_rotating_path() {
             continue;
         };
         // `TestFixture` is not in this group and would be a mistake here.
+        // A generic-path row is admissible ONLY under the rule that
+        // rotates nothing (`gpt2`: a learned position table,
+        // `ferrox_models::position_embd`); its layout is then a filler
+        // no rotation site reads.
         if let ArchPath::GenericGqa { rope } | ArchPath::TestFixture { rope } = p.path {
-            rotated.push(format!("{name}: ferrox rotates it as {rope:?}"));
+            if ferrox_models::rope_layers::rope_layers(name, 12, false)
+                != ferrox_models::rope_layers::RopeLayers::Never
+            {
+                rotated.push(format!("{name}: ferrox rotates it as {rope:?}"));
+            }
         }
     }
     assert!(

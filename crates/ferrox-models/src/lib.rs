@@ -77,6 +77,7 @@ pub mod parallel_dense_ffn;
 pub mod parallel_residual;
 pub mod penalty_window;
 pub mod pooling;
+pub mod position_embd;
 pub mod prefix_cache;
 pub mod proj_bias;
 pub mod qk_layer_norm;

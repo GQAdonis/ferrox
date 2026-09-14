@@ -434,6 +434,12 @@ pub struct ModelConfig {
     /// reads, because every fused Metal launch bakes the pre-FFN norm
     /// over the post-attention residual into its kernel.
     pub parallel_residual: bool,
+    /// Whether this model adds a learned position table to its token
+    /// embeddings (`crate::position_embd`; `gpt2`, `starcoder`). The
+    /// table itself is `Decoder::position_embd`; this is the model-level
+    /// fact `Decoder::metal_can_serve_model` reads, because the GPU
+    /// embedding gather has no add and the fused stacks never see `pos`.
+    pub learned_positions: bool,
     /// `{arch}.attention.value_scale`: MiMo-V2 multiplies the attention
     /// branch by it AFTER `wo` (`mimo2.cpp:180-183`; every real export
     /// carries `0.707`). `None` for no scale; see
@@ -970,6 +976,7 @@ pub fn glm_5_2() -> ModelConfig {
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
         parallel_residual: false,
+        learned_positions: false,
         attn_value_scale: None,
         layer_loops: None,
         skip_stream: false,
@@ -1063,6 +1070,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
         parallel_residual: false,
+        learned_positions: false,
         attn_value_scale: None,
         layer_loops: None,
         skip_stream: false,
@@ -1188,6 +1196,7 @@ pub fn kimi_k3() -> ModelConfig {
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
         parallel_residual: false,
+        learned_positions: false,
         attn_value_scale: None,
         layer_loops: None,
         skip_stream: false,
@@ -1259,6 +1268,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
         parallel_residual: false,
+        learned_positions: false,
         attn_value_scale: None,
         layer_loops: None,
         skip_stream: false,
@@ -1325,6 +1335,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
         parallel_residual: false,
+        learned_positions: false,
         attn_value_scale: None,
         layer_loops: None,
         skip_stream: false,
@@ -1394,6 +1405,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
         parallel_residual: false,
+        learned_positions: false,
         attn_value_scale: None,
         layer_loops: None,
         skip_stream: false,

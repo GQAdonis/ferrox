@@ -17,6 +17,24 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`gpt2` and `starcoder` run: the learned position table.**
+  `ferrox_models::position_embd` adds `position_embd.weight`'s row
+  `pos` to the token embedding at the one embedding site
+  (`Decoder::embed_token` takes the position now; `gpt2.cpp:19,74-77`,
+  `starcoder.cpp:19,75-78`), and `rope_layers::RopeLayers::Never` is
+  the rule that rotates nothing, the `LLAMA_ROPE_TYPE_NONE` group as a
+  value rather than a refusal. Three graphs of 140 create the tensor on
+  the generic path (`gpt2`, `starcoder` REQUIRED; `mpt` optional,
+  still refused for its ALiBi). The two graphs are one: the biased
+  LayerNorm, a fused `attn_qkv` with bias, REQUIRED `attn_output` / FFN
+  biases with the ungated GELU, `output` tied when absent; StarCoder
+  is multi-query. Every fused Metal launch is fenced off a
+  learned-position model (the GPU gather has no add), and a position
+  past the table is refused rather than clamped.
+  `tests/position_embd_graphs.rs`: KL 1.85e-7 (gpt2) and 1.89e-7
+  (starcoder) at the f16 GELU-table line; dropping the table or
+  rotating the layers diverges by more than 1. The bias group of
+  `tests/attn_bias.rs` is empty. 71 audited.
 - **`phimoe` runs: Phi-3.5-MoE.** `phi3`'s graph (`models.h:632`) on
   `phimoe.cpp`'s tensors, which differ from a Phi-3 file in biases
   only: an RMSNorm WITH a bias at every norm site (`phi3.cpp:99-102,

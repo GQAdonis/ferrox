@@ -426,25 +426,12 @@ fn an_architecture_whose_required_bias_ferrox_drops_is_not_on_the_generic_path()
     );
 }
 
-/// The refusals added for this reason must keep saying so.
-///
-/// A refusal whose reason drifts to something else is a refusal nobody
-/// can act on, and it would let the arch back onto the generic path the
-/// moment that other reason is fixed.
-#[test]
-fn the_bias_refusals_name_the_bias() {
-    // `nemotron`, `orion`, `codeshell`, `jais2`, `starcoder2`,
-    // `stablelm` and `phimoe` were here; their biases are applied now.
-    for arch in ["starcoder"] {
-        match resolve_profile(arch).map(|p| p.path) {
-            Some(ArchPath::DedicatedOnly { reason }) => assert!(
-                reason.contains("bias"),
-                "{arch} is refused, but not for its biases: {reason}"
-            ),
-            other => panic!("{arch} must be refused for its required biases, got {other:?}"),
-        }
-    }
-}
+// The test that pinned "the refusals added for this reason keep saying
+// so" has no rows left: `nemotron`, `orion`, `codeshell`, `jais2`,
+// `starcoder2`, `stablelm`, `phimoe` and `starcoder` each left by having
+// the dropped bias implemented, which is what
+// `an_architecture_whose_required_bias_ferrox_drops_is_not_on_the_generic_path`
+// checks for every row above.
 
 /// The transcription itself must not silently shrink, and every name in
 /// it has to resolve or the test above compares nothing.

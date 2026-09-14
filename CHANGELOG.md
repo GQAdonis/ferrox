@@ -17,6 +17,22 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`cohere2` runs: Command-R7B and Command-A.** `command-r`'s graph
+  with a REQUIRED sliding window whose SLIDING layers alone are rotated
+  (`cohere2.cpp:72,91`, `if (is_swa)` around `ggml_rope_ext`): that is
+  `rope_layers::RopeLayers::SlidingOnly`, the `exaone-moe` rule, which
+  the module's census had missed by grepping for `use_rope`; the
+  census is eight graphs now (`cohere2moe`'s `|| il <
+  n_layer_dense_lead` variant recorded, no arm yet). Also: the third
+  `WEIGHTED_LAYER_NORM` row, `MultiplierSupport::COHERE2` (`logit_scale`
+  REQUIRED, multiplied), and `swa_geometry::window_required`: a
+  `cohere2` or `exaone-moe` file without `attention.sliding_window` is
+  refused by name, as libllama refuses it (`key not found`, measured),
+  where it would have run with no layer rotated.
+  `tests/cohere2_graphs.rs`: KL 1.03e-14 (seeded period 4, window 3
+  inside the prompt), 8.95e-14 with `sliding_window_pattern = 2`
+  (libllama's goldens differ by 0.36, so the scalar key is live);
+  rotating the full layer diverges. 68 audited.
 - **`phi2` runs: Phi-2 and Phi-1.5; the LM head has a bias slot.**
   `output.bias` (`phi2.cpp:22,136`, REQUIRED) is `Decoder::output_bias`,
   read by `proj_bias::load_output_bias` for the three graphs of 140

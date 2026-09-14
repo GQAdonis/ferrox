@@ -60,16 +60,16 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **67** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **68** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`; `deepseek2` in both tensor forms, `tests/deepseek2_graphs.rs`; the real PLM-1.8B through `ferrox parity`), `Gemma4` has it on the real Gemma-4-E2B (parity MATCH, KL 5.1e-4 on Q4_K_M, against a libllama that has `gemma4.cpp`), `Glm52` and `Kimi` none |
 | Refuses as **unaudited**, now triaged | 2 |
-| Off the generic path: refuses by name, or reaches one of those 4 engines | 78 (46 `dedicated` + 32 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon` and `phi2` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
+| Off the generic path: refuses by name, or reaches one of those 4 engines | 77 (45 `dedicated` + 32 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2` and `cohere2` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 69 generic-gqa (67 of
-them audited), 46 dedicated, 32 deferred, 3 test fixtures.
+regenerated with `ferrox archs --write`: 150 rows, 70 generic-gqa (68 of
+them audited), 45 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
 opt-in: an architecture not on the audited list stops rather than
@@ -219,9 +219,17 @@ per layer, `tests/falcon_graphs.rs`). `phi2` followed on 2026-09-14
 on ONE slot, `output.bias` on the LM head (`Decoder::output_bias`,
 `proj_bias::OUTPUT_BIAS_CREATORS`: three graphs of 140), added in the
 one place the head's post-projection transforms run and fenced off the
-fused argmax stacks (`tests/phi2_graphs.rs`). `cohere2` and
-`cohere2moe` stay refused, each naming what it needs on top: a
-rotation on the sliding layers only; experts and an MTP block.
+fused argmax stacks (`tests/phi2_graphs.rs`). `cohere2` (Command-R7B)
+followed the same day, and it is a census correction: its "rotation on
+the sliding layers only" is `rope_layers::SlidingOnly`, the rule
+`exaone-moe` had closed on, which the module's census of six had
+missed because it grepped for `use_rope` and `cohere2.cpp:91` spells
+the gate `if (is_swa)` (`tests/cohere2_graphs.rs`, KL 1.0e-14; the
+window key REQUIRED upstream is refused when absent, measured against
+libllama's own refusal). `cohere2moe` stays refused for its routed
+experts on the parallel input and its MTP block, and its
+`|| il < n_layer_dense_lead` rotation variant is recorded for when
+that row closes.
 
 `olmo2` and `exaone4` closed TOGETHER, because they are one residual
 topology and not two. Neither has an `attn_norm` or an `ffn_norm`

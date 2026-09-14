@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **67** architectures run with
+Honest position, re-audited 2026-09-14. **68** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -792,8 +792,23 @@ multiplier and the cap because it belongs to the matmul -- and
 cap and the multiplier a bias is not monotone across the vocabulary
 and a folded argmax would be a different token. KL 2.9e-7 at the f16
 GELU-table line, the fused and split QKV spellings on one golden
-(`tests/phi2_graphs.rs`). `cohere2` and `cohere2moe` stay refused with
-what each needs ON TOP of the residual written into the reason.
+(`tests/phi2_graphs.rs`). `cohere2` (Command-R7B, Command-A) followed
+the same day on a CENSUS CORRECTION rather than new code: its refusal
+had named "a rotation on the sliding layers only, the inverse of the
+per-layer RoPE gate", and it is not the inverse, it is the gate --
+`cohere2.cpp:91` is `if (is_swa)` around `ggml_rope_ext`, the
+`exaone-moe` rule `rope_layers` had served since 2026-09-11. The
+module's census of SIX had been made by grepping for the word
+`use_rope`; grepping for `is_swa` beside `ggml_rope_ext` finds eight,
+`cohere2` and `cohere2moe` (whose `|| il < n_layer_dense_lead` is a
+variant the enum does not have yet, recorded). One arm, one
+`WEIGHTED_LAYER_NORM` row, one `MultiplierSupport` row for its
+REQUIRED `logit_scale`, and one refusal for the window key llama.cpp
+REQUIRES (`swa_geometry::window_required`; a fixture without it is
+refused by libllama with `key not found`, measured). KL 1.0e-14
+(`tests/cohere2_graphs.rs`), 8.9e-14 with the scalar pattern key at 2.
+`cohere2moe` stays refused with what it needs ON TOP of the residual
+written into the reason.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

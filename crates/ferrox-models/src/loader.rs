@@ -776,6 +776,20 @@ impl ModelConfig {
                 },
             );
 
+        // A window llama.cpp REQUIRES (`crate::swa_geometry::
+        // window_required`): without it the file does not load upstream,
+        // and here it would run with no layer rotated.
+        if let (None, Some(line)) = (sliding_window, crate::swa_geometry::window_required(&arch)) {
+            return Err(LoadError::UnsupportedFeature(
+                arch.clone(),
+                format!(
+                    "`{arch}.attention.sliding_window` is absent or zero, and llama.cpp reads it \
+                     as a REQUIRED key for this architecture (src/models/{line}); every real \
+                     export writes it, and a file without it does not load upstream"
+                ),
+            ));
+        }
+
         // Three graphs rope their SLIDING layers with the scaling
         // switched off -- freq_scale = 1, ext_factor = 0, attn_factor =
         // 1 -- while the full-attention layers use the model's:

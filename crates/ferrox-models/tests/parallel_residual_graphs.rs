@@ -424,6 +424,7 @@ fn every_generic_path_row_of_the_table_has_a_golden() {
         "command-r",
         "falcon",
         "phi2",
+        "cohere2",
     ];
     for row in PARALLEL_RESIDUAL_GRAPHS {
         let generic = matches!(

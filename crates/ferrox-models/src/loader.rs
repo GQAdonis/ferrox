@@ -130,11 +130,15 @@ const SIGMOID_GATING_ARCHITECTURES: &[&str] =
 /// it guards against. `conversion/mimo.py` writes SIGMOID from
 /// `scoring_func`, so on a real MiMo file the two agree too; the row
 /// exists because the literal is what llama.cpp runs.
-const GATING_LITERAL_ARCHITECTURES: &[(&str, GatingFunction)] =
-    &[("mimo2", GatingFunction::Sigmoid)];
+const GATING_LITERAL_ARCHITECTURES: &[(&str, GatingFunction)] = &[
+    ("mimo2", GatingFunction::Sigmoid),
+    // `nemotron-h.cpp:218`: the SIGMOID literal; the converter writes no
+    // `expert_gating_func` (`conversion/nemotron.py:238-250`).
+    ("nemotron_h_moe", GatingFunction::Sigmoid),
+];
 /// The names alone, for the cross-table test.
 #[cfg(test)]
-const GATING_LITERAL_NAMES: &[&str] = &["mimo2"];
+const GATING_LITERAL_NAMES: &[&str] = &["mimo2", "nemotron_h_moe"];
 
 /// Architectures whose `load_arch_hparams` reads
 /// `{arch}.expert_weights_scale` (`LLM_KV_EXPERT_WEIGHTS_SCALE`) -- and
@@ -161,6 +165,8 @@ const EXPERT_WEIGHTS_SCALE_READERS: &[&str] = &[
     // `glm4-moe.cpp:13-14` read both the scale and the norm.
     "glm4moe",
     "laguna",
+    // `nemotron-h.cpp:19` (`routed_scaling_factor`, 2.5 on Nemotron-3 Nano).
+    "nemotron_h_moe",
     "step35",
 ];
 
@@ -178,6 +184,8 @@ const EXPERT_WEIGHTS_NORM_READERS: &[&str] = &[
     "exaone-moe",
     "glm4moe",
     "laguna",
+    // `nemotron-h.cpp:18` (`norm_topk_prob`).
+    "nemotron_h_moe",
     "step35",
 ];
 
@@ -2711,7 +2719,36 @@ impl Decoder {
             // ik_llama.cpp's source. A model with n_experts<=1
             // globally (the dense test fixture) is dense on every
             // layer either way.
-            let is_dense_layer = config.layer_is_dense(l) || config.moe.n_experts <= 1;
+            // A layer with NO FFN at all (`ffn_dim 0`: deci's, Nemotron-H's
+            // block-only layers) takes the dense arm, whose loader answers
+            // `absent_ffn` for that width, whatever the model's MoE says.
+            let is_dense_layer =
+                config.layer_is_dense(l) || config.moe.n_experts <= 1 || shape.ffn_dim == 0;
+            // The ungated experts (`nemotron-h.cpp:82-86,209-215`: a null
+            // gate into `build_moe_ffn`, `LLM_FFN_RELU_SQR`) are spelled
+            // the way the dense ungated FFN is (`load_dense_expert`): the
+            // gate ALIASED to `up`, so `relu(up)^2` runs through the gated
+            // body with no branch. A file that carries a gate anyway is
+            // refused, as the dense loader refuses one.
+            let routed_gate_name = if config.ffn_is_ungated() && !is_dense_layer {
+                if file
+                    .find_tensor(&format!("blk.{l}.ffn_gate_exps.weight"))
+                    .is_some()
+                {
+                    return Err(LoadError::UnsupportedFeature(
+                        arch.clone(),
+                        format!(
+                            "blk.{l}.ffn_gate_exps.weight is present but this architecture's \
+                             experts are ungated ({:?}: a null gate into build_moe_ffn, \
+                             nemotron-h.cpp:212)",
+                            config.ffn_activation
+                        ),
+                    ));
+                }
+                format!("blk.{l}.ffn_up_exps.weight")
+            } else {
+                format!("blk.{l}.ffn_gate_exps.weight")
+            };
             // The inner FFN norm has a site in the dense body only
             // (`build_ffn` with a NULL down, `bitnet.cpp:127-141`);
             // `build_moe_ffn` has none, so a routed layer that carried
@@ -2738,11 +2775,7 @@ impl Decoder {
                 // enabled; fall back to resident when any of the three
                 // tensors isn't a supported quantized dtype.
                 let stored = if expert_cache_bytes.is_some() {
-                    let g = stored_expert_specs(
-                        &file,
-                        &format!("blk.{l}.ffn_gate_exps.weight"),
-                        n_experts,
-                    )?;
+                    let g = stored_expert_specs(&file, &routed_gate_name, n_experts)?;
                     let u = stored_expert_specs(
                         &file,
                         &format!("blk.{l}.ffn_up_exps.weight"),
@@ -2793,11 +2826,7 @@ impl Decoder {
                         ExpertBacking::Resident(Vec::new())
                     }
                     None => {
-                        let gates = split_expert_tensor(
-                            &file,
-                            &format!("blk.{l}.ffn_gate_exps.weight"),
-                            n_experts,
-                        )?;
+                        let gates = split_expert_tensor(&file, &routed_gate_name, n_experts)?;
                         let ups = split_expert_tensor(
                             &file,
                             &format!("blk.{l}.ffn_up_exps.weight"),
@@ -2825,8 +2854,28 @@ impl Decoder {
 
             let mut shared_experts: Vec<ExpertWeights> =
                 if config.moe.n_shared_experts > 0 && !is_dense_layer {
+                    // The shared expert takes the architecture's dense
+                    // activation, so an ungated one aliases its gate as
+                    // `load_dense_expert` does (`nemotron-h.cpp:222-227`).
+                    let shexp_gate = if config.ffn_is_ungated() {
+                        if file
+                            .find_tensor(&format!("blk.{l}.ffn_gate_shexp.weight"))
+                            .is_some()
+                        {
+                            return Err(LoadError::UnsupportedFeature(
+                                arch.clone(),
+                                format!(
+                                    "blk.{l}.ffn_gate_shexp.weight is present but this \
+                                     architecture's shared expert is ungated"
+                                ),
+                            ));
+                        }
+                        format!("blk.{l}.ffn_up_shexp.weight")
+                    } else {
+                        format!("blk.{l}.ffn_gate_shexp.weight")
+                    };
                     vec![ExpertWeights {
-                        gate: load_weight_matrix(&file, &format!("blk.{l}.ffn_gate_shexp.weight"))?,
+                        gate: load_weight_matrix(&file, &shexp_gate)?,
                         up: load_weight_matrix(&file, &format!("blk.{l}.ffn_up_shexp.weight"))?,
                         down: load_weight_matrix(&file, &format!("blk.{l}.ffn_down_shexp.weight"))?,
                     }]

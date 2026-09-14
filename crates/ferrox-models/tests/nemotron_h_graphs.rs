@@ -23,6 +23,7 @@
 //! | `nemotron_h` | see `report_kl_against_llama_cpp` | |
 //! | `nemotron_h_biases` | (`attn_output.bias`, `ffn_up.bias`, `ffn_down.bias`) | |
 //! | `nemotron_h_output` | (a separate `output.weight`) | |
+//! | `nemotron_h_moe` | (`nemotron_h_moe`: the FFN layer a sigmoid MoE of ungated ReLU-squared experts with the router bias, plus an ungated shared expert) | |
 //!
 //! ```text
 //! PYTHONPATH=$LLAMA/gguf-py python3 scripts/make_nemotron_h_fixture.py \
@@ -41,10 +42,12 @@ use ferrox_models::layer_shapes::AttnShape;
 use ferrox_models::norm::NormOp;
 use ferrox_models::rope_layers::RopeLayers;
 use ferrox_models::Decoder;
+use ferrox_moe::GatingFunction;
 
 const NH: &str = "nemotron_h";
 const NH_BIASES: &str = "nemotron_h_biases";
 const NH_OUTPUT: &str = "nemotron_h_output";
+const NH_MOE: &str = "nemotron_h_moe";
 
 const NH_GOLDEN: [f32; 48] = [
     0.49835235,
@@ -199,6 +202,57 @@ const NH_OUTPUT_GOLDEN: [f32; 48] = [
     -0.6347847,
 ];
 
+const NH_MOE_GOLDEN: [f32; 48] = [
+    -0.08564373,
+    -1.6987907,
+    1.8891659,
+    -1.4673355,
+    0.29491323,
+    0.91232556,
+    -0.8917374,
+    0.025633007,
+    -1.7253807,
+    -0.01343681,
+    0.707696,
+    0.6290622,
+    0.29452106,
+    -3.4463603,
+    -0.27748054,
+    -0.4468344,
+    -1.6725605,
+    0.982375,
+    -1.7984426,
+    0.96634746,
+    2.6736352,
+    -0.88111913,
+    -0.14342129,
+    -1.6324458,
+    0.91854924,
+    1.2190024,
+    -1.8341832,
+    0.47902635,
+    -1.6169864,
+    1.8832711,
+    -3.628996,
+    1.2772206,
+    0.22597688,
+    -1.5320915,
+    -0.7546907,
+    0.52415156,
+    2.734423,
+    -0.40010202,
+    1.4872544,
+    0.3147399,
+    -0.31410587,
+    1.9143537,
+    -0.88486254,
+    0.8757988,
+    0.6030685,
+    -1.2249955,
+    1.2363064,
+    0.4540758,
+];
+
 fn decode(decoder: &Decoder) -> Vec<f32> {
     let mut kv = graph_caches(decoder);
     let mut out = Vec::new();
@@ -234,12 +288,60 @@ fn a_separate_output_weight_matches_llama_cpp() {
     assert_all_three_paths_match(NH_OUTPUT, &NH_OUTPUT_GOLDEN);
 }
 
+/// `nemotron_h_moe` (Nemotron-3 Nano 30B-A3B): the FFN layer is a
+/// sigmoid MoE (`nemotron-h.cpp:206-231`, the gating function a literal,
+/// `expert_weights_norm` / `_scale` from the file, the router bias
+/// required) of UNGATED ReLU-squared experts, plus an ungated
+/// ReLU-squared shared expert added to the routed sum. The fixture
+/// declares `expert_weights_scale 2.5` and `expert_weights_norm true`,
+/// both READ here (unlike `mimo2`'s), so the golden carries both.
+#[test]
+fn nemotron_h_moe_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match(NH_MOE, &NH_MOE_GOLDEN);
+    let d = load_graph_fixture(NH_MOE);
+    assert!(matches!(
+        resolve_architecture("nemotron_h_moe"),
+        Some(ArchPath::GenericGqa { .. })
+    ));
+    assert_eq!(d.config.moe.gating, GatingFunction::Sigmoid);
+    assert!(d.config.moe.norm_topk_prob);
+    assert_eq!(d.config.moe.expert_weights_scale, 2.5);
+    assert_eq!(d.config.moe.n_experts, 4);
+    assert_eq!(d.config.moe.n_shared_experts, 1);
+    assert_eq!(d.config.ffn_activation, FfnActivation::ReluSqr);
+    // The block layers carry no experts; the FFN layer routes with its
+    // bias and its gate is the aliased `up` (no `ffn_gate_exps` in the
+    // file).
+    assert!(d.layers[0].moe.exp_probs_bias.is_none());
+    assert!(d.layers[2].moe.exp_probs_bias.is_some());
+    assert_eq!(d.layers[2].moe.router.rows(), 4);
+    assert_eq!(d.config.layer_shape(2).attention, AttnShape::Absent);
+    assert_eq!(d.config.layer_shape(2).ffn_dim, 16);
+}
+
+/// The routed sum's scale and the shared expert are each visible.
+#[test]
+fn the_moe_seams_are_visible_in_the_logits() {
+    let mut d = load_graph_fixture(NH_MOE);
+    assert_decoder_matches_on_all_three_paths(&d, &NH_MOE_GOLDEN, GRAPH_TOL, "baseline");
+    d.config.moe.expert_weights_scale = 1.0;
+    let worst = worst_vs(&decode(&d), &NH_MOE_GOLDEN);
+    assert!(worst > 1e-2, "expert_weights_scale not seen: {worst}");
+    d.config.moe.expert_weights_scale = 2.5;
+    assert_decoder_matches_on_all_three_paths(&d, &NH_MOE_GOLDEN, GRAPH_TOL, "restored");
+    let saved = std::mem::take(&mut d.layers[2].moe.shared_experts);
+    let worst = worst_vs(&decode(&d), &NH_MOE_GOLDEN);
+    assert!(worst > 1e-2, "the shared expert not seen: {worst}");
+    d.layers[2].moe.shared_experts = saved;
+}
+
 #[test]
 fn report_kl_against_llama_cpp() {
     for (name, golden) in [
         (NH, &NH_GOLDEN),
         (NH_BIASES, &NH_BIASES_GOLDEN),
         (NH_OUTPUT, &NH_OUTPUT_GOLDEN),
+        (NH_MOE, &NH_MOE_GOLDEN),
     ] {
         let out = decode(&load_graph_fixture(name));
         println!(

@@ -93,6 +93,7 @@ pub const ATTN_OUT_BIAS_CREATORS: &[(&str, Presence)] = &[
     ("mistral3", Presence::Optional),
     ("nemotron", Presence::Optional),
     ("nemotron_h", Presence::Optional),
+    ("nemotron_h_moe", Presence::Optional),
     ("pangu-embedded", Presence::Required),
     ("phimoe", Presence::Required),
     ("starcoder", Presence::Required),

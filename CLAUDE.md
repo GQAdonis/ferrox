@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **82** architectures run with
+Honest position, re-audited 2026-09-14. **83** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -1002,8 +1002,17 @@ attention never calls `ggml_rope_ext` (`:181-193`), so the NEOX group
 entry is a filler and `rope_layers` answers `Never`. KL 2.0e-13 /
 1.4e-12 / 7.5e-14 (`tests/nemotron_h_graphs.rs`); pointing the FFN
 slot at `ffn_norm` turns every test red. `nemotron_h_moe`
-(Nemotron-3 Nano 30B-A3B) needs its latent ungated ReLU-squared MoE
-(`:79-90,163-190`) and says so.
+(Nemotron-3 Nano 30B-A3B) closed in the next PR on what the loader
+already had: `load_dense_expert` aliased an ungated FFN's gate to
+`up`, and the routed and shared experts (`:82-89,209-227`, a null
+gate into `build_moe_ffn`) take the same alias, which
+`GluAct::ReluSqr` never reads; the sigmoid literal (`:218`) and the
+two `expert_weights_*` keys (`:18-19`, which Nano's converter writes
+as `norm_topk_prob true` / `routed_scaling_factor 2.5`) are rows in
+the loader's reader tables; a layer with `ffn_dim 0` takes the dense
+arm whatever the model's MoE says, so the block-only layers load no
+experts. `moe_latent_size` (Nemotron-3 Super, `:206-208`) is refused
+by name in `unsupported_feature_keys`. KL 3.6e-13.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

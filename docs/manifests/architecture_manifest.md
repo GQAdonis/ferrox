@@ -22,6 +22,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `granitehybrid` | TextGeneration | Hybrid | Hybrid | generic-gqa |
 | `granite-hybrid` | TextGeneration | Hybrid | Hybrid | generic-gqa |
 | `nemotron_h` | TextGeneration | Hybrid | Hybrid | generic-gqa |
+| `nemotron_h_moe` | TextGeneration | Hybrid | Hybrid | generic-gqa |
 | `olmo` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `smollm3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `arcee` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
@@ -107,7 +108,6 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `jamba` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `falcon-h1` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `plamo2` | TextGeneration | Hybrid | Hybrid | dedicated |
-| `nemotron_h_moe` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `qwen3next` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `qwen35` | TextGeneration | Hybrid | Hybrid | dedicated |
 | `qwen35moe` | TextGeneration | Hybrid | Hybrid | dedicated |

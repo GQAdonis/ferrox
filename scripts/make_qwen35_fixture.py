@@ -37,10 +37,18 @@ Variants:
                      (`qwen35moe.cpp:98-107,496-538`): a softmax MoE with
                      `norm_w = true` and a shared expert whose output is
                      scaled by `sigmoid(ffn_gate_inp_shexp . x)`
+  * `--next`         the `qwen3next` architecture (Qwen3-Next-80B-A3B):
+                     `--moe`'s layers with three differences: V heads
+                     read K heads GROUPED (`h / (n_v / n_k)`,
+                     `qwen3next.cpp:521-539`, `llama-model.cpp:525`), beta
+                     and alpha come from ONE `ssm_ba` projection laid out
+                     `[k_group][beta * ratio, alpha * ratio]`
+                     (`:422-436`), and RoPE is plain NEOX with no sections
+                     (`:282-291`; `llama-model.cpp:2678`)
 
 Usage:
     PYTHONPATH=/path/to/llama.cpp/gguf-py \\
-        python3 scripts/make_qwen35_fixture.py OUT.gguf [--array] [--output] [--moe]
+        python3 scripts/make_qwen35_fixture.py OUT.gguf [--array] [--output] [--moe | --next]
 
 Weights are pseudo-random from a fixed seed so the files are byte-stable.
 The golden logits that go with them are produced by llama.cpp itself
@@ -55,6 +63,7 @@ import gguf
 
 ARCH = "qwen35"
 MOE_ARCH = "qwen35moe"
+NEXT_ARCH = "qwen3next"
 
 N_EMBD = 32
 N_HEAD = 4
@@ -86,13 +95,14 @@ N_FF_EXP = 16
 N_FF_SHEXP = 12
 
 
-def main(out_path: str, as_array: bool, separate_output: bool, moe: bool) -> None:
+def main(out_path: str, as_array: bool, separate_output: bool, moe: bool, nxt: bool) -> None:
     rng = np.random.default_rng(0x9335)
 
     def rnd(*shape: int) -> np.ndarray:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
-    arch = MOE_ARCH if moe else ARCH
+    arch = NEXT_ARCH if nxt else MOE_ARCH if moe else ARCH
+    moe = moe or nxt
     w = gguf.GGUFWriter(out_path, arch)
     w.add_name(f"ferrox-{arch}-fixture")
     w.add_block_count(N_LAYER)
@@ -112,9 +122,10 @@ def main(out_path: str, as_array: bool, separate_output: bool, moe: bool) -> Non
     w.add_layer_norm_rms_eps(RMS_EPS)
     w.add_rope_freq_base(ROPE_BASE)
     w.add_rope_dimension_count(ROPE_DIM)
-    # conversion/qwen.py: the four M-RoPE sections, summing to
-    # rope_dim / 2 (text, height, width, time).
-    w.add_rope_dimension_sections([1, 1, 0, 0])
+    if not nxt:
+        # conversion/qwen.py: the four M-RoPE sections, summing to
+        # rope_dim / 2 (text, height, width, time). Qwen3-Next has none.
+        w.add_rope_dimension_sections([1, 1, 0, 0])
     w.add_ssm_conv_kernel(D_CONV)
     w.add_ssm_state_size(HEAD_KV)
     w.add_ssm_group_count(N_K_HEADS)
@@ -151,8 +162,13 @@ def main(out_path: str, as_array: bool, separate_output: bool, moe: bool) -> Non
             w.add_tensor(p + "ssm_conv1d.weight", rnd(CONV_DIM, D_CONV) * 2.0)
             w.add_tensor(p + "ssm_dt.bias", rnd(N_V_HEADS) * 2.0)
             w.add_tensor(p + "ssm_a", (-(0.5 + 2.0 * rng.random(N_V_HEADS))).astype(np.float32))
-            w.add_tensor(p + "ssm_beta.weight", rnd(N_V_HEADS, N_EMBD) * 2.0)
-            w.add_tensor(p + "ssm_alpha.weight", rnd(N_V_HEADS, N_EMBD) * 2.0)
+            if nxt:
+                # qwen3next.cpp:96,422-436: one projection, per K group
+                # `ratio` betas then `ratio` alphas.
+                w.add_tensor(p + "ssm_ba.weight", rnd(2 * N_V_HEADS, N_EMBD) * 2.0)
+            else:
+                w.add_tensor(p + "ssm_beta.weight", rnd(N_V_HEADS, N_EMBD) * 2.0)
+                w.add_tensor(p + "ssm_alpha.weight", rnd(N_V_HEADS, N_EMBD) * 2.0)
             w.add_tensor(p + "ssm_norm.weight", (1.0 + rnd(HEAD_KV)).astype(np.float32))
             w.add_tensor(p + "ssm_out.weight", rnd(N_EMBD, VALUE_DIM))
         else:
@@ -197,4 +213,5 @@ if __name__ == "__main__":
         "--array" in sys.argv[1:],
         "--output" in sys.argv[1:],
         "--moe" in sys.argv[1:],
+        "--next" in sys.argv[1:],
     )

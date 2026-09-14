@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **89** architectures run with
+Honest position, re-audited 2026-09-14. **90** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -1095,8 +1095,14 @@ sigmoid each turns five tests red. The scaffold is deleted.
 next PR with NO code: `qwen35moe.cpp:496-538` is `qwen2moe`'s FFN --
 softmax, `norm_w = true`, the shared expert scaled by its own sigmoid
 gate -- under Qwen3.5's layers, KL 2.9e-11 at the `orion` tolerance.
-`qwen3next` needs its grouped heads and fused projections and says
-so.
+`qwen3next` (Qwen3-Next-80B-A3B) followed on the two tables its
+refusal had named: `gdn::GROUPED_HEAD_ARCHITECTURES` (its V heads
+read K heads `h / ratio`, `qwen3next.cpp:521-539`, the map the
+deleted port had assumed for everyone) and `gdn::BetaAlpha::Fused`
+(beta and alpha in one `ssm_ba` projection laid out per K group,
+`:422-436`), plain NEOX RoPE, KL 8.7e-12; swapping beta and alpha
+or tiling the heads each turns its test red. Every gated-delta-net
+graph in llama.cpp is served.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

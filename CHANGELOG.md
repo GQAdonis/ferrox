@@ -17,6 +17,11 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`qwen3next` runs: Qwen3-Next-80B-A3B.** `gdn::GROUPED_HEAD_
+  ARCHITECTURES` / `GdnHparams::map` (`HeadMap::Grouped`) and
+  `gdn::BetaAlpha::Fused` (the `ssm_ba` projection); catalog and
+  `norm_sites` rows. KL 8.7e-12 (`tests/qwen35_graphs.rs`,
+  `make_qwen35_fixture.py --next`). 90 audited.
 - **`qwen35moe` runs: Qwen3.5-35B-A3B, 122B-A10B, 397B-A17B.** No
   code: `qwen2moe`'s FFN under Qwen3.5's layers; catalog, `norm_sites`
   and `mrope` rows. KL 2.9e-11 (`tests/qwen35_graphs.rs`,

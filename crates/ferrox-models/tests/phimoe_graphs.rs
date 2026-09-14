@@ -43,9 +43,8 @@
 
 mod common;
 use common::{
-    assert_all_three_paths_match, assert_all_three_paths_match_within,
-    assert_decoder_matches_on_all_three_paths, graph_caches, kl_vs_golden, load_graph_fixture,
-    worst_vs, GRAPH_PROMPT,
+    assert_all_three_paths_match_within, assert_decoder_matches_on_all_three_paths, graph_caches,
+    kl_vs_golden, load_graph_fixture, worst_vs, GRAPH_PROMPT,
 };
 use ferrox_models::capability::{resolve_architecture, ArchPath, BIASED_RMS_NORM};
 use ferrox_models::config::RopeLayout;
@@ -57,7 +56,8 @@ const PHIMOE: &str = "phimoe";
 const PLAIN: &str = "phimoe_plain";
 
 /// The LongRoPE file sits at 1.5e-5 max |delta| (KL 1.9e-11), the plain
-/// one at 8.8e-6: the `orion` class (`tests/biased_layer_norm_graphs.rs`,
+/// one at 8.8e-6 here and 1.07e-5 on CI's x86 host: the `orion` class
+/// (`tests/biased_layer_norm_graphs.rs`,
 /// `ORION_TOL`), a SwiGLU fed a biased, non-zero-mean norm output on a
 /// libllama built with Accelerate, where f32 summation order shows. The
 /// line is 5e-5, as there; every sabotage below moves the logits by
@@ -182,7 +182,7 @@ fn phimoe_matches_llama_cpp_on_all_three_paths() {
 #[test]
 fn phimoe_without_longrope_matches_llama_cpp() {
     assert!(worst_vs(&PHIMOE_GOLDEN, &PHIMOE_PLAIN_GOLDEN) > 0.5);
-    assert_all_three_paths_match(PLAIN, &PHIMOE_PLAIN_GOLDEN);
+    assert_all_three_paths_match_within(PLAIN, &PHIMOE_PLAIN_GOLDEN, PHIMOE_TOL);
 }
 
 #[test]

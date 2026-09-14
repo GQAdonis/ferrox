@@ -9,6 +9,7 @@
 
 use ferrox_core::recurrent_state::RecurrentState;
 
+use crate::gdn::Gdn;
 use crate::mamba1::Mamba1;
 use crate::mamba2::Mamba2;
 
@@ -17,6 +18,9 @@ pub enum SsmBlock {
     Mamba1(Mamba1),
     /// `build_mamba2_layer` (`mamba-base.cpp:149-288`).
     Mamba2(Mamba2),
+    /// `build_layer_attn_linear` (`qwen35.cpp:236-317`), the gated delta
+    /// net.
+    Gdn(Gdn),
 }
 
 impl SsmBlock {
@@ -25,6 +29,7 @@ impl SsmBlock {
         match self {
             SsmBlock::Mamba1(m) => m.zero_state(),
             SsmBlock::Mamba2(m) => m.zero_state(),
+            SsmBlock::Gdn(m) => m.zero_state(),
         }
     }
 
@@ -40,27 +45,42 @@ impl SsmBlock {
         match self {
             SsmBlock::Mamba1(m) => m.forward_rows(normed, rows, state, rms_eps),
             SsmBlock::Mamba2(m) => m.forward_rows(normed, rows, state, rms_eps),
+            SsmBlock::Gdn(m) => m.forward_rows(normed, rows, state, rms_eps),
         }
     }
 
     pub fn mamba2(&self) -> Option<&Mamba2> {
         match self {
             SsmBlock::Mamba2(m) => Some(m),
-            SsmBlock::Mamba1(_) => None,
+            _ => None,
         }
     }
 
     pub fn mamba2_mut(&mut self) -> Option<&mut Mamba2> {
         match self {
             SsmBlock::Mamba2(m) => Some(m),
-            SsmBlock::Mamba1(_) => None,
+            _ => None,
         }
     }
 
     pub fn mamba1(&self) -> Option<&Mamba1> {
         match self {
             SsmBlock::Mamba1(m) => Some(m),
-            SsmBlock::Mamba2(_) => None,
+            _ => None,
+        }
+    }
+
+    pub fn gdn(&self) -> Option<&Gdn> {
+        match self {
+            SsmBlock::Gdn(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn gdn_mut(&mut self) -> Option<&mut Gdn> {
+        match self {
+            SsmBlock::Gdn(m) => Some(m),
+            _ => None,
         }
     }
 }

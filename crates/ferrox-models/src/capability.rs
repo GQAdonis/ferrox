@@ -1120,6 +1120,17 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     "jamba",
     "mamba",
     "mamba2",
+    // tests/qwen35_graphs.rs: `qwen35` (Qwen3.5 0.8B to 27B). The gated
+    // delta net (`crate::gdn`: `qwen35.cpp:236-317` over
+    // `delta-net-base.cpp:289-365`, V heads TILED over K heads) on the
+    // layers `attention.recurrent_layers` / `full_attention_interval`
+    // name (`:17-24`), gated full attention elsewhere (`:186-234`: the
+    // gate interleaved in `wq`, per-head QK norm, partial IMROPE over
+    // `rope.dimension_sections`, NEOX on text positions), the pre-FFN
+    // norm stored as `post_attention_norm` (`:65,146-148`), SwiGLU,
+    // `nextn_predict_layers` skipped as an MTP block. Three fixtures:
+    // the interval, the array, a separate `output.weight`.
+    "qwen35",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -2514,26 +2525,56 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "kimi_k3",
             "use ferrox_models::kimi_decoder / kimi_loader, not the generic GQA Decoder",
         ));
-        for (n, rope) in [
-            ("plamo2", Neox),
-            ("qwen3next", Neox),
-            ("qwen35", Neox),
-            ("qwen35moe", Neox),
+        // Qwen3.5 dense (`qwen35`: 0.8B / 2B / 4B / 9B / 27B) left the
+        // hybrid group on 2026-09-14: the gated delta net is a block
+        // where attention would be (`crate::gdn`, `AttnShape::Gdn`,
+        // decided by `gdn::recurrent_layers`), its full-attention layers
+        // gate through a double-width `wq` (`attn_gate::
+        // Q_INTERLEAVED_GATE_ARCHS`), per-head QK norm, partial IMROPE
+        // (NEOX on text positions, `crate::mrope`), the pre-FFN norm
+        // under `post_attention_norm` (`norm_sites`). Audited on
+        // tests/qwen35_graphs.rs.
+        v.push(prof(
+            "qwen35",
+            TextGeneration,
+            DecoderFamily::Hybrid,
+            MemoryKind::Hybrid,
+            Neox,
+            ArchPath::GenericGqa { rope: Neox },
+            PerHead,
+        ));
+        for (n, rope, qk, reason) in [
+            (
+                "plamo2",
+                Neox,
+                WholeVector,
+                "PLaMo-2's own Mamba-1 spelling (plamo2.cpp:218-219: its dt / B / C norms and \
+                 gating order), which `crate::mamba1` does not spell",
+            ),
+            (
+                "qwen3next",
+                Neox,
+                PerHead,
+                "Qwen3-Next: the gated delta net with GROUPED V heads (llama-model.cpp:525, \
+                 `HeadMap::Grouped`) and the legacy fused `ssm_in` / `ssm_ba` projections \
+                 (qwen3next.cpp:88-95), plus its MoE; `crate::gdn` serves Qwen3.5's tiled \
+                 split layout",
+            ),
+            (
+                "qwen35moe",
+                Neox,
+                PerHead,
+                "Qwen3.5-MoE: `qwen35`'s layers with a shared-expert MoE FFN (qwen35moe.cpp); \
+                 the delta net and the gated attention are served, the MoE half is next",
+            ),
         ] {
-            let qk = if n.starts_with("qwen3") {
-                PerHead
-            } else {
-                WholeVector
-            };
             v.push(prof(
                 n,
                 TextGeneration,
                 DecoderFamily::Hybrid,
                 MemoryKind::Hybrid,
                 rope,
-                ArchPath::DedicatedOnly {
-                    reason: "hybrid attn+SSM/delta-net engine not yet on the serve path",
-                },
+                ArchPath::DedicatedOnly { reason },
                 qk,
             ));
         }

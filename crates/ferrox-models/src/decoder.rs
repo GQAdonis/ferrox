@@ -171,6 +171,12 @@ pub struct AttnWeights {
     /// (`crate::mamba2::PARALLEL_WITH_ATTENTION`); the same rules as
     /// `shortconv` otherwise.
     pub ssm: Option<crate::ssm_block::SsmBlock>,
+    /// `attn_q` is `2 * n_heads * head_dim` wide, each head's `[q, gate]`
+    /// interleaved, and `sigmoid(gate)` multiplies the attention output
+    /// before `wo` (`crate::attn_gate::Q_INTERLEAVED_GATE_ARCHS`). The
+    /// projection stays one matrix; the three host bodies split its
+    /// output. The fused Metal launches refuse the layer.
+    pub q_gate_interleaved: bool,
 }
 
 /// How a layer's routed experts are held. `Resident` is the original
@@ -807,6 +813,7 @@ impl Decoder {
                 o_bias: None,
                 shortconv: None,
                 ssm: None,
+                q_gate_interleaved: false,
             };
 
             // Leading dense layers (see ModelConfig::layer_is_dense's
@@ -1261,6 +1268,7 @@ impl Decoder {
             o_bias,
             shortconv,
             ssm,
+            q_gate_interleaved,
         } = &layer.attn;
         // No Metal attention kernel gates, sinks, norms between the V
         // sum and `wo`, scales after it, adds a bias to it, or runs a
@@ -1273,6 +1281,7 @@ impl Decoder {
             || o_bias.is_some()
             || shortconv.is_some()
             || ssm.is_some()
+            || *q_gate_interleaved
         {
             return None;
         }
@@ -4444,7 +4453,8 @@ impl Decoder {
                     // layer's cache.
                     crate::layer_shapes::AttnShape::ShortConv
                     | crate::layer_shapes::AttnShape::Mamba2
-                    | crate::layer_shapes::AttnShape::Mamba1 => {
+                    | crate::layer_shapes::AttnShape::Mamba1
+                    | crate::layer_shapes::AttnShape::Gdn => {
                         let out = self.recurrent_block(
                             l,
                             layer,
@@ -4480,6 +4490,15 @@ impl Decoder {
                     batch_size,
                     qkv_acts.as_ref(),
                 );
+                // qwen35.cpp:191-199: the gate rides in `wq`; split it
+                // off before anything reads a Q width.
+                let q_gate = layer.attn.q_gate_interleaved.then(|| {
+                    let (q, gate) = crate::attn_gate::split_interleaved_q_gate(
+                        &q_batch, batch_size, n_heads, head_dim,
+                    );
+                    q_batch = q;
+                    gate
+                });
                 let mut k_batch = layer.attn.k_proj.apply_batch_with_acts(
                     &normed_batch,
                     batch_size,
@@ -4755,6 +4774,7 @@ impl Decoder {
                     &normed_batch,
                     &mut attn_out_batch,
                     batch_size,
+                    q_gate.as_deref(),
                 );
                 Self::add_parallel_ssm(&mut projected_batch, parallel_ssm);
                 residual_add(
@@ -4871,7 +4891,8 @@ impl Decoder {
                     // its own cache.
                     crate::layer_shapes::AttnShape::ShortConv
                     | crate::layer_shapes::AttnShape::Mamba2
-                    | crate::layer_shapes::AttnShape::Mamba1 => {
+                    | crate::layer_shapes::AttnShape::Mamba1
+                    | crate::layer_shapes::AttnShape::Gdn => {
                         let mut out = Vec::with_capacity(batch_size * hidden_dim);
                         for b in 0..batch_size {
                             let step = kv.step(b, l);
@@ -4921,6 +4942,15 @@ impl Decoder {
                     batch_size,
                     qkv_acts.as_ref(),
                 );
+                // qwen35.cpp:191-199: the gate rides in `wq`; split it
+                // off before anything reads a Q width.
+                let q_gate = layer.attn.q_gate_interleaved.then(|| {
+                    let (q, gate) = crate::attn_gate::split_interleaved_q_gate(
+                        &q_batch, batch_size, n_heads, head_dim,
+                    );
+                    q_batch = q;
+                    gate
+                });
                 let mut k_batch = layer.attn.k_proj.apply_batch_with_acts(
                     &normed_batch,
                     batch_size,
@@ -4999,6 +5029,7 @@ impl Decoder {
                     &normed_batch,
                     &mut attn_out_batch,
                     batch_size,
+                    q_gate.as_deref(),
                 );
                 Self::add_parallel_ssm(&mut projected_batch, parallel_ssm);
                 residual_add(

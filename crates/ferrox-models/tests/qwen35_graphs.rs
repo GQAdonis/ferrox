@@ -25,6 +25,7 @@
 //! | `qwen35_array` | (`attention.recurrent_layers`; libllama byte-identical to `qwen35`) | |
 //! | `qwen35_output` | (a separate `output.weight`) | |
 //! | `qwen35moe` | (`qwen35moe`: `qwen2moe`'s FFN, softmax, a sigmoid-gated shared expert) | |
+//! | `qwen3next` | (`qwen3next`: grouped V heads, fused `ssm_ba`, plain NEOX RoPE) | |
 //!
 //! ```text
 //! PYTHONPATH=$LLAMA/gguf-py python3 scripts/make_qwen35_fixture.py \
@@ -48,6 +49,7 @@ const Q35: &str = "qwen35";
 const Q35_ARRAY: &str = "qwen35_array";
 const Q35_OUTPUT: &str = "qwen35_output";
 const Q35MOE: &str = "qwen35moe";
+const Q3NEXT: &str = "qwen3next";
 
 /// The MoE row sits at 2e-5 max delta against libllama (KL 2.9e-11),
 /// with the differences of either sign: the four routed SwiGLU experts
@@ -209,6 +211,57 @@ const Q35MOE_GOLDEN: [f32; 48] = [
     0.87471986,
 ];
 
+const Q3NEXT_GOLDEN: [f32; 48] = [
+    -1.822459,
+    2.3457584,
+    1.3742877,
+    -0.8353147,
+    0.72063106,
+    -0.26173767,
+    -0.8956128,
+    -1.3595253,
+    -0.39872923,
+    -0.41714746,
+    -2.8663216,
+    -2.0913703,
+    -1.2430406,
+    -1.6470684,
+    0.74821794,
+    -0.6727401,
+    -1.1653898,
+    0.19283068,
+    0.8031446,
+    -1.8707193,
+    -0.872216,
+    -0.03859979,
+    1.4898968,
+    1.2567704,
+    -2.8511357,
+    0.26563025,
+    1.263978,
+    -0.15689299,
+    -3.245607,
+    -1.1053009,
+    0.6680958,
+    -1.1433238,
+    -0.5721313,
+    2.0743752,
+    0.18879429,
+    -0.4341504,
+    -1.9876447,
+    0.18905528,
+    0.65706193,
+    -1.8302537,
+    1.729474,
+    0.5731117,
+    0.49496412,
+    1.674253,
+    0.505594,
+    1.0427579,
+    -0.30545288,
+    -2.0598164,
+];
+
 fn decode(decoder: &Decoder) -> Vec<f32> {
     let mut kv = graph_caches(decoder);
     let mut out = Vec::new();
@@ -257,6 +310,27 @@ fn qwen35moe_matches_llama_cpp_on_all_three_paths() {
     assert_eq!(d.config.layer_shape(0).attention, AttnShape::Gdn);
 }
 
+/// `qwen3next`: `qwen35moe`'s layers with the V heads GROUPED over the
+/// K heads (`qwen3next.cpp:521-539`), beta and alpha from one `ssm_ba`
+/// projection (`:422-436`) and plain NEOX RoPE (`:282-291`). Tiling the
+/// heads instead is a different graph: this golden is the grouped one.
+#[test]
+fn qwen3next_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match_within(Q3NEXT, &Q3NEXT_GOLDEN, Q35MOE_TOL);
+    let d = load_graph_fixture(Q3NEXT);
+    assert!(matches!(
+        resolve_architecture("qwen3next"),
+        Some(ArchPath::GenericGqa { .. })
+    ));
+    let g = d.layers[0].attn.ssm.as_ref().unwrap().gdn().unwrap();
+    assert_eq!(g.h.map, ferrox_core::gdn::HeadMap::Grouped);
+    assert!(matches!(
+        g.beta_alpha,
+        ferrox_models::gdn::BetaAlpha::Fused { .. }
+    ));
+    assert_eq!(d.config.moe.n_experts, 4);
+}
+
 #[test]
 fn report_kl_against_llama_cpp() {
     for (name, golden) in [
@@ -264,6 +338,7 @@ fn report_kl_against_llama_cpp() {
         (Q35_ARRAY, &Q35_GOLDEN),
         (Q35_OUTPUT, &Q35_OUTPUT_GOLDEN),
         (Q35MOE, &Q35MOE_GOLDEN),
+        (Q3NEXT, &Q3NEXT_GOLDEN),
     ] {
         let out = decode(&load_graph_fixture(name));
         println!(

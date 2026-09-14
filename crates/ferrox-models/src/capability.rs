@@ -1136,6 +1136,13 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // (`qwen35moe.cpp:98-107,496-538`: softmax, `norm_w = true`, a
     // shared expert scaled by `sigmoid(ffn_gate_inp_shexp . x)`).
     "qwen35moe",
+    // tests/qwen35_graphs.rs: `qwen3next` (Qwen3-Next-80B-A3B), the
+    // same layers with the V heads GROUPED over the K heads
+    // (`qwen3next.cpp:521-539`, `HeadMap::Grouped`), beta and alpha in
+    // one `ssm_ba` projection (`:96,422-436`, `BetaAlpha::Fused`) and
+    // plain NEOX RoPE (`:282-291`). The legacy fused `ssm_in` is refused
+    // by name.
+    "qwen3next",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -2543,7 +2550,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // layers with `qwen2moe`'s FFN (`qwen35moe.cpp:496-538`: softmax,
         // `norm_w = true`, the shared expert scaled by its own sigmoid
         // gate), which the generic path has served since OLMoE.
-        for n in ["qwen35", "qwen35moe"] {
+        // `qwen3next` (Qwen3-Next-80B-A3B) is `qwen35moe`'s layers with
+        // the V heads GROUPED over the K heads and beta / alpha in one
+        // `ssm_ba` projection (`gdn::GROUPED_HEAD_ARCHITECTURES`,
+        // `gdn::BetaAlpha::Fused`), plain NEOX RoPE with no sections
+        // (llama-model.cpp:2678).
+        for n in ["qwen35", "qwen35moe", "qwen3next"] {
             v.push(prof(
                 n,
                 TextGeneration,
@@ -2554,34 +2566,19 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 PerHead,
             ));
         }
-        for (n, rope, qk, reason) in [
-            (
-                "plamo2",
-                Neox,
-                WholeVector,
-                "PLaMo-2's own Mamba-1 spelling (plamo2.cpp:218-219: its dt / B / C norms and \
-                 gating order), which `crate::mamba1` does not spell",
-            ),
-            (
-                "qwen3next",
-                Neox,
-                PerHead,
-                "Qwen3-Next: the gated delta net with GROUPED V heads (llama-model.cpp:525, \
-                 `HeadMap::Grouped`) and the legacy fused `ssm_in` / `ssm_ba` projections \
-                 (qwen3next.cpp:88-95), plus its MoE; `crate::gdn` serves Qwen3.5's tiled \
-                 split layout",
-            ),
-        ] {
-            v.push(prof(
-                n,
-                TextGeneration,
-                DecoderFamily::Hybrid,
-                MemoryKind::Hybrid,
-                rope,
-                ArchPath::DedicatedOnly { reason },
-                qk,
-            ));
-        }
+        // The one hybrid row still off the generic path.
+        v.push(prof(
+            "plamo2",
+            TextGeneration,
+            DecoderFamily::Hybrid,
+            MemoryKind::Hybrid,
+            Neox,
+            ArchPath::DedicatedOnly {
+                reason: "PLaMo-2's own Mamba-1 spelling (plamo2.cpp:218-219: its dt / B / C \
+                         norms and gating order), which `crate::mamba1` does not spell",
+            },
+            WholeVector,
+        ));
         // `lfm2` left the hybrid group on 2026-09-14: its recurrent
         // block is a short convolution at the attention site
         // (`crate::shortconv`), served on the generic path with a

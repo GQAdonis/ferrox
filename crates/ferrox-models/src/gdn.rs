@@ -38,9 +38,14 @@
 //!
 //! Three graphs of 140 build the block (`grep -l build_layer_attn_linear
 //! src/models/*.cpp`: `qwen35`, `qwen35moe`, `qwen3next`) over the ONE
-//! `delta-net-base.cpp`. `qwen3next` groups its V heads instead of
-//! tiling them and may store the projections fused (`ssm_in` /
-//! `ssm_ba`, `:88-95`); its row says so.
+//! `delta-net-base.cpp`. `qwen3next` differs in two places, both
+//! tables here: its V heads read K heads GROUPED (`h / ratio`,
+//! `qwen3next.cpp:521-539`, `llama-model.cpp:525`;
+//! [`GROUPED_HEAD_ARCHITECTURES`]), and beta and alpha come from ONE
+//! `ssm_ba` projection laid out `[k_group][beta * ratio, alpha * ratio]`
+//! (`:96,422-436`; [`BetaAlpha::Fused`]). Its legacy fused `ssm_in`
+//! (q/k/v/z in one, `:88-90,336-360`) is refused by name: every
+//! current export splits it (`conversion/qwen.py:389-416`).
 
 use ferrox_core::gdn::{delta_step, l2_normalize, DeltaDims, HeadMap};
 use ferrox_core::mamba2::{conv_step, softplus};
@@ -51,7 +56,23 @@ use ferrox_gguf::TensorSource;
 
 use crate::loader::{load_f32_vec, load_weight_matrix, LoadError};
 
-/// The five `ssm.*` hparams as one value (`qwen35.cpp:7-11`).
+/// Architectures whose V heads read K heads grouped (`HeadMap::Grouped`,
+/// `qwen3next.cpp:521-539`: `ggml_repeat_4d` over a `[head_dim, 1,
+/// n_k]` view repeats each K head `ratio` times consecutively). Every
+/// other reader of the block tiles (`llama-model.cpp:524-526`).
+pub const GROUPED_HEAD_ARCHITECTURES: &[&str] = &["qwen3next"];
+
+/// How `arch`'s V heads find their K heads.
+pub fn head_map(arch: &str) -> HeadMap {
+    if GROUPED_HEAD_ARCHITECTURES.contains(&arch) {
+        HeadMap::Grouped
+    } else {
+        HeadMap::Tiled
+    }
+}
+
+/// The five `ssm.*` hparams as one value (`qwen35.cpp:7-11`), and the
+/// architecture's head map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GdnHparams {
     pub d_conv: usize,
@@ -61,6 +82,7 @@ pub struct GdnHparams {
     pub n_k_heads: usize,
     /// `ssm.time_step_rank`.
     pub n_v_heads: usize,
+    pub map: HeadMap,
 }
 
 impl GdnHparams {
@@ -76,6 +98,7 @@ impl GdnHparams {
             head_dim: read("state_size")?,
             n_k_heads: read("group_count")?,
             n_v_heads: read("time_step_rank")?,
+            map: head_map(arch),
         };
         let d_inner = read("inner_size")?;
         if h.d_conv < 2
@@ -114,7 +137,7 @@ impl GdnHparams {
             n_k_heads: self.n_k_heads,
             n_v_heads: self.n_v_heads,
             head_dim: self.head_dim,
-            map: HeadMap::Tiled,
+            map: self.map,
         }
     }
 
@@ -125,6 +148,20 @@ impl GdnHparams {
             self.delta_dims().state_len(),
         )
     }
+}
+
+/// Where beta and alpha come from.
+pub enum BetaAlpha {
+    /// `blk.N.ssm_beta.weight` and `blk.N.ssm_alpha.weight`, each
+    /// `[n_v_heads, n_embd]` (`qwen35.cpp:71-72`).
+    Split {
+        beta: WeightMatrix,
+        alpha: WeightMatrix,
+    },
+    /// `blk.N.ssm_ba.weight`, `[2 n_v_heads, n_embd]`, its rows laid out
+    /// per K group as `ratio` betas then `ratio` alphas
+    /// (`qwen3next.cpp:96,422-436`).
+    Fused { ba: WeightMatrix },
 }
 
 /// One GDN layer's weights (`qwen35.cpp:66-74`).
@@ -140,10 +177,7 @@ pub struct Gdn {
     pub dt_bias: Vec<f32>,
     /// `blk.N.ssm_a`, `[n_v_heads]`, stored negative.
     pub a: Vec<f32>,
-    /// `blk.N.ssm_beta.weight`, `[n_v_heads, n_embd]`.
-    pub beta: WeightMatrix,
-    /// `blk.N.ssm_alpha.weight`, `[n_v_heads, n_embd]`.
-    pub alpha: WeightMatrix,
+    pub beta_alpha: BetaAlpha,
     /// `blk.N.ssm_norm.weight`, `[head_dim]`, one weight for every head.
     pub norm: Vec<f32>,
     /// `blk.N.ssm_out.weight`, `[n_embd, value_dim]`.
@@ -195,6 +229,16 @@ impl Gdn {
                     .to_string(),
             ));
         }
+        let beta_alpha = if file.find_tensor(&name("ssm_ba.weight")).is_some() {
+            BetaAlpha::Fused {
+                ba: matrix("ssm_ba.weight", 2 * h.n_v_heads, hidden_dim)?,
+            }
+        } else {
+            BetaAlpha::Split {
+                beta: matrix("ssm_beta.weight", h.n_v_heads, hidden_dim)?,
+                alpha: matrix("ssm_alpha.weight", h.n_v_heads, hidden_dim)?,
+            }
+        };
         Ok(Self {
             h,
             qkv: matrix("attn_qkv.weight", h.conv_dim(), hidden_dim)?,
@@ -202,8 +246,7 @@ impl Gdn {
             conv1d: vector("ssm_conv1d.weight", h.d_conv * h.conv_dim())?,
             dt_bias: vector("ssm_dt.bias", h.n_v_heads)?,
             a: vector("ssm_a", h.n_v_heads)?,
-            beta: matrix("ssm_beta.weight", h.n_v_heads, hidden_dim)?,
-            alpha: matrix("ssm_alpha.weight", h.n_v_heads, hidden_dim)?,
+            beta_alpha,
             norm: vector("ssm_norm.weight", h.head_dim)?,
             out_proj: matrix("ssm_out.weight", hidden_dim, h.value_dim())?,
         })
@@ -250,8 +293,28 @@ impl Gdn {
         };
         let qkv_all = project(&self.qkv);
         let z_all = project(&self.z_proj);
-        let beta_all = project(&self.beta);
-        let alpha_all = project(&self.alpha);
+        // The two per-head gate logits, whichever projection spells
+        // them: `[rows][n_v]` each.
+        let (beta_all, alpha_all) = match &self.beta_alpha {
+            BetaAlpha::Split { beta, alpha } => (project(beta), project(alpha)),
+            BetaAlpha::Fused { ba } => {
+                let mixed = project(ba);
+                let ratio = n_v / n_k;
+                let mut beta_all = vec![0.0f32; rows * n_v];
+                let mut alpha_all = vec![0.0f32; rows * n_v];
+                for r in 0..rows {
+                    let row = &mixed[r * 2 * n_v..(r + 1) * 2 * n_v];
+                    for hd in 0..n_v {
+                        // qwen3next.cpp:422-436: group `hd / ratio`, its
+                        // `ratio` betas then its `ratio` alphas.
+                        let base = (hd / ratio) * 2 * ratio + hd % ratio;
+                        beta_all[r * n_v + hd] = row[base];
+                        alpha_all[r * n_v + hd] = row[base + ratio];
+                    }
+                }
+                (beta_all, alpha_all)
+            }
+        };
         let mut ys = vec![0.0f32; rows * value_dim];
         let mut conv_out = vec![0.0f32; conv_dim];
         let mut o = vec![0.0f32; value_dim];
@@ -380,6 +443,7 @@ mod tests {
             head_dim: 2,
             n_k_heads: 1,
             n_v_heads: 2,
+            map: HeadMap::Tiled,
         }
     }
 
@@ -415,8 +479,10 @@ mod tests {
             conv1d: rnd(h.d_conv * h.conv_dim()),
             dt_bias: rnd(h.n_v_heads),
             a: vec![-0.7, -1.2],
-            beta: mat(h.n_v_heads, n_embd, rnd(h.n_v_heads * n_embd)),
-            alpha: mat(h.n_v_heads, n_embd, rnd(h.n_v_heads * n_embd)),
+            beta_alpha: BetaAlpha::Split {
+                beta: mat(h.n_v_heads, n_embd, rnd(h.n_v_heads * n_embd)),
+                alpha: mat(h.n_v_heads, n_embd, rnd(h.n_v_heads * n_embd)),
+            },
             norm: vec![1.1, 0.9],
             out_proj: mat(n_embd, h.value_dim(), rnd(n_embd * h.value_dim())),
         };

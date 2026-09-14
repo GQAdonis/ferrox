@@ -129,6 +129,8 @@ is faster.
   (NEOX band for band on text positions, `ferrox_models::mrope`); the
   pre-FFN norm is stored as `post_attention_norm` (`norm_sites`). The
   1.8k-line GDN scaffold that had never met libllama is deleted.
+  `qwen35moe` (Qwen3.5-35B-A3B and up) is the same layers with
+  `qwen2moe`'s FFN, served since OLMoE: KL 2.9e-11.
 - **Mamba-1: Jamba, Mamba, FalconMamba; and pure Mamba-2** (`jamba`,
   `mamba`, `mamba2`), audited against libllama on 2026-09-14
   (`tests/mamba_graphs.rs`, KL 7.3e-12 / 2.3e-12 / 1.8e-12 / 3.6e-13).

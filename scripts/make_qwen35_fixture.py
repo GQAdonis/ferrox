@@ -32,10 +32,15 @@ Variants:
   * default          `full_attention_interval 4`
   * `--array`        the same layout declared with `attention.recurrent_layers`
   * `--output`       a separate `output.weight`
+  * `--moe`          the `qwen35moe` architecture (Qwen3.5-35B-A3B and up):
+                     the same layers with `qwen2moe`'s FFN on every one
+                     (`qwen35moe.cpp:98-107,496-538`): a softmax MoE with
+                     `norm_w = true` and a shared expert whose output is
+                     scaled by `sigmoid(ffn_gate_inp_shexp . x)`
 
 Usage:
     PYTHONPATH=/path/to/llama.cpp/gguf-py \\
-        python3 scripts/make_qwen35_fixture.py OUT.gguf [--array] [--output]
+        python3 scripts/make_qwen35_fixture.py OUT.gguf [--array] [--output] [--moe]
 
 Weights are pseudo-random from a fixed seed so the files are byte-stable.
 The golden logits that go with them are produced by llama.cpp itself
@@ -49,6 +54,7 @@ import numpy as np
 import gguf
 
 ARCH = "qwen35"
+MOE_ARCH = "qwen35moe"
 
 N_EMBD = 32
 N_HEAD = 4
@@ -73,19 +79,32 @@ CONV_DIM = 2 * KEY_DIM + VALUE_DIM
 N_LAYER = 4
 RECURRENT = [True, True, True, False]
 
+# MoE (`--moe`).
+N_EXPERT = 4
+N_EXPERT_USED = 2
+N_FF_EXP = 16
+N_FF_SHEXP = 12
 
-def main(out_path: str, as_array: bool, separate_output: bool) -> None:
+
+def main(out_path: str, as_array: bool, separate_output: bool, moe: bool) -> None:
     rng = np.random.default_rng(0x9335)
 
     def rnd(*shape: int) -> np.ndarray:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
-    w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-qwen35-fixture")
+    arch = MOE_ARCH if moe else ARCH
+    w = gguf.GGUFWriter(out_path, arch)
+    w.add_name(f"ferrox-{arch}-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
-    w.add_feed_forward_length(N_FF)
+    w.add_feed_forward_length(N_FF_EXP if moe else N_FF)
+    if moe:
+        # conversion/qwen.py (Qwen2MoeModel): the expert keys.
+        w.add_expert_count(N_EXPERT)
+        w.add_expert_used_count(N_EXPERT_USED)
+        w.add_expert_feed_forward_length(N_FF_EXP)
+        w.add_expert_shared_feed_forward_length(N_FF_SHEXP)
     w.add_head_count(N_HEAD)
     w.add_head_count_kv(N_KV)
     w.add_key_length(HEAD_DIM)
@@ -102,7 +121,7 @@ def main(out_path: str, as_array: bool, separate_output: bool) -> None:
     w.add_ssm_time_step_rank(N_V_HEADS)
     w.add_ssm_inner_size(VALUE_DIM)
     if as_array:
-        w.add_array(f"{ARCH}.attention.recurrent_layers", RECURRENT)
+        w.add_array(f"{arch}.attention.recurrent_layers", RECURRENT)
     else:
         w.add_full_attention_interval(4)
     w.add_file_type(gguf.LlamaFileType.ALL_F32)
@@ -144,9 +163,21 @@ def main(out_path: str, as_array: bool, separate_output: bool) -> None:
             w.add_tensor(p + "attn_output.weight", rnd(N_EMBD, N_HEAD * HEAD_DIM))
             w.add_tensor(p + "attn_q_norm.weight", (1.0 + rnd(HEAD_DIM)).astype(np.float32))
             w.add_tensor(p + "attn_k_norm.weight", (1.0 + rnd(HEAD_DIM)).astype(np.float32))
-        w.add_tensor(p + "ffn_gate.weight", rnd(N_FF, N_EMBD))
-        w.add_tensor(p + "ffn_up.weight", rnd(N_FF, N_EMBD))
-        w.add_tensor(p + "ffn_down.weight", rnd(N_EMBD, N_FF))
+        if moe:
+            # qwen35moe.cpp:98-107: the router, the experts, the shared
+            # expert with its own one-logit gate.
+            w.add_tensor(p + "ffn_gate_inp.weight", rnd(N_EXPERT, N_EMBD) * 4.0)
+            w.add_tensor(p + "ffn_gate_exps.weight", rnd(N_EXPERT, N_FF_EXP, N_EMBD))
+            w.add_tensor(p + "ffn_up_exps.weight", rnd(N_EXPERT, N_FF_EXP, N_EMBD))
+            w.add_tensor(p + "ffn_down_exps.weight", rnd(N_EXPERT, N_EMBD, N_FF_EXP))
+            w.add_tensor(p + "ffn_gate_inp_shexp.weight", rnd(N_EMBD) * 2.0)
+            w.add_tensor(p + "ffn_gate_shexp.weight", rnd(N_FF_SHEXP, N_EMBD))
+            w.add_tensor(p + "ffn_up_shexp.weight", rnd(N_FF_SHEXP, N_EMBD))
+            w.add_tensor(p + "ffn_down_shexp.weight", rnd(N_EMBD, N_FF_SHEXP))
+        else:
+            w.add_tensor(p + "ffn_gate.weight", rnd(N_FF, N_EMBD))
+            w.add_tensor(p + "ffn_up.weight", rnd(N_FF, N_EMBD))
+            w.add_tensor(p + "ffn_down.weight", rnd(N_EMBD, N_FF))
 
     w.add_tensor("output_norm.weight", (1.0 + rnd(N_EMBD)).astype(np.float32))
     if separate_output:
@@ -156,7 +187,7 @@ def main(out_path: str, as_array: bool, separate_output: bool) -> None:
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
-    print(f"wrote {out_path} (array={as_array}, output={separate_output})")
+    print(f"wrote {out_path} ({arch}, array={as_array}, output={separate_output})")
 
 
 if __name__ == "__main__":
@@ -165,4 +196,5 @@ if __name__ == "__main__":
         args[0] if args else "qwen35-fixture.gguf",
         "--array" in sys.argv[1:],
         "--output" in sys.argv[1:],
+        "--moe" in sys.argv[1:],
     )

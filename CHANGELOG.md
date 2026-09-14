@@ -17,6 +17,10 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`qwen35moe` runs: Qwen3.5-35B-A3B, 122B-A10B, 397B-A17B.** No
+  code: `qwen2moe`'s FFN under Qwen3.5's layers; catalog, `norm_sites`
+  and `mrope` rows. KL 2.9e-11 (`tests/qwen35_graphs.rs`,
+  `make_qwen35_fixture.py --moe`). 89 audited.
 - **`qwen35` runs: Qwen3.5 dense 0.8B to 27B.** `ferrox_core::gdn` is
   the autoregressive delta rule (`delta_step`, `l2_normalize`,
   `HeadMap::{Tiled, Grouped}`); `ferrox_models::gdn` the block

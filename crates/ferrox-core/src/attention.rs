@@ -219,18 +219,23 @@ fn online_attn_accumulate(
     out_h: &mut [f32],
     attn_softcap: Option<f32>,
     sink: Option<f32>,
-    mut for_each_kv: impl FnMut(&mut dyn FnMut(&[f32], &[f32])),
+    mut for_each_kv: impl FnMut(&mut dyn FnMut(&[f32], &[f32], f32)),
 ) {
     // `q_h` is one K-width head and `out_h` one V-width head; the two
     // agree everywhere but MiMo-V2, and nothing here needs them to.
+    // The third visitor argument is an ADDITIVE score bias for that
+    // key -- ALiBi's `slope * (p_key - p_query)` (`crate::alibi`), or
+    // `0.0` -- applied after the scale and the softcap, where
+    // `ggml_soft_max_ext` adds `slope * mask`.
     let mut m = f32::NEG_INFINITY;
     let mut l = 0f32;
     out_h.fill(0.0);
-    for_each_kv(&mut |k_t, v_t| {
+    for_each_kv(&mut |k_t, v_t, bias| {
         let mut s = dot_f32(q_h, k_t) * scale;
         if let Some(sc) = attn_softcap.filter(|&c| c > 0.0) {
             s = sc * (s / sc).tanh();
         }
+        s += bias;
         let m_new = m.max(s);
         let alpha = (m - m_new).exp();
         let p = (s - m_new).exp();
@@ -787,6 +792,7 @@ pub fn causal_gqa_attention_softcap(
         None,
         None,
         attn_softcap,
+        None,
     )
 }
 
@@ -835,6 +841,7 @@ pub fn causal_gqa_attention_windowed_softcap(
         Some(window),
         None,
         attn_softcap,
+        None,
     )
 }
 
@@ -866,6 +873,7 @@ pub fn causal_gqa_attention_sinks(
         window,
         Some(sinks),
         None,
+        None,
     )
 }
 
@@ -896,6 +904,7 @@ pub fn causal_gqa_attention_row(
     window: Option<usize>,
     sinks: Option<&[f32]>,
     attn_softcap: Option<f32>,
+    alibi: Option<&[f32]>,
 ) -> Vec<f32> {
     assert_eq!(q.len(), n_heads * head_dim);
     assert_eq!(k_cache.len(), seq_len * n_kv_heads * head_dim);
@@ -906,6 +915,9 @@ pub fn causal_gqa_attention_row(
             n_heads,
             "attention sinks are per query head (llama.cpp `attn_sinks` is {{n_head}})"
         );
+    }
+    if let Some(slopes) = alibi {
+        assert_eq!(slopes.len(), n_heads, "ALiBi slopes are per query head");
     }
 
     let group_size = n_heads / n_kv_heads.max(1);
@@ -921,10 +933,14 @@ pub fn causal_gqa_attention_row(
         None => 0,
     };
 
+    // ALiBi: the query is the last cached position, key `t` is
+    // `(seq_len - 1) - t` behind it, and the bias is `-slope * distance`.
+    let q_pos = seq_len as f32 - 1.0;
     for h in 0..n_heads {
         let kv_h = h / group_size.max(1);
         let q_h = &q[h * head_dim..(h + 1) * head_dim];
         let sink = sinks.map(|s| s[h]);
+        let slope = alibi.map_or(0.0, |s| s[h]);
         let out_h = &mut out[h * v_head_dim..(h + 1) * v_head_dim];
         online_attn_accumulate(q_h, scale, out_h, attn_softcap, sink, |visit| {
             for t in start..seq_len {
@@ -932,7 +948,7 @@ pub fn causal_gqa_attention_row(
                     [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
                 let v_t = &v_cache[(t * n_kv_heads + kv_h) * v_head_dim
                     ..(t * n_kv_heads + kv_h + 1) * v_head_dim];
-                visit(k_t, v_t);
+                visit(k_t, v_t, slope * (t as f32 - q_pos));
             }
         });
     }
@@ -1045,6 +1061,7 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
         kv_prefix,
         attn_softcap,
         window,
+        None,
     )
 }
 
@@ -1066,12 +1083,16 @@ pub fn causal_gqa_attention_prefill_shared_kv_split(
     kv_prefix: usize,
     attn_softcap: Option<f32>,
     window: Option<usize>,
+    alibi: Option<&[f32]>,
 ) -> Vec<f32> {
     let q_stride = n_heads * head_dim;
     let kv_stride = n_kv_heads * head_dim;
     let v_stride = n_kv_heads * v_head_dim;
     let out_stride = n_heads * v_head_dim;
     assert_eq!(q.len(), n_q * q_stride);
+    if let Some(slopes) = alibi {
+        assert_eq!(slopes.len(), n_heads, "ALiBi slopes are per query head");
+    }
     let kv_len = kv_prefix + n_q;
     assert!(k_cache.len() >= kv_len * kv_stride);
     assert!(v_cache.len() >= kv_len * v_stride);
@@ -1184,6 +1205,18 @@ pub fn causal_gqa_attention_prefill_shared_kv_split(
             if let Some(sc) = softcap {
                 for s in live.iter_mut() {
                     *s = sc * (*s / sc).tanh();
+                }
+            }
+            // ALiBi (`crate::alibi`): `slope_h * (p_key - p_query)` on
+            // every visible key, after the softcap, as
+            // `ggml_soft_max_ext` adds `slope * mask`. Key `j` of the
+            // live range is position `t_start + j`; the query is
+            // `causal_len - 1`.
+            if let Some(slopes) = alibi {
+                let slope = slopes[h];
+                let q_pos = (causal_len - 1) as f32;
+                for (j, s) in live.iter_mut().enumerate() {
+                    *s += slope * ((t_start + j) as f32 - q_pos);
                 }
             }
             norms[b - b_start] = softmax_row_exp_sum(live);
@@ -2142,6 +2175,7 @@ pub fn causal_gqa_attention_paged(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -2187,8 +2221,12 @@ pub fn causal_gqa_attention_paged_sinks(
     window: Option<usize>,
     sinks: Option<&[f32]>,
     attn_softcap: Option<f32>,
+    alibi: Option<&[f32]>,
 ) -> Vec<f32> {
     assert_eq!(q.len(), n_heads * head_dim);
+    if let Some(slopes) = alibi {
+        assert_eq!(slopes.len(), n_heads, "ALiBi slopes are per query head");
+    }
     assert_eq!(
         head_dim,
         store.head_dim(),
@@ -2228,10 +2266,12 @@ pub fn causal_gqa_attention_paged_sinks(
         None => 0,
     };
 
+    let q_pos = seq_len as f32 - 1.0;
     for h in 0..n_heads {
         let kv_h = h / group_size.max(1);
         let q_h = &q[h * head_dim..(h + 1) * head_dim];
         let sink = sinks.map(|s| s[h]);
+        let slope = alibi.map_or(0.0, |s| s[h]);
         let out_h = &mut out[h * v_head_dim..(h + 1) * v_head_dim];
         online_attn_accumulate(q_h, scale, out_h, attn_softcap, sink, |visit| {
             for t in start..seq_len {
@@ -2241,7 +2281,7 @@ pub fn causal_gqa_attention_paged_sinks(
                 let v_row = store.v_row(block_id, offset);
                 let k_t = &k_row[kv_h * head_dim..(kv_h + 1) * head_dim];
                 let v_t = &v_row[kv_h * v_head_dim..(kv_h + 1) * v_head_dim];
-                visit(k_t, v_t);
+                visit(k_t, v_t, slope * (t as f32 - q_pos));
             }
         });
     }
@@ -2606,7 +2646,7 @@ mod tests {
             (None, None, Some(5.0)),
         ] {
             let row = super::causal_gqa_attention_row(
-                &q, &k, &v, n_heads, n_kv_heads, hd, vd, seq, window, sink, cap,
+                &q, &k, &v, n_heads, n_kv_heads, hd, vd, seq, window, sink, cap, None,
             );
             assert_eq!(row.len(), n_heads * vd);
             // Paged twin over the same rows.
@@ -2632,6 +2672,7 @@ mod tests {
                 window,
                 sink,
                 cap,
+                None,
             );
             for (a, b) in row.iter().zip(via_pages.iter()) {
                 assert!((a - b).abs() < 1e-6, "row {a} vs paged {b} ({window:?})");
@@ -2642,7 +2683,7 @@ mod tests {
         let k1 = lcg_vec(6, seq * n_heads * hd);
         let v1 = lcg_vec(7, seq * n_heads * vd);
         let row = super::causal_gqa_attention_row(
-            &q1, &k1, &v1, n_heads, n_heads, hd, vd, seq, None, None, None,
+            &q1, &k1, &v1, n_heads, n_heads, hd, vd, seq, None, None, None, None,
         );
         let mla = super::causal_mla_attention(&q1, &k1, &v1, n_heads, hd, vd, seq);
         for (a, b) in row.iter().zip(mla.iter()) {
@@ -2651,6 +2692,147 @@ mod tests {
         // And the width is not merely tolerated: a V width read as the
         // K width would be a different vector.
         assert_ne!(row.len(), n_heads * hd);
+    }
+
+    /// ALiBi (`crate::alibi`): the three kernels agree with each other
+    /// and with a naive softmax reference that adds `slope_h * (p_key -
+    /// p_query)` to every scaled score, windowed and not; and the bias
+    /// really moves the output (a slope of zero on every head is the
+    /// plain kernel).
+    #[test]
+    fn alibi_is_one_bias_across_the_row_paged_and_prefill_kernels() {
+        let (n_heads, n_kv_heads, hd, prefix, n_q) = (6usize, 3usize, 8usize, 5usize, 9usize);
+        let kv_len = prefix + n_q;
+        let q = lcg_vec(21, n_q * n_heads * hd);
+        let k = lcg_vec(22, kv_len * n_kv_heads * hd);
+        let v = lcg_vec(23, kv_len * n_kv_heads * hd);
+        let slopes = crate::alibi::slopes(n_heads, 8.0).unwrap();
+        let group = n_heads / n_kv_heads;
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        // The naive reference for query row `b` (position `prefix + b`).
+        let naive = |b: usize, window: Option<usize>| -> Vec<f32> {
+            let q_pos = prefix + b;
+            let t_start = window.map_or(0, |w| (q_pos + 1).saturating_sub(w));
+            let mut out = vec![0f32; n_heads * hd];
+            for h in 0..n_heads {
+                let kv_h = h / group;
+                let q_h = &q[(b * n_heads + h) * hd..(b * n_heads + h + 1) * hd];
+                let scores: Vec<f32> = (t_start..=q_pos)
+                    .map(|t| {
+                        let k_t =
+                            &k[(t * n_kv_heads + kv_h) * hd..(t * n_kv_heads + kv_h + 1) * hd];
+                        let dot: f32 = q_h.iter().zip(k_t).map(|(a, b)| a * b).sum();
+                        dot * scale + slopes[h] * (t as f32 - q_pos as f32)
+                    })
+                    .collect();
+                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let e: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+                let l: f32 = e.iter().sum();
+                for (j, t) in (t_start..=q_pos).enumerate() {
+                    let v_t = &v[(t * n_kv_heads + kv_h) * hd..(t * n_kv_heads + kv_h + 1) * hd];
+                    for d in 0..hd {
+                        out[h * hd + d] += e[j] / l * v_t[d];
+                    }
+                }
+            }
+            out
+        };
+
+        for window in [None, Some(4)] {
+            let prefill = super::causal_gqa_attention_prefill_shared_kv_split(
+                &q,
+                &k,
+                &v,
+                n_heads,
+                n_kv_heads,
+                hd,
+                hd,
+                n_q,
+                prefix,
+                None,
+                window,
+                Some(&slopes),
+            );
+            let plain = super::causal_gqa_attention_prefill_shared_kv_split(
+                &q, &k, &v, n_heads, n_kv_heads, hd, hd, n_q, prefix, None, window, None,
+            );
+            let mut moved = false;
+            for b in 0..n_q {
+                let t = prefix + b + 1;
+                let want = naive(b, window);
+                let row = super::causal_gqa_attention_row(
+                    &q[b * n_heads * hd..(b + 1) * n_heads * hd],
+                    &k[..t * n_kv_heads * hd],
+                    &v[..t * n_kv_heads * hd],
+                    n_heads,
+                    n_kv_heads,
+                    hd,
+                    hd,
+                    t,
+                    window,
+                    None,
+                    None,
+                    Some(&slopes),
+                );
+                let got = &prefill[b * n_heads * hd..(b + 1) * n_heads * hd];
+                for ((g, r), w) in got.iter().zip(&row).zip(&want) {
+                    assert!(
+                        (g - w).abs() < 1e-5,
+                        "prefill {g} vs naive {w} ({window:?})"
+                    );
+                    assert!((r - w).abs() < 1e-5, "row {r} vs naive {w} ({window:?})");
+                }
+                let unbiased = &plain[b * n_heads * hd..(b + 1) * n_heads * hd];
+                moved |= got.iter().zip(unbiased).any(|(a, b)| (a - b).abs() > 1e-3);
+            }
+            assert!(moved, "the bias must change the output ({window:?})");
+        }
+
+        // The paged kernel reads the same slopes.
+        let seq = kv_len;
+        let mut store = crate::cache::PagedKvStore::new_split(2, 8, n_kv_heads, hd, hd);
+        let mut paged = crate::cache::PagedKvCache::new();
+        for t in 0..seq {
+            paged
+                .push(
+                    &mut store,
+                    &k[t * n_kv_heads * hd..(t + 1) * n_kv_heads * hd],
+                    &v[t * n_kv_heads * hd..(t + 1) * n_kv_heads * hd],
+                )
+                .unwrap();
+        }
+        let qn = &q[(n_q - 1) * n_heads * hd..];
+        let row = super::causal_gqa_attention_row(
+            qn,
+            &k,
+            &v,
+            n_heads,
+            n_kv_heads,
+            hd,
+            hd,
+            seq,
+            None,
+            None,
+            None,
+            Some(&slopes),
+        );
+        let via_pages = super::causal_gqa_attention_paged_sinks(
+            qn,
+            &store,
+            paged.block_table(),
+            n_heads,
+            n_kv_heads,
+            hd,
+            seq,
+            None,
+            None,
+            None,
+            Some(&slopes),
+        );
+        for (a, b) in row.iter().zip(via_pages.iter()) {
+            assert!((a - b).abs() < 1e-6, "row {a} vs paged {b}");
+        }
     }
 
     /// The batched prefill kernel at split widths equals the row kernel
@@ -2672,7 +2854,7 @@ mod tests {
             (Some(5), Some(6.0)),
         ] {
             let got = super::causal_gqa_attention_prefill_shared_kv_split(
-                &q, &k, &v, n_heads, n_kv_heads, hd, vd, n_q, prefix, cap, window,
+                &q, &k, &v, n_heads, n_kv_heads, hd, vd, n_q, prefix, cap, window, None,
             );
             assert_eq!(got.len(), n_q * n_heads * vd);
             for b in 0..n_q {
@@ -2689,6 +2871,7 @@ mod tests {
                     window,
                     None,
                     cap,
+                    None,
                 );
                 let row = &got[b * n_heads * vd..(b + 1) * n_heads * vd];
                 for (a, w) in row.iter().zip(want.iter()) {
@@ -3883,6 +4066,7 @@ mod tests {
             None,
             Some(&sinks),
             None,
+            None,
         );
         assert_eq!(contiguous.len(), paged.len());
         for (i, (a, b)) in contiguous.iter().zip(paged.iter()).enumerate() {
@@ -3926,6 +4110,7 @@ mod tests {
                 Some(window),
                 Some(&sinks),
                 None,
+                None,
             );
             for (i, (a, b)) in contiguous.iter().zip(paged.iter()).enumerate() {
                 assert_eq!(
@@ -3951,7 +4136,7 @@ mod tests {
         let plain =
             causal_gqa_attention_paged(&q, &store, &table, n_heads, n_kv_heads, head_dim, seq_len);
         let via_sinks = causal_gqa_attention_paged_sinks(
-            &q, &store, &table, n_heads, n_kv_heads, head_dim, seq_len, None, None, None,
+            &q, &store, &table, n_heads, n_kv_heads, head_dim, seq_len, None, None, None, None,
         );
         for (i, (a, b)) in plain.iter().zip(via_sinks.iter()).enumerate() {
             assert_eq!(a.to_bits(), b.to_bits(), "element {i}");

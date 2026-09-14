@@ -213,6 +213,12 @@ pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> Rop
         // position table is added to the embeddings instead
         // (`crate::position_embd`).
         "gpt2" | "starcoder" => RopeLayers::Never,
+        // The ALiBi graphs (`crate::alibi`): `bloom`, `refact`, `mpt`,
+        // `jais`, and `baichuan` at 40 layers ONLY (`baichuan.cpp:11-14`;
+        // the 7B rotates). One table decides both the bias and the
+        // absence of rotation, so the two cannot disagree about the
+        // layer count.
+        _ if crate::alibi::positions_by_alibi(arch, n_layers) => RopeLayers::Never,
         // `smollm3.cpp:5` assigns the step unconditionally, so this is
         // every SmolLM3 file: 9 of a 36-layer SmolLM3-3B's layers get no
         // rotation.

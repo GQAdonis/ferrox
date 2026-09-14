@@ -19,6 +19,7 @@
 //! docs/THIRD_PARTY_NOTICES.md.
 
 pub mod activation_tap;
+pub mod alibi;
 pub mod attention;
 pub mod bench_profile;
 pub mod block_sparse;

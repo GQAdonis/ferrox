@@ -17,6 +17,31 @@ are the ones worth reading twice.
 
 ### Added
 
+- **ALiBi; `refact`, `bloom`, `mpt`, `jais` and Baichuan-13B run.**
+  `ferrox_core::alibi::slopes` is llama.cpp's per-head slope formula
+  (`ggml-cpu/ops.cpp:5489-5508`), and the row, paged and batched
+  prefill kernels take the slopes as one additive `slope_h * (p_key -
+  p_query)` on every score after the scale and the softcap
+  (`online_attn_accumulate`'s visitor carries the bias); a kernel test
+  pins the three against a naive reference. `ferrox_models::alibi` is
+  the table of the five generic-path graphs that set
+  `f_max_alibi_bias` (measured over all 140: the literal 8 for
+  `bloom` / `refact`, the literal at 40 layers only for `baichuan`,
+  `attention.max_alibi_bias` for `mpt` / `jais`), and
+  `rope_layers::RopeLayers::Never` is derived from it, so the bias and
+  the absence of rotation cannot disagree about a layer count.
+  `ModelConfig::alibi_max_bias` fences every fused Metal launch and the
+  CUDA resident attention; `Decoder::alibi_slopes` is derived from it
+  in one place. Also: `norm_sites::EMBEDDING_NORM_ARCHITECTURES` and
+  `Decoder::embedding_norm` for `bloom`'s `token_embd_norm`; `jais`'s
+  `kq_scale = 1/d` (`jais.cpp:83`) in `attention_scale_override`;
+  `mpt` in `CLAMPED_QKV_ARCHITECTURES` and its optional `position_embd`
+  served; `mpt`'s whole-vector LayerNorm QK norm refused by name. The
+  Baichuan-13B layer-count refusal is gone. `tests/alibi_graphs.rs`:
+  KL 6.4e-13 (refact), 8.3e-8 (bloom), 3.6e-7 (mpt, `clamp_kqv 4`),
+  1.6e-7 (mpt with a position table), 7.4e-13 (jais), 1.1e-12
+  (Baichuan-13B); dropping the slopes, rotating, or the wrong slope
+  table each diverge. 75 audited.
 - **`gpt2` and `starcoder` run: the learned position table.**
   `ferrox_models::position_embd` adds `position_embd.weight`'s row
   `pos` to the token embedding at the one embedding site

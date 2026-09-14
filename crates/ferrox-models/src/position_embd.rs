@@ -18,10 +18,10 @@
 //!
 //! `grep -l POS_EMBD src/models/*.cpp` over all 140 graphs
 //! (2026-09-14): `gpt2`, `starcoder` (REQUIRED, decoders on the generic
-//! path), `mpt` (`mpt.cpp:19,80-84`, OPTIONAL beside its ALiBi bias;
-//! refused for the ALiBi, the row is recorded here so the day it closes
-//! the table is not re-measured), and `bert` / `nomic-bert` /
-//! `nomic-bert-moe` / `jina-bert-v3` on the encoder engine.
+//! path), `mpt` (`mpt.cpp:19,80-84`, OPTIONAL beside its ALiBi bias),
+//! and `bert` / `nomic-bert` /
+//! `nomic-bert-moe` / `jina-bert-v3` on the encoder engine. `mpt`'s
+//! optional table is served too (its ALiBi row, `crate::alibi`).
 //!
 //! # Where the arithmetic is
 //!
@@ -142,7 +142,17 @@ mod tests {
                         "`{arch}` adds positions and must rotate nothing"
                     );
                 }
-                Presence::Optional => assert!(!generic, "`{arch}` is refused for its ALiBi"),
+                // `mpt`: served since `crate::alibi`, its optional table
+                // added when present (tests/alibi_graphs.rs, the
+                // `mpt_posembd` fixture) and, like every ALiBi row,
+                // rotating nothing.
+                Presence::Optional => {
+                    assert!(generic, "`{arch}` is audited on its ALiBi");
+                    assert_eq!(
+                        crate::rope_layers::rope_layers(arch, 32, false),
+                        crate::rope_layers::RopeLayers::Never
+                    );
+                }
             }
         }
         assert!(!learned_positions("llama"));

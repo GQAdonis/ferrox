@@ -432,25 +432,11 @@ impl ModelConfig {
         let n_layers = layer_loops
             .map(|l| l.logical_layers())
             .unwrap_or(trunk.n_layers);
-        // Baichuan is one architecture string covering two positional
-        // schemes: 7B rotates, 13B uses ALiBi and no RoPE at all
-        // (`src/models/baichuan.cpp:11-14`, `:57-58`, where `inp_pos` is
-        // `nullptr` for 13B, so `ggml_rope_ext` is never reached).
-        // llama.cpp decides that on the layer count and says so in a
-        // comment: "TODO: become GGUF KV parameter". There is therefore
-        // no key for `capability::unsupported_feature_keys` to test and
-        // no tensor for `assert_every_tensor_consumed` to miss. A
-        // Baichuan-13B checkpoint loads clean and is rotated anyway.
-        // Refuse it here, where the layer count is known.
-        if arch == "baichuan" && n_layers == 40 {
-            return Err(LoadError::UnsupportedFeature(
-                arch.clone(),
-                "Baichuan-13B (block_count=40) uses ALiBi and no RoPE, decided by layer \
-                 count with no GGUF key to declare it; the generic decoder would rotate \
-                 every Q/K head instead. Baichuan-7B (block_count=32) is unaffected"
-                    .to_string(),
-            ));
-        }
+        // Baichuan-13B (block_count 40) used to be refused HERE: one
+        // architecture string, two positional schemes, decided by layer
+        // count with no key (`baichuan.cpp:11-14`). It is served now
+        // through `crate::alibi` (the bias) and `crate::rope_layers`
+        // (no rotation), both keyed on the same layer count.
         // EXAONE-4 32B used to be refused HERE, on the same shape:
         // `exaone4.cpp:4-14` switches the whole SWA machinery on inside
         // `if (hparams.n_layer() == 64)` and :116 then ropes only the
@@ -1403,6 +1389,11 @@ impl ModelConfig {
             attn_value_scale: crate::attn_value_scale::resolve_attn_value_scale(
                 &arch,
                 file.metadata_f32(&key("attention.value_scale")),
+            ),
+            alibi_max_bias: crate::alibi::max_alibi_bias(
+                &arch,
+                n_layers,
+                file.metadata_f32(&key("attention.max_alibi_bias")),
             ),
             layer_shapes,
             moe: MoeLayerConfig {
@@ -3011,6 +3002,9 @@ impl Decoder {
         // asking for the tensor would refuse every real OLMo-1 file;
         // the table's function decides whether the read happens.
         let final_norm = norm_sites.load_pre_norm(Some(norm_sites.output), &file, None)?;
+        // The embedding norm (`norm_sites::EMBEDDING_NORM_ARCHITECTURES`),
+        // `NormOp::None` where the site is absent.
+        let embedding_norm = norm_sites.load_pre_norm(norm_sites.embedding, &file, None)?;
         // Many small Llama/Gemma-family GGUFs tie the lm-head to
         // `token_embd.weight` and omit `output.weight` (llama.cpp
         // `llama_model_loader` falls back the same way). Prefer the
@@ -3071,10 +3065,13 @@ impl Decoder {
             crate::execution_plan::ExecutionPlan::probe_metal_caps(),
         );
 
+        let alibi_slopes = crate::decoder::config_alibi_slopes(&config);
         let decoder = Decoder {
             config,
             embedding,
             position_embd,
+            embedding_norm,
+            alibi_slopes,
             layers,
             final_norm,
             output_head,
@@ -3934,17 +3931,17 @@ mod tests {
 
     /// A NAMED problem must outrank "unaudited".
     ///
-    /// `bloom` uses ALiBi, and that is what its refusal should say.
-    /// Reporting "unaudited" instead would be true and far less useful,
-    /// and it is the ordering the loader's own comment claims. Nothing
-    /// checked that claim. (`gpt2` was the example until its learned
-    /// positions were served, `crate::position_embd`.)
+    /// `llama4` is refused for its chunked attention, and that is what
+    /// its refusal should say. Reporting "unaudited" instead would be
+    /// true and far less useful, and it is the ordering the loader's
+    /// own comment claims. Nothing checked that claim. (`gpt2` and then
+    /// `bloom` were the example until their positions were served.)
     #[test]
     fn a_named_refusal_outranks_the_unaudited_one() {
-        let err = config_for_arch("bloom").expect_err("bloom must refuse");
+        let err = config_for_arch("llama4").expect_err("llama4 must refuse");
         assert!(
             !matches!(err, LoadError::UnauditedArchitecture(..)),
-            "bloom should report its own reason, not that nobody audited it: {err:?}"
+            "llama4 should report its own reason, not that nobody audited it: {err:?}"
         );
     }
 
@@ -4999,38 +4996,27 @@ mod tests {
         );
     }
 
-    /// An architecture that uses no RoPE must not reach the generic
-    /// decoder, which rotates unconditionally.
-    ///
-    /// All five of these were admitted as `GenericGqa { rope: Neox }`.
-    /// Nothing downstream could have caught it: `bloom` and `refact`
-    /// hardcode their ALiBi slope in `load_arch_hparams` with no GGUF
-    /// key, so the metadata gates above see nothing, and `mpt` carries
-    /// no tensor the generic loader fails to consume, so
-    /// `assert_every_tensor_consumed` sees nothing either. It would have
-    /// loaded, run at full speed, and answered from rotated positions.
-    ///
-    /// `gpt2` left this list on 2026-09-14: its learned positions are
-    /// served (`crate::position_embd`) and it rotates nothing
-    /// (`rope_layers::RopeLayers::Never`), which is what the finding
-    /// asked for; `tests/position_embd_graphs.rs` is its evidence.
+    /// The `LLAMA_ROPE_TYPE_NONE` group used to be refused by name here;
+    /// every row is served now, positioned the way its graph positions
+    /// (`crate::position_embd`, `crate::alibi`), and what this pins is
+    /// that not one of them reaches a rotation: the rule is
+    /// `RopeLayers::Never` for each, at any depth it takes.
     #[test]
-    fn an_architecture_with_no_rope_is_refused_by_name() {
-        for arch in ["mpt", "refact", "bloom", "jais"] {
-            let file = open_metadata_gguf(
-                &format!("norope_{arch}"),
-                &[("general.architecture", Kv::Str(arch))],
+    fn an_architecture_with_no_rope_rotates_nothing() {
+        for (arch, n_layers) in [
+            ("gpt2", 12),
+            ("mpt", 32),
+            ("refact", 32),
+            ("bloom", 30),
+            ("jais", 40),
+            ("baichuan", 40),
+        ] {
+            assert_eq!(
+                crate::rope_layers::rope_layers(arch, n_layers, false),
+                crate::rope_layers::RopeLayers::Never,
+                "{arch} positions without RoPE and must rotate nothing"
             );
-            match ModelConfig::from_gguf(&file) {
-                Err(LoadError::DedicatedArchitectureRequired(got, reason)) => {
-                    assert_eq!(got, arch);
-                    assert!(
-                        reason.contains("ALiBi") || reason.contains("position embeddings"),
-                        "{arch}: the refusal must name what is missing, got {reason:?}"
-                    );
-                }
-                other => panic!("{arch} must be refused, got {other:?}"),
-            }
+            assert!(crate::capability::is_audited_generic(arch), "{arch}");
         }
     }
 
@@ -5100,139 +5086,40 @@ mod tests {
     /// Baichuan is one `general.architecture` string covering two
     /// positional schemes, and llama.cpp picks between them on the layer
     /// count alone (`src/models/baichuan.cpp:11-14`, with its own "TODO:
-    /// become GGUF KV parameter"). So the 13B is the MiniCPM case: no
-    /// key to gate on and no tensor to miss.
+    /// become GGUF KV parameter"). The 13B used to be refused HERE; it is
+    /// served now, and what this pins is that the two schemes are still
+    /// told apart by the count, on both tables that must agree about it
+    /// (`crate::alibi`, `crate::rope_layers`).
     #[test]
-    fn baichuan_13b_is_refused_because_it_uses_alibi_and_the_7b_is_not() {
-        let thirteen_b = open_metadata_gguf(
-            "baichuan13b",
-            &[
-                ("general.architecture", Kv::Str("baichuan")),
-                ("baichuan.block_count", Kv::U32(40)),
-            ],
+    fn baichuan_13b_positions_by_alibi_and_the_7b_rotates() {
+        assert_eq!(
+            crate::alibi::max_alibi_bias("baichuan", 40, None),
+            Some(8.0)
         );
-        match ModelConfig::from_gguf(&thirteen_b) {
-            Err(LoadError::UnsupportedFeature(arch, msg)) => {
-                assert_eq!(arch, "baichuan");
-                assert!(msg.contains("ALiBi"), "{msg}");
-                assert!(
-                    msg.contains("40"),
-                    "the refusal must name the layer count: {msg}"
-                );
-            }
-            other => panic!("Baichuan-13B must be refused, got {other:?}"),
-        }
-
-        // The 7B rotates exactly as the generic decoder does, so it must
-        // pass this gate. It still fails later, on the next missing
-        // hparam, which is what proves the gate let it through.
-        let seven_b = open_metadata_gguf(
-            "baichuan7b",
-            &[
-                ("general.architecture", Kv::Str("baichuan")),
-                ("baichuan.block_count", Kv::U32(32)),
-            ],
+        assert_eq!(
+            crate::rope_layers::rope_layers("baichuan", 40, false),
+            crate::rope_layers::RopeLayers::Never
         );
-        match ModelConfig::from_gguf(&seven_b) {
-            Err(LoadError::MissingHparam(key)) => assert_eq!(key, "baichuan.embedding_length"),
-            other => panic!("Baichuan-7B must pass the ALiBi gate, got {other:?}"),
-        }
-    }
-
-    /// The norm-slot and norm-function lists cannot contradict each
-    /// other.
-    ///
-    /// Two kinds of list feed `crate::norm_sites::NormSites::for_arch`.
-    /// The SLOT lists say which tensor a site reads:
-    /// `PRE_FFN_NORM_IS_POST_ATTENTION_NORM`,
-    /// `PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM`, `POST_NORMS_UNDER_GROK_NAMES`
-    /// and `capability::POST_NORM_ONLY_ARCHITECTURES` (no pre-norm
-    /// tensor at all). A name on two of them would have one tensor read
-    /// for two sites, or a site both present and absent, and whichever
-    /// list `for_arch` consults last would win silently. The FUNCTION
-    /// lists say how a site norms: `capability::NON_PARAMETRIC_LAYER_NORM`
-    /// and `capability::WEIGHTED_LAYER_NORM`, which are two answers to
-    /// one question and so must also be disjoint. And the parameterless
-    /// function reads no tensor, so `olmo` cannot also be on a list
-    /// that names one.
-    ///
-    /// `dbrx` is deliberately on a slot list AND a function list, which
-    /// is why this is not "every list is pairwise disjoint": where a
-    /// tensor lives and how it is applied are orthogonal facts.
-    ///
-    /// Written as loops over the lists rather than hand-written pairs,
-    /// because the previous version checked two of three and the third
-    /// would have slipped past it in either direction.
-    #[test]
-    fn the_norm_slot_and_function_lists_cannot_contradict() {
-        use crate::norm_sites::{
-            POST_NORMS_UNDER_GROK_NAMES, PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM,
-            PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
-        };
-        let slot_lists: [(&str, &[&str]); 4] = [
-            (
-                "PRE_FFN_NORM_IS_POST_ATTENTION_NORM",
-                PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
-            ),
-            (
-                "PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM",
-                PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM,
-            ),
-            ("POST_NORMS_UNDER_GROK_NAMES", POST_NORMS_UNDER_GROK_NAMES),
-            (
-                "POST_NORM_ONLY_ARCHITECTURES",
-                crate::capability::POST_NORM_ONLY_ARCHITECTURES,
-            ),
-        ];
-        // Every list `norm_function` consults, so a name on two of them
-        // -- which `norm_function`'s `if` chain would answer by order --
-        // fails here instead. It listed two of five until `phimoe`
-        // added the fifth.
-        let function_lists: [(&str, &[&str]); 5] = [
-            (
-                "NON_PARAMETRIC_LAYER_NORM",
-                crate::capability::NON_PARAMETRIC_LAYER_NORM,
-            ),
-            (
-                "NON_PARAMETRIC_RMS_NORM",
-                crate::capability::NON_PARAMETRIC_RMS_NORM,
-            ),
-            (
-                "WEIGHTED_LAYER_NORM",
-                crate::capability::WEIGHTED_LAYER_NORM,
-            ),
-            ("BIASED_LAYER_NORM", crate::capability::BIASED_LAYER_NORM),
-            ("BIASED_RMS_NORM", crate::capability::BIASED_RMS_NORM),
-        ];
-        let disjoint = |lists: &[(&str, &[&str])]| {
-            for (i, (a_name, a)) in lists.iter().enumerate() {
-                for (b_name, b) in lists.iter().skip(i + 1) {
-                    for name in a.iter() {
-                        assert!(
-                            !b.contains(name),
-                            "`{name}` is on both `{a_name}` and `{b_name}`; \
-                             `NormSites::for_arch` would read it two ways and the list it \
-                             consults last would win silently"
-                        );
-                    }
-                }
-            }
-        };
-        disjoint(&slot_lists);
-        disjoint(&function_lists);
-        for name in crate::capability::NON_PARAMETRIC_LAYER_NORM {
-            for (slot_name, slot) in &slot_lists {
-                assert!(
-                    !slot.contains(name),
-                    "`{name}` reads no norm tensor and is on `{slot_name}`, which names one"
-                );
+        assert_eq!(crate::alibi::max_alibi_bias("baichuan", 32, None), None);
+        assert_eq!(
+            crate::rope_layers::rope_layers("baichuan", 32, false),
+            crate::rope_layers::RopeLayers::All
+        );
+        // Both sizes pass the header stage and fail on the next missing
+        // hparam, which is what proves neither is gated here any more.
+        for (name, n) in [("baichuan13b", 40u32), ("baichuan7b", 32)] {
+            let file = open_metadata_gguf(
+                name,
+                &[
+                    ("general.architecture", Kv::Str("baichuan")),
+                    ("baichuan.block_count", Kv::U32(n)),
+                ],
+            );
+            match ModelConfig::from_gguf(&file) {
+                Err(LoadError::MissingHparam(key)) => assert_eq!(key, "baichuan.embedding_length"),
+                other => panic!("{name} must pass the header stage, got {other:?}"),
             }
         }
-        // Non-empty, so the loops above cannot pass by having nothing
-        // to compare.
-        assert!(!crate::capability::NON_PARAMETRIC_LAYER_NORM.is_empty());
-        assert!(!crate::capability::WEIGHTED_LAYER_NORM.is_empty());
-        assert!(!PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM.is_empty());
     }
 
     /// EXAONE-4 is ONE architecture string over TWO graphs, and

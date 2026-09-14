@@ -37,6 +37,14 @@ use lm_head::FoldedLmHead;
 use lm_head::Logits;
 use rayon::prelude::*;
 
+/// `Decoder::alibi_slopes` from the config, the ONE derivation, so a
+/// constructor cannot carry a bias without its slopes.
+pub(crate) fn config_alibi_slopes(config: &ModelConfig) -> Option<Vec<f32>> {
+    config
+        .alibi_max_bias
+        .and_then(|b| ferrox_core::alibi::slopes(config.n_heads, b))
+}
+
 /// Whether the CUDA `gqa_decode` kernel should serve the per-token GQA
 /// reduction (`FERROX_CUDA_GQA=1`). Off by default and only compiled with
 /// `--features cuda`; the host path is byte-identical when unset.
@@ -493,6 +501,13 @@ pub struct Decoder {
     /// else. `None` for every architecture that encodes position by
     /// rotation or not at all.
     pub position_embd: Option<WeightMatrix>,
+    /// The norm on the token embeddings before layer 0
+    /// (`norm_sites::EMBEDDING_NORM_ARCHITECTURES`: `bloom`'s
+    /// `token_embd_norm`, a biased LayerNorm), or [`NormOp::None`] for
+    /// every other architecture. Applied in [`Self::embed_token`], the
+    /// one embedding site; the GPU embedding gather has no norm and is
+    /// not taken for a model that has one.
+    pub embedding_norm: NormOp,
     pub layers: Vec<LayerWeights>,
     /// The norm before the LM head.
     ///
@@ -513,6 +528,12 @@ pub struct Decoder {
     /// post-projection transforms run; a head with a bias is never
     /// folded into a fused Metal decode stack (`FoldedLmHead::permit`).
     pub output_bias: Option<Vec<f32>>,
+    /// ALiBi's per-head slopes, `[n_heads]`, `Some` exactly when
+    /// `ModelConfig::alibi_max_bias` is (`ferrox_core::alibi::slopes`),
+    /// handed to every host attention kernel as its additive per-key
+    /// bias. Derived from the config at construction so the two cannot
+    /// disagree; no fused GPU path serves a model that has them.
+    pub alibi_slopes: Option<Vec<f32>>,
     /// Real VRAM budget for GPU-resident routed experts.
     /// `None` (both constructors below
     /// set it) means every expert always runs on CPU -- the exact
@@ -825,14 +846,17 @@ impl Decoder {
             crate::execution_plan::ExecutionPlan::probe_metal_caps(),
         );
 
+        let alibi_slopes = config_alibi_slopes(&config);
         Decoder {
             config,
             embedding,
             position_embd: None,
+            embedding_norm: NormOp::None,
             layers,
             final_norm,
             output_head,
             output_bias: None,
+            alibi_slopes,
             gpu_vram_budget_bytes: None,
             // Synthetic-weights constructor: no checkpoint, no gpt-oss.
             gpt_oss: None,
@@ -973,6 +997,8 @@ impl Decoder {
             // The GPU embedding gather has no add and no stack sees
             // `pos` for it (`crate::position_embd`).
             && !config.learned_positions
+            // No fused kernel adds a per-key bias (`crate::alibi`).
+            && config.alibi_max_bias.is_none()
             // Every fused launch takes ONE head width for K and V (the
             // KV buffers, the attention tile, the `wo` fold); MiMo-V2's
             // split widths stay on the host (`crate::kv_head_dims`).
@@ -2031,7 +2057,10 @@ impl Decoder {
     ) -> Vec<f32> {
         #[cfg(feature = "cuda")]
         {
-            if cuda_gqa_enabled() && self.config.layer_shapes.is_uniform() {
+            if cuda_gqa_enabled()
+                && self.config.layer_shapes.is_uniform()
+                && self.alibi_slopes.is_none()
+            {
                 match ferrox_cuda::attn::launch_gqa_decode_resident(
                     layer, q, k, v, n_heads, n_kv_heads, head_dim, seq_len,
                 ) {
@@ -2101,8 +2130,13 @@ impl Decoder {
                     .all(|l| self.layer_supports_metal_attn(l))
                 && self.layers.iter().all(Self::layer_supports_metal_dense_ffn);
             // Gemma scales the embedding row (`embedding_scale`) — the GPU
-            // gather has no scale op, so dequant + scale on the host.
-            if metal_path && self.config.embedding_scale.is_none() {
+            // gather has no scale op, so dequant + scale on the host; nor
+            // has it a norm (`embedding_norm`) or a position table (the
+            // latter already fenced through `metal_can_serve_model`).
+            if metal_path
+                && self.config.embedding_scale.is_none()
+                && matches!(self.embedding_norm, NormOp::None)
+            {
                 Self::metal_matvec_launch(&self.embedding)
                     .and_then(|l| ferrox_metal::embd::EmbdKind::from_fn_name(l.fn_name))
             } else {
@@ -2121,7 +2155,10 @@ impl Decoder {
         #[cfg(not(feature = "metal"))]
         let mut hidden = self.embed_token(token_id, pos);
         #[cfg(feature = "cuda")]
-        if cuda_gqa_enabled() && self.config.layer_shapes.is_uniform() {
+        if cuda_gqa_enabled()
+            && self.config.layer_shapes.is_uniform()
+            && self.alibi_slopes.is_none()
+        {
             // Fixed capacity so ensure_layer_kv does not recreate (and
             // wipe) mid-sequence as pos grows. ONE geometry for every
             // layer, which is why a per-layer-shape model never seeds it
@@ -3931,6 +3968,12 @@ impl Decoder {
                 *v += p;
             }
         }
+        // `bloom.cpp:77-80`: the embedding normed before layer 0. No
+        // graph has both a position table and this norm, so their
+        // order is not a graph's; it is the order the two arrived in.
+        if !matches!(self.embedding_norm, NormOp::None) {
+            row = self.embedding_norm.apply(&row, self.config.rms_norm_eps);
+        }
         if self.config.skip_stream {
             row = crate::norm::rms_norm_no_params(&row, self.config.rms_norm_eps);
         }
@@ -4601,6 +4644,7 @@ impl Decoder {
                                 window,
                                 Some(sinks),
                                 None,
+                                self.alibi_slopes.as_deref(),
                             );
                             dest.copy_from_slice(&attn_out);
                         });
@@ -4618,6 +4662,7 @@ impl Decoder {
                         base_seq_len,
                         softcap,
                         window,
+                        self.alibi_slopes.as_deref(),
                     )
                 };
 
@@ -7052,6 +7097,27 @@ mod metal_rope_tests {
     /// fused Metal path: the GPU embedding gather has no add, and no
     /// stack sees `pos` for it. Only reachable in a `--features metal`
     /// build.
+    /// An ALiBi model (`crate::alibi`) stays off every fused Metal path:
+    /// no kernel adds a per-key bias to its scores. Only reachable in a
+    /// `--features metal` build.
+    #[test]
+    fn an_alibi_bias_keeps_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+        let mut biased = plain;
+        biased.alibi_max_bias = Some(8.0);
+        let d = Decoder::new_random_small(biased.clone(), 1, 32);
+        assert!(d.alibi_slopes.is_some(), "derived from the config");
+        assert!(!d.layer_supports_metal_attn(&d.layers[0]));
+        assert!(!Decoder::metal_can_serve_model(&biased, false));
+    }
+
     #[test]
     fn a_learned_position_table_keeps_the_model_off_every_fused_metal_path() {
         let mut plain = phi_like_config();

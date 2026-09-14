@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **71** architectures run with
+Honest position, re-audited 2026-09-14. **75** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -853,6 +853,41 @@ the table or rotating every layer -- what the generic path used to do
 to GPT-2 -- diverges by more than 1. The "LayerNorm-with-bias group"
 of `tests/attn_bias.rs` is EMPTY: nine rows, nine closures, each by the
 dropped bias being implemented rather than the row being edited.
+
+ALiBi closed the rest of the `LLAMA_ROPE_TYPE_NONE` group the same
+day, FIVE rows on one seam, and the count was measured before the
+seam was built: `grep -n f_max_alibi_bias src/models/*.cpp` over the
+140 is seven files, five on the generic path, in THREE spellings --
+the literal `8.0f` (`bloom.cpp:18`, `refact.cpp:12`), the literal at
+40 layers only (`baichuan.cpp:11-14`, the 13B; the 7B rotates and was
+audited already), and `attention.max_alibi_bias` read optional
+(`mpt.cpp:6`, `jais.cpp:5`). `ferrox-core/src/alibi.rs` is llama.cpp's
+slope formula (`ggml-cpu/ops.cpp:5489-5508`: `n_head_log2`, `m0`,
+`m1`, the odd powers for the tail of a non-power-of-two head count),
+and the three host attention kernels -- row, paged, batched prefill --
+take the slopes as ONE additive term, `slope_h * (p_key - p_query)`
+after the scale and the softcap, where `ggml_soft_max_ext` adds
+`slope * mask`; a ferrox-core test pins the three against a naive
+reference and each other. `ferrox-models/src/alibi.rs` is the table,
+and `rope_layers::RopeLayers::Never` is DERIVED from it for these rows,
+so the bias and the absence of rotation cannot disagree about
+Baichuan's layer count -- the thing the old refusal had said "no key
+could see". Every fused Metal launch and the CUDA resident attention
+refuse a model with a bias. Each row then had one more thing, and each
+was a table entry: `bloom` norms its EMBEDDINGS (`token_embd_norm`,
+`norm_sites::EMBEDDING_NORM_ARCHITECTURES`, the one decoder of 140
+that does), `jais` passes `kq_scale = 1/d` (`jais.cpp:83`, the one
+graph with a literal other than `1/sqrt(d)`;
+`capability::attention_scale_override`), `mpt` clamps
+(`CLAMPED_QKV_ARCHITECTURES`, where it had been "deliberately absent"
+as a refused row) and carries an optional `position_embd` the table
+from the PR before serves. KL 6.4e-13 (refact), 8.3e-8 / 3.6e-7 /
+1.6e-7 (bloom, mpt, mpt with a position table: GELU rows at the table
+line), 7.4e-13 (jais), 1.1e-12 (Baichuan-13B at 40 layers)
+(`tests/alibi_graphs.rs`). The first run of the six goldens found the
+two things the table had not: `mpt`'s clamp was not applied (4.8 off)
+and `jais` was scaled by `1/sqrt(d)` (1.36 off), which is what a
+golden is for.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

@@ -72,6 +72,7 @@ pub enum Presence {
 /// Generic-path graphs that create `blk.N.attn_output.bias`.
 pub const ATTN_OUT_BIAS_CREATORS: &[(&str, Presence)] = &[
     ("apertus", Presence::Optional),
+    ("bloom", Presence::Required),
     ("codeshell", Presence::Required),
     ("deci", Presence::Optional),
     ("ernie4_5", Presence::Optional),
@@ -79,6 +80,8 @@ pub const ATTN_OUT_BIAS_CREATORS: &[(&str, Presence)] = &[
     ("gpt2", Presence::Required),
     ("gptneox", Presence::Required),
     ("granite", Presence::Optional),
+    ("jais", Presence::Required),
+    ("mpt", Presence::Optional),
     ("phi2", Presence::Required),
     ("granitemoe", Presence::Optional),
     ("granite-moe", Presence::Optional),
@@ -96,6 +99,7 @@ pub const ATTN_OUT_BIAS_CREATORS: &[(&str, Presence)] = &[
 /// `blk.N.ffn_down.bias` (the same flag for both in every graph), and
 /// whether they also create `blk.N.ffn_gate.bias`.
 pub const FFN_BIAS_CREATORS: &[(&str, Presence, bool)] = &[
+    ("bloom", Presence::Required, false),
     ("codeshell", Presence::Required, false),
     ("deci", Presence::Optional, true),
     ("gpt2", Presence::Required, false),
@@ -103,10 +107,12 @@ pub const FFN_BIAS_CREATORS: &[(&str, Presence, bool)] = &[
     ("granite", Presence::Optional, true),
     ("granitemoe", Presence::Optional, true),
     ("granite-moe", Presence::Optional, true),
+    ("jais", Presence::Required, true),
     ("jais2", Presence::Required, false),
     ("llama", Presence::Optional, true),
     ("minicpm", Presence::Optional, true),
     ("mistral3", Presence::Optional, true),
+    ("mpt", Presence::Optional, false),
     ("nemotron", Presence::Optional, false),
     ("phi2", Presence::Required, false),
     ("starcoder", Presence::Required, false),

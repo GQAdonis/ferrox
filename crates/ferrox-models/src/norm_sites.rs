@@ -117,6 +117,20 @@ pub const POST_NORMS_UNDER_GROK_NAMES: &[&str] = &["grok"];
 /// engines); one generic-path graph.
 pub const ATTN_NORM_2_FEEDS_ATTENTION: &[&str] = &["falcon"];
 
+/// Architectures that norm the TOKEN EMBEDDINGS before layer 0, with
+/// the model-level `token_embd_norm` pair (`LLM_TENSOR_TOKEN_EMBD_NORM`,
+/// spelled without a `blk.` prefix).
+///
+/// `bloom`: `bloom.cpp:25-26` create `tok_norm` / `tok_norm_b`
+/// REQUIRED and `:77-80` norm `inpL` with them, `LLM_NORM`, right after
+/// `build_inp_embd`. Measured over all 140 graphs: `bloom` is the one
+/// decoder on the generic path; `bert` / `nomic-bert` / `nomic-bert-moe`
+/// / `jina-bert-v2` / `jina-bert-v3` / `modern-bert` are the encoder
+/// engine, `rwkv6` / `rwkv7` / `wavtokenizer-dec` their own. The site
+/// takes the architecture's norm FUNCTION like every other
+/// ([`NormSites::function`]), so `bloom`'s is the biased LayerNorm.
+pub const EMBEDDING_NORM_ARCHITECTURES: &[&str] = &["bloom"];
+
 /// A norm site whose weight the file stores.
 ///
 /// `names` are base names tried in order; each is looked up as
@@ -251,6 +265,9 @@ pub struct NormSites {
     pub post_attn: Option<StoredNorm>,
     pub post_ffn: Option<StoredNorm>,
     pub output: StoredNorm,
+    /// The norm on the token embeddings before layer 0, or `None` for
+    /// every architecture but [`EMBEDDING_NORM_ARCHITECTURES`].
+    pub embedding: Option<StoredNorm>,
 }
 
 impl NormSites {
@@ -264,6 +281,9 @@ impl NormSites {
             post_attn: Some(StoredNorm::optional(&["post_attention_norm"])),
             post_ffn: Some(StoredNorm::optional(&["post_ffw_norm"])),
             output: StoredNorm::required(&["output_norm"]),
+            embedding: EMBEDDING_NORM_ARCHITECTURES
+                .contains(&arch)
+                .then_some(StoredNorm::required(&["token_embd_norm"])),
         };
         if crate::capability::is_post_norm_only(arch) {
             sites.attn = None;
@@ -379,6 +399,11 @@ mod tests {
         );
         assert_eq!(s.post_ffn, Some(StoredNorm::optional(&["post_ffw_norm"])));
         assert_eq!(s.output, StoredNorm::required(&["output_norm"]));
+        assert_eq!(s.embedding, None);
+        assert_eq!(
+            NormSites::for_arch("bloom").embedding,
+            Some(StoredNorm::required(&["token_embd_norm"]))
+        );
     }
 
     /// `attn_output_norm` feeds a DIFFERENT site on the two rows that

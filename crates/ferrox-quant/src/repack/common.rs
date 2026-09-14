@@ -43,8 +43,21 @@ pub enum AccelX4 {
 
 impl AccelX4 {
     /// The fastest kernel available on this host.
+    ///
+    /// Resolved once per process. The feature probe underneath is a
+    /// `sysctlbyname` walk on Apple platforms, and below macOS 15 /
+    /// iOS 18 there is no `hw.optional.arm.caps` fast path, so it is
+    /// ~20 sysctls rather than one bit test. That is cheap once and not
+    /// cheap per matmul, and [`preferred_interleave`] and
+    /// [`interleaved_gemm_is_accelerated`] both call this on paths that
+    /// run per matrix.
     #[inline]
     pub fn detect() -> Self {
+        static CACHED: std::sync::OnceLock<AccelX4> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(Self::probe)
+    }
+
+    fn probe() -> Self {
         #[cfg(target_arch = "aarch64")]
         {
             if std::arch::is_aarch64_feature_detected!("i8mm") {
@@ -84,11 +97,54 @@ impl AccelX4 {
 /// the whole `×4` tier or none of it, and no kind can be told "yes" while
 /// its kernel is missing.
 ///
-/// The `×4` GEMMs exist only for the interleave-8 layout, on either
-/// architecture, which is why the width is part of the question.
+/// The interleave-8 `×4` GEMMs -- the ones reading a pre-interleaved
+/// activation quad -- exist only for that layout, on either
+/// architecture, which is why the width is part of the question. This
+/// is NOT the same question as "does a SIMD batch GEMM exist at all";
+/// see [`batch_gemm_is_accelerated`].
 #[inline]
 pub fn interleaved_gemm_is_accelerated(interleave: usize) -> bool {
     interleave == 8 && AccelX4::detect().is_simd()
+}
+
+/// Whether a SIMD batch GEMM -- of ANY layout -- runs on this host for
+/// `interleave`-packed weights.
+///
+/// [`interleaved_gemm_is_accelerated`] answers a narrower question: it
+/// is about the interleave-8 quad kernels specifically, which is what
+/// the five `q*_gemm_uses_acts_x4` entry points need, because that quad
+/// is the thing they decide whether to prepare.
+///
+/// It is not the right question for "is the batch tier worth taking on
+/// this host", and reading it as though it were is a real drift. Four
+/// of the five kinds -- Q4_K, Q5_K, Q8_0, Q4_0 -- also have a width-4
+/// `dotprod` GEMM in `gemm_*_group` (`gemm_*_neon_sdot`), which runs on
+/// every aarch64 host with `dotprod` and no `i8mm`: every Apple M1, every
+/// A14-and-earlier iPhone, and the Cortex-A55-class cores that are still
+/// most of the Android fleet. On those hosts the interleave-8 predicate
+/// says "no SIMD GEMM" while a SIMD GEMM is what actually runs.
+///
+/// Q6_K is the exception and deliberately so: it has no width-4 GEMM
+/// because the scalar Kx8 GEMM measured SLOWER than the per-row NEON dot
+/// on ARM (see [`q6_kx8_gemm_uses_acts_x4`]). It falls to the per-row
+/// path there, which is the intended behaviour and not a missing kernel.
+/// So this predicate answers "does the tier buy anything here", and the
+/// per-kind entry points still decide what each kind does with it.
+#[inline]
+pub fn batch_gemm_is_accelerated(interleave: usize) -> bool {
+    if interleaved_gemm_is_accelerated(interleave) {
+        return true;
+    }
+    // The `gemm_*_neon_sdot` arm in `gemm_*_group`, for the four kinds
+    // that have one.
+    #[cfg(target_arch = "aarch64")]
+    let width_4_simd = interleave == 4 && std::arch::is_aarch64_feature_detected!("dotprod");
+    #[cfg(not(target_arch = "aarch64"))]
+    let width_4_simd = {
+        let _ = interleave;
+        false
+    };
+    width_4_simd
 }
 
 /// The qs interleave width a matrix should be packed with on this host:

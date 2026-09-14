@@ -1028,6 +1028,17 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     "bloom",
     "mpt",
     "jais",
+    // tests/minimax_m2_graphs.rs: `minimax-m2` (MiniMax-M2, 230B MoE).
+    // `minimax-m2.cpp:26,30-31,96-106,131-141`: plain GQA, ONE RMSNorm
+    // over the whole Q projection and one over K (`attn_q_norm` is
+    // `n_embd_head_k * n_head` wide), partial NEOX RoPE (`n_rot 64` of
+    // `head_dim 128`), one SiLU MoE on every layer with `exp_probs_b`,
+    // `norm_w = true` and the gating function from the key (SIGMOID on
+    // every real export; the default aborts upstream). No dense layer,
+    // no shared expert, no biases; `expert_weights_scale` is never read
+    // by its hparams. Its refusal had said "a fixture away" for a week
+    // while the fixture sat in `tests/fixtures/`.
+    "minimax-m2",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -2202,32 +2213,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // an hparam, not a ceiling.
         //
         // llama-arch.cpp puts both in the NEOX RoPE group.
-        v.push(prof(
-            "minimax-m2",
-            TextGeneration,
-            Dedicated,
-            KvGqa,
-            Neox,
-            ArchPath::DedicatedOnly {
-                // `minimax-m2.cpp` is plain GQA: `create_tensor_qkv` at
-                // :26, whole-vector Q/K norm at :30-31 (`attn_q_norm` is
-                // `n_embd_head_k * n_head` wide, NOT per-head), partial
-                // NEOX RoPE at :96-106 (:51 notes head_dim=128 but
-                // n_rot=64), and one SiLU MoE with `exp_probs_b`,
-                // `expert_weights_scale` and norm_w=true at :131-141.
-                // ferrox implements every one of those on the generic
-                // path. What is missing is EVIDENCE, not capability.
-                reason: "minimax-m2 is UNAUDITED, not unimplemented: llama.cpp's minimax-m2.cpp \
-                         builds plain GQA + whole-vector QK-norm + partial NEOX RoPE (n_rot=64 < \
-                         head_dim=128) + a SiLU sigmoid MoE with exp_probs_b, all of which the \
-                         generic path already has. Admitting it needs a fixture or a parity run \
-                         against llama.cpp, not new code",
-            },
-            // `attn_q_norm` is `{n_embd_head_k * n_head}` wide
-            // (minimax-m2.cpp:30) -- one RMSNorm over the whole Q
-            // projection, OLMoE's style, not Qwen3's per-head.
-            WholeVector,
-        ));
+        // `minimax-m2` was HERE as "UNAUDITED, not unimplemented" -- plain
+        // GQA, whole-vector QK-norm, partial NEOX RoPE, a sigmoid MoE
+        // with `exp_probs_b` -- and it is audited now on the fixture that
+        // had evidenced the claim (tests/minimax_m2_graphs.rs). NEOX
+        // RoPE: llama-model.cpp:2672.
+        v.push(gqa_neox("minimax-m2"));
         v.push(prof(
             "minimax-m3",
             TextGeneration,
@@ -3744,15 +3735,13 @@ mod tests {
             resolve_architecture("deepseek4"),
             Some(ArchPath::DedicatedOnly { .. })
         ));
-        for arch in ["minimax-m2", "minimax-m3"] {
-            assert!(
-                matches!(
-                    resolve_architecture(arch),
-                    Some(ArchPath::DedicatedOnly { .. })
-                ),
-                "{arch} must fail closed, not silent generic GQA"
-            );
-        }
+        assert!(
+            matches!(
+                resolve_architecture("minimax-m3"),
+                Some(ArchPath::DedicatedOnly { .. })
+            ),
+            "minimax-m3 must fail closed, not silent generic GQA"
+        );
         match resolve_architecture("llama4") {
             Some(ArchPath::DedicatedOnly { reason }) => {
                 assert!(

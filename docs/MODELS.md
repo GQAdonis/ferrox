@@ -77,7 +77,7 @@ OLMoE (1.11×) and Gemma-3-1B (1.18×) on Metal.
 | Gemma-4-E2B | Dedicated `Gemma4Engine` + SPM-style `gemma4` BPE tokenizer + `<|turn>` chat wrap. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` (`unsloth/gemma-4-E2B-it-GGUF`). Suite id `gemma4_e2b_q4km`, Homebrew llama may still lack `gemma4` arch. **Cross-engine evidence since 2026-09-12**: against a libllama built from `.scratch/llama.cpp` (1269cb1, which has `gemma4.cpp`), `ferrox parity` reads tokenizer MATCH (21 cases x 2) and logits MATCH, KL 5.1e-4 on Q4_K_M with top-10 overlap 10/10 -- the K-quant band, so the graph agrees and the file is not one a WRONG line can be drawn on. |
 | gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal stops with an error, because no Metal kernel implements attention sinks. The paged-KV decode path runs it: all three attention arms are bit-identical to their contiguous twins |
 | Llama 4 | **Will not load**, with the reason stated: `llama4 MoE + non-GQA attn` |
-| MiniMax | **Will not load**, and the two are refused for different reasons. `minimax-m2` is *unaudited, not unimplemented*: plain GQA + whole-vector QK norm + partial NEOX RoPE + a sigmoid MoE with `exp_probs_b`, all of which the generic path has, so it needs a fixture rather than code. `minimax-m3` needs MiniMax Sparse Attention (a per-layer indexer driving its own MSA KV cache), of which ferrox has only the block-selection rule |
+| MiniMax | `minimax-m2` (MiniMax-M2) **runs** on the generic path since 2026-09-14: plain GQA + whole-vector QK norm + partial NEOX RoPE + a sigmoid MoE with `exp_probs_b`, KL 3.4e-15 against libllama on the fixture that had said it was a fixture away (`tests/minimax_m2_graphs.rs`). `minimax-m3` **will not load**: it needs MiniMax Sparse Attention (a per-layer indexer driving its own MSA KV cache), of which ferrox has only the block-selection rule |
 | Hybrid GDN / Qwen3.5 | Scaffold only |
 | Kimi K3 / GLM-5.2 / DeepSeek V4 | Loaders and primitives only. Nothing has been run end to end on a real checkpoint |
 | Vision | Finds an mmproj file and warns about it. An `image_url` in a request returns an error |
@@ -97,8 +97,8 @@ The error always names the reason. Six things cause it:
 1. **Ferrox does not know the architecture.** It is not in the
    capability registry.
 
-2. **Ferrox knows it and has not implemented it.** `llama4`,
-   `minimax-m2` and `minimax-m3` stop with the missing feature named.
+2. **Ferrox knows it and has not implemented it.** `llama4` and
+   `minimax-m3` stop with the missing feature named.
    The parallel residual, `x + attn(norm(x)) + ffn(norm(x))`, used to
    be this list's biggest group and is served now
    (`ferrox_models::parallel_residual`; `gptneox` and `plamo` run on
@@ -201,7 +201,7 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; **75** do
+   logit comparison against real `libllama`, or a fixture; **76** do
    today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
    `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
    `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
@@ -213,8 +213,8 @@ The error always names the reason. Six things cause it:
    `arctic`, `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`,
    `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`,
    `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `refact`,
-   `bloom`, `mpt`, `jais`, `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`,
-   `dots1`).
+   `bloom`, `mpt`, `jais`, `minimax-m2`, `gemma`, `gemma2`, `gemma3`, `phi3`,
+   `gpt-oss`, `dots1`).
    The other **2** stop with `UnauditedArchitecture`. (`plm` is not in
    the 54 and not in the 2: it runs on the MLA engine, `DedicatedOnly`,
    with its own golden.)

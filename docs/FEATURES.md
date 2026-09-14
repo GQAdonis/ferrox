@@ -40,10 +40,12 @@ is faster.
   (`ferrox_moe::route_gemma4_moe`) but the loader still expects
   `ffn_gate.weight`, so a MoE Gemma-4 GGUF does not load yet.
 - **MiniMax**, and the two architectures are not one thing.
-  `minimax-m2` builds ordinary dense GQA with whole-vector Q/K norm,
-  partial NEOX RoPE and a sigmoid MoE with router bias, every one of
-  which the generic path implements: it is **unaudited, not
-  unimplemented**, and what it needs is a fixture. `minimax-m3` is
+  `minimax-m2` (MiniMax-M2) builds ordinary dense GQA with whole-vector
+  Q/K norm, partial NEOX RoPE and a sigmoid MoE with router bias, every
+  one of which the generic path implements, and it RUNS since
+  2026-09-14: the fixture that had evidenced "unaudited, not
+  unimplemented" got its libllama golden, KL 3.4e-15
+  (`tests/minimax_m2_graphs.rs`). `minimax-m3` is
   genuinely unimplemented, and the blocker is MiniMax Sparse Attention:
   a per-layer indexer driving its own KV cache with position-to-cell
   maps, plus `SWIGLU_OAI` and shared experts. The block-sparse block

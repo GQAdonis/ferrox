@@ -46,14 +46,12 @@
 //!     crates/ferrox-models/tests/fixtures/minimax_m2_tiny.gguf
 //! ```
 //!
-//! NOTE ON SCOPE: nothing here claims minimax-m2 *runs*. Admitting it to
-//! `AUDITED_GENERIC_GQA` needs a first-token logit comparison against
-//! llama.cpp on this file (`ferrox parity` / `tools/llama_logits.c`), and
-//! until that exists the honest state is a refusal that says "unaudited".
+//! `minimax-m2` RUNS since 2026-09-14: `tests/minimax_m2_graphs.rs` is
+//! the libllama golden on this same file, which is what "unaudited"
+//! had been waiting for.
 
 use ferrox_gguf::TensorSource;
 use ferrox_models::capability::{resolve_architecture, resolve_profile, ArchPath, QkNormStyle};
-use ferrox_models::loader::LoadError;
 use ferrox_models::ModelConfig;
 
 const FIXTURE: &str = concat!(
@@ -211,28 +209,14 @@ fn minimax_m2_moe_is_the_routing_ferrox_already_has() {
 /// The refusal a user actually hits, and the whole point of this file:
 /// it must not blame MTP, and it must say which of the two problems it
 /// is — missing evidence, or missing code.
+/// `minimax-m2` refused here as "unaudited" until the fixture below got
+/// its libllama golden (`tests/minimax_m2_graphs.rs`); it loads now.
 #[test]
-fn minimax_m2_refuses_with_the_reason_that_is_actually_true() {
+fn minimax_m2_loads_on_the_generic_path() {
     let file = open();
-    match ModelConfig::from_gguf(&file) {
-        Err(LoadError::DedicatedArchitectureRequired(arch, reason)) => {
-            assert_eq!(arch, "minimax-m2");
-            let lower = reason.to_ascii_lowercase();
-            assert!(
-                !lower.contains("mtp") && !lower.contains("nextn"),
-                "no MiniMax GGUF can carry MTP tensors; the reason must not blame them: {reason}"
-            );
-            assert!(
-                lower.contains("unaudited"),
-                "m2 is unaudited, not unimplemented -- the reason must say which: {reason}"
-            );
-            assert!(
-                reason.contains("minimax-m2.cpp"),
-                "the reason must cite the llama.cpp graph it was checked against: {reason}"
-            );
-        }
-        other => panic!("minimax-m2 must fail closed with a named reason, got {other:?}"),
-    }
+    let config = ModelConfig::from_gguf(&file).expect("audited: the header parses");
+    assert_eq!(config.moe.n_experts, 6);
+    assert!(ferrox_models::capability::is_audited_generic("minimax-m2"));
 }
 
 /// M3's reason names MiniMax Sparse Attention, which is the real
@@ -263,16 +247,16 @@ fn minimax_m3_refuses_for_sparse_attention_not_for_mtp() {
 /// wrong for M3.
 #[test]
 fn m2_and_m3_are_not_the_same_architecture() {
-    let m2 = resolve_architecture("minimax-m2").expect("m2 in catalog");
-    let m3 = resolve_architecture("minimax-m3").expect("m3 in catalog");
-    let (ArchPath::DedicatedOnly { reason: r2 }, ArchPath::DedicatedOnly { reason: r3 }) = (m2, m3)
-    else {
-        panic!("both MiniMax rows must be DedicatedOnly");
-    };
-    assert_ne!(
-        r2, r3,
-        "M2 is plain GQA and M3 is sparse-attention; one string cannot be true of both"
-    );
+    // M2 is generic and M3 refused: the two rows cannot share a path,
+    // let alone a reason, any more.
+    assert!(matches!(
+        resolve_architecture("minimax-m2"),
+        Some(ArchPath::GenericGqa { .. })
+    ));
+    assert!(matches!(
+        resolve_architecture("minimax-m3"),
+        Some(ArchPath::DedicatedOnly { .. })
+    ));
 
     // minimax-m2.cpp:30 is `n_embd_head_k * n_head` wide; minimax-m3.cpp:54
     // is `n_embd_head_k`, with llama.cpp's own comment "per-head QK-norm".
@@ -290,18 +274,16 @@ fn m2_and_m3_are_not_the_same_architecture() {
 /// `AUDITED_GENERIC_GQA` without a logit comparison converts an honest
 /// refusal into a silent wrong answer.
 #[test]
-fn neither_minimax_is_on_the_generic_path() {
-    for arch in ["minimax-m2", "minimax-m3"] {
-        assert!(
-            matches!(
-                resolve_architecture(arch),
-                Some(ArchPath::DedicatedOnly { .. })
-            ),
-            "{arch} must fail closed"
-        );
-        assert!(
-            !ferrox_models::capability::is_audited_generic(arch),
-            "{arch} has no parity evidence; it may not be listed as audited"
-        );
-    }
+fn minimax_m3_is_not_on_the_generic_path() {
+    assert!(
+        matches!(
+            resolve_architecture("minimax-m3"),
+            Some(ArchPath::DedicatedOnly { .. })
+        ),
+        "minimax-m3 must fail closed"
+    );
+    assert!(
+        !ferrox_models::capability::is_audited_generic("minimax-m3"),
+        "minimax-m3 has no parity evidence; it may not be listed as audited"
+    );
 }

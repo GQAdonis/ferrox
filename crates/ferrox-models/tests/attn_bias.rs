@@ -332,15 +332,23 @@ fn the_layer_norm_bias_entry_is_backed_by_real_code() {
         let config = ferrox_models::ModelConfig::from_gguf(&file).expect("config parses");
         let d = ferrox_models::Decoder::from_gguf(&path, config).expect("fixture loads");
         for (i, layer) in d.layers.iter().enumerate() {
+            use ferrox_models::norm::NormOp;
+            use ferrox_models::parallel_residual::ParallelNorm;
             assert!(
-                matches!(
-                    layer.attn.norm_weight,
-                    ferrox_models::norm::NormOp::LayerNormBias { .. }
-                ) && matches!(
-                    layer.moe.norm_weight,
-                    ferrox_models::norm::NormOp::LayerNormBias { .. }
-                ),
+                matches!(layer.attn.norm_weight, NormOp::LayerNormBias { .. }),
                 "{arch} layer {i}: the LayerNorm biases were not read into the biased variant"
+            );
+            // A shared-norm parallel layer (`falcon`-7B, `phi2`) has no
+            // pre-FFN tensor and no pre-FFN norm: the FFN reads the
+            // attention norm's output (`ferrox_models::parallel_residual`).
+            let pre_ffn_ok = match layer.moe.parallel {
+                Some(ParallelNorm::SharedNorm) => matches!(layer.moe.norm_weight, NormOp::None),
+                _ => matches!(layer.moe.norm_weight, NormOp::LayerNormBias { .. }),
+            };
+            assert!(
+                pre_ffn_ok,
+                "{arch} layer {i}: the pre-FFN slot is not the biased variant (or the \
+                 shared-norm parallel layer's None)"
             );
         }
         assert!(matches!(

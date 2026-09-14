@@ -18,7 +18,9 @@
 //!   sa_inp`, over an RMSNorm).
 //! - **Two norms** (`TwoNorms`): `x + attn(ln1(x)) + ffn(ln2(x))`,
 //!   `gptneox.cpp:143-166` (`use_parallel_residual`, read at `:5`) and
-//!   `falcon.cpp:79-85` (Falcon-40B, `attn_norm_2`).
+//!   `falcon.cpp:79-85` (Falcon-40B: `attn_norm_2` present, and it is
+//!   ATTENTION's norm, `attn_norm` staying the FFN's; every Falcon layer
+//!   is parallel, the optional tensor only picks the arm).
 //!
 //! # Reach -- MEASURED
 //!
@@ -88,17 +90,22 @@ pub enum ParallelWhen {
     FfnNormAbsent,
     /// `{arch}.use_parallel_residual` is true (`gptneox.cpp:5,143`).
     ParallelResidualKey,
-    /// `blk.N.attn_norm_2.weight` is present (`falcon.cpp:79`); absent
-    /// is the shared-norm shape.
-    AttnNorm2Present,
 }
 
 /// One graph that builds the parallel residual.
 #[derive(Debug, Clone, Copy)]
 pub struct ParallelResidual {
     pub arch: &'static str,
+    /// The arm a parallel layer takes when `second_norm` is absent or
+    /// `None`.
     pub norm: ParallelNorm,
     pub when: ParallelWhen,
+    /// A per-layer OPTIONAL tensor whose presence turns the layer into
+    /// the two-norm arm: `falcon.cpp:35-36,79-85`'s `attn_norm_2`, which
+    /// norms the layer input FOR ATTENTION while `attn_norm` keeps
+    /// feeding the FFN (`crate::norm_sites::ATTN_NORM_2_FEEDS_ATTENTION`
+    /// crosses the two slots on such a layer).
+    pub second_norm: Option<&'static str>,
     pub lines: &'static str,
 }
 
@@ -110,48 +117,56 @@ pub const PARALLEL_RESIDUAL_GRAPHS: &[ParallelResidual] = &[
         arch: "stablelm",
         norm: ParallelNorm::SharedNorm,
         when: ParallelWhen::FfnNormAbsent,
+        second_norm: None,
         lines: "src/models/stablelm.cpp:38-39,129-138,147",
     },
     ParallelResidual {
         arch: "gptneox",
         norm: ParallelNorm::TwoNorms,
         when: ParallelWhen::ParallelResidualKey,
+        second_norm: None,
         lines: "src/models/gptneox.cpp:5,143-166",
     },
     ParallelResidual {
         arch: "phi2",
         norm: ParallelNorm::SharedNorm,
         when: ParallelWhen::Always,
+        second_norm: None,
         lines: "src/models/phi2.cpp:67,108,116-117",
     },
     ParallelResidual {
         arch: "falcon",
-        norm: ParallelNorm::TwoNorms,
-        when: ParallelWhen::AttnNorm2Present,
+        norm: ParallelNorm::SharedNorm,
+        when: ParallelWhen::Always,
+        second_norm: Some("attn_norm_2"),
         lines: "src/models/falcon.cpp:35-36,79-85,124-135",
     },
     ParallelResidual {
         arch: "command-r",
         norm: ParallelNorm::SharedNorm,
         when: ParallelWhen::Always,
+        second_norm: None,
         lines: "src/models/command-r.cpp:68,106-119",
     },
     ParallelResidual {
         arch: "cohere2",
         norm: ParallelNorm::SharedNorm,
         when: ParallelWhen::Always,
+        second_norm: None,
         lines: "src/models/cohere2.cpp:120-134",
     },
     ParallelResidual {
         arch: "cohere2moe",
         norm: ParallelNorm::SharedNorm,
         when: ParallelWhen::Always,
+        second_norm: None,
         lines: "src/models/cohere2moe.cpp:222-266",
     },
     ParallelResidual {
         arch: "plamo",
         norm: ParallelNorm::SharedNorm,
         when: ParallelWhen::Always,
+        second_norm: None,
         lines: "src/models/plamo.cpp:59-64,97-98,111-112",
     },
 ];
@@ -175,9 +190,6 @@ pub fn layer_is_parallel(file: &impl TensorSource, arch: &str, l: usize) -> bool
         ParallelWhen::ParallelResidualKey => file
             .metadata_bool(&format!("{arch}.use_parallel_residual"))
             .unwrap_or(false),
-        ParallelWhen::AttnNorm2Present => file
-            .find_tensor(&format!("blk.{l}.attn_norm_2.weight"))
-            .is_some(),
     }
 }
 
@@ -186,7 +198,18 @@ pub fn layer_is_parallel(file: &impl TensorSource, arch: &str, l: usize) -> bool
 /// the table, and a table row whose rule does not fire on this layer).
 pub fn layer_parallel_norm(file: &impl TensorSource, arch: &str, l: usize) -> Option<ParallelNorm> {
     let row = parallel_residual(arch)?;
-    layer_is_parallel(file, arch, l).then_some(row.norm)
+    if !layer_is_parallel(file, arch, l) {
+        return None;
+    }
+    let has_second = row.second_norm.is_some_and(|name| {
+        file.find_tensor(&format!("blk.{l}.{name}.weight"))
+            .is_some()
+    });
+    Some(if has_second {
+        ParallelNorm::TwoNorms
+    } else {
+        row.norm
+    })
 }
 
 /// Whether any trunk layer of `arch` in `file` is parallel: the
@@ -218,7 +241,10 @@ mod tests {
             );
             assert_eq!(
                 generic,
-                matches!(row.arch, "stablelm" | "gptneox" | "plamo" | "command-r"),
+                matches!(
+                    row.arch,
+                    "stablelm" | "gptneox" | "plamo" | "command-r" | "falcon"
+                ),
                 "`{}`: a generic-path row here must have a golden in \
                  tests/parallel_residual_graphs.rs or its own graph test",
                 row.arch
@@ -285,10 +311,13 @@ mod tests {
             Some(ParallelNorm::TwoNorms)
         );
 
+        // Every Falcon layer is parallel; `attn_norm_2` picks the arm.
         let falcon_7b = StubSource::with_tensors(&["blk.0.attn_norm.weight"]);
-        assert!(!layer_is_parallel(&falcon_7b, "falcon", 0));
+        assert_eq!(
+            layer_parallel_norm(&falcon_7b, "falcon", 0),
+            Some(ParallelNorm::SharedNorm)
+        );
         let falcon_40b = StubSource::with_tensors(&["blk.0.attn_norm_2.weight"]);
-        assert!(layer_is_parallel(&falcon_40b, "falcon", 0));
 
         let phi2 = StubSource::with_tensors(&["blk.0.ffn_norm.weight"]);
         assert_eq!(

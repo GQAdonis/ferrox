@@ -137,6 +137,16 @@ is faster.
   per-head LayerNorm QK norm llama.cpp REQUIRES at that depth and is
   refused by name (`ferrox_models::qk_layer_norm`) from a 64-layer
   fixture libllama runs.
+- **Falcon (`falcon`): Falcon-7B, 40B and 180B run.** Both of
+  `falcon.cpp`'s shapes, decided per layer by one optional tensor: 7B is
+  the shared-norm parallel residual over the biased LayerNorm with a
+  fused multi-query `attn_qkv` and the ungated GELU; 40B / 180B carry
+  `attn_norm_2`, which norms the layer input FOR ATTENTION while
+  `attn_norm` keeps feeding the FFN, the two-norm arm with the names
+  crossed relative to `gptneox` (`norm_sites::ATTN_NORM_2_FEEDS_
+  ATTENTION`, one graph of 140). `tests/falcon_graphs.rs`: KL 3.8e-8
+  and 1.9e-7 at the f16 GELU-table line; swapping the two slots back
+  diverges by more than 1.
 - **The LayerNorm with a bias, and with it Orion-14B (`orion`) and
   Nemotron-4 / Minitron (`nemotron`).** `NormOp::LayerNormBias` is
   `build_norm(x, w, b, LLM_NORM)`, the variant the eight-row
@@ -332,10 +342,10 @@ is faster.
   `rope.scaling.finetuned = false` stops too, because llama.cpp then
   runs it with no rotation at all and there is no way to express that
   here.
-- **Four parallel-residual architectures still do not load**:
-  `cohere2`, `cohere2moe`, `falcon`, `phi2`. The residual itself is
-  served (`ferrox_models::parallel_residual`, below); each of these
-  names what it needs on top of it.
+- **Three parallel-residual architectures still do not load**:
+  `cohere2`, `cohere2moe`, `phi2`. The residual itself is served
+  (`ferrox_models::parallel_residual`, below); each of these names what
+  it needs on top of it.
 
 Full matrix: [`MODELS.md`](MODELS.md) ·
 [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) ·

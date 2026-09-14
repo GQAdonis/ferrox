@@ -2503,6 +2503,10 @@ impl Decoder {
             // than the post-attention residual, and under which norm
             // (`crate::parallel_residual`).
             let parallel = crate::parallel_residual::layer_parallel_norm(&file, &arch, l);
+            // THIS layer's norm slots: the architecture's row, with
+            // Falcon-40B's `attn_norm_2` crossing the two pre-norm names
+            // on the layers that carry it (`crate::norm_sites`).
+            let layer_sites = norm_sites.for_layer(&arch, &file, l);
             // BitNet's two inner norms, REQUIRED when the architecture
             // has them and untouched otherwise (`crate::sub_norms`).
             let sub_norms = crate::sub_norms::load_sub_norms(
@@ -2587,7 +2591,7 @@ impl Decoder {
                         o_proj: load_weight_matrix(&file, &format!("blk.{l}.attn_output.weight"))?,
                         // Which tensor, which function, and whether there is a
                         // norm here at all: all three answered by the table.
-                        norm_weight: norm_sites.load_pre_norm(norm_sites.attn, &file, Some(l))?,
+                        norm_weight: layer_sites.load_pre_norm(layer_sites.attn, &file, Some(l))?,
                         q_norm,
                         k_norm,
                         // Qwen2/Qwen2-MoE-family real QKV bias (`attn_{q,k,v}.bias`,
@@ -2956,7 +2960,7 @@ impl Decoder {
                 {
                     NormOp::None
                 } else {
-                    norm_sites.load_pre_norm(norm_sites.ffn, &file, Some(l))?
+                    layer_sites.load_pre_norm(layer_sites.ffn, &file, Some(l))?
                 },
                 parallel,
                 activation_counts,
@@ -3749,6 +3753,10 @@ mod tests {
                 "POST_NORMS_UNDER_GROK_NAMES",
                 crate::norm_sites::POST_NORMS_UNDER_GROK_NAMES,
             ),
+            (
+                "ATTN_NORM_2_FEEDS_ATTENTION",
+                crate::norm_sites::ATTN_NORM_2_FEEDS_ATTENTION,
+            ),
             ("LEADING_DENSE_KEY_IS_INERT", LEADING_DENSE_KEY_IS_INERT),
             (
                 "QK_NORM_AFTER_ROPE_ARCHITECTURES",
@@ -3809,6 +3817,10 @@ mod tests {
             (
                 "POST_NORMS_UNDER_GROK_NAMES",
                 crate::norm_sites::POST_NORMS_UNDER_GROK_NAMES,
+            ),
+            (
+                "ATTN_NORM_2_FEEDS_ATTENTION",
+                crate::norm_sites::ATTN_NORM_2_FEEDS_ATTENTION,
             ),
             ("LEADING_DENSE_KEY_IS_INERT", LEADING_DENSE_KEY_IS_INERT),
             (

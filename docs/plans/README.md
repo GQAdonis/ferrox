@@ -60,23 +60,25 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **69** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **71** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`; `deepseek2` in both tensor forms, `tests/deepseek2_graphs.rs`; the real PLM-1.8B through `ferrox parity`), `Gemma4` has it on the real Gemma-4-E2B (parity MATCH, KL 5.1e-4 on Q4_K_M, against a libllama that has `gemma4.cpp`), `Glm52` and `Kimi` none |
 | Refuses as **unaudited**, now triaged | 2 |
-| Off the generic path: refuses by name, or reaches one of those 4 engines | 76 (44 `dedicated` + 32 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2` and `phimoe` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
+| Off the generic path: refuses by name, or reaches one of those 4 engines | 74 (42 `dedicated` + 32 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2` and `starcoder` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 71 generic-gqa (69 of
-them audited), 44 dedicated, 32 deferred, 3 test fixtures.
+regenerated with `ferrox archs --write`: 150 rows, 73 generic-gqa (71 of
+them audited), 42 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
 opt-in: an architecture not on the audited list stops rather than
 guessing. The five strings that used to compute ALiBi or learned
 position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`,
-`refact`, `bloom`, `jais`) are `DedicatedOnly` refusals, pinned by a
-test that they can never be re-listed as audited.
+`refact`, `bloom`, `jais`) became `DedicatedOnly` refusals, pinned by a
+test; `gpt2` left that test on 2026-09-14 the right way round, audited
+on a rule that rotates nothing with its table added
+(`ferrox_models::position_embd`), and the four ALiBi rows stay pinned.
 
 The 2 unaudited refusals split 0 fixture-away / 0 one-match-arm /
 1 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
@@ -236,6 +238,12 @@ way: the norm biases it "required LayerNorm" for are RMSNorm biases
 140), and its two projection biases were slots already
 (`tests/phimoe_graphs.rs`, KL 1.9e-11); the window key it writes is
 dead metadata as `phi3`'s, and a test had asserted the opposite.
+`gpt2` and `starcoder` closed together the same day on the seam the
+bias group's last row had named: a learned position table added to the
+embeddings and NO rotation (`ferrox_models::position_embd`,
+`rope_layers::RopeLayers::Never`; three graphs of 140 create the
+tensor, `mpt`'s optional). The bias group of `tests/attn_bias.rs` is
+empty (`tests/position_embd_graphs.rs`, KL 1.9e-7 each).
 
 `olmo2` and `exaone4` closed TOGETHER, because they are one residual
 topology and not two. Neither has an `attn_norm` or an `ffn_norm`

@@ -76,6 +76,7 @@ pub const ATTN_OUT_BIAS_CREATORS: &[(&str, Presence)] = &[
     ("deci", Presence::Optional),
     ("ernie4_5", Presence::Optional),
     ("gpt-oss", Presence::Required),
+    ("gpt2", Presence::Required),
     ("gptneox", Presence::Required),
     ("granite", Presence::Optional),
     ("phi2", Presence::Required),
@@ -87,6 +88,7 @@ pub const ATTN_OUT_BIAS_CREATORS: &[(&str, Presence)] = &[
     ("mistral3", Presence::Optional),
     ("nemotron", Presence::Optional),
     ("phimoe", Presence::Required),
+    ("starcoder", Presence::Required),
     ("starcoder2", Presence::Required),
 ];
 
@@ -96,6 +98,7 @@ pub const ATTN_OUT_BIAS_CREATORS: &[(&str, Presence)] = &[
 pub const FFN_BIAS_CREATORS: &[(&str, Presence, bool)] = &[
     ("codeshell", Presence::Required, false),
     ("deci", Presence::Optional, true),
+    ("gpt2", Presence::Required, false),
     ("gptneox", Presence::Required, false),
     ("granite", Presence::Optional, true),
     ("granitemoe", Presence::Optional, true),
@@ -106,6 +109,7 @@ pub const FFN_BIAS_CREATORS: &[(&str, Presence, bool)] = &[
     ("mistral3", Presence::Optional, true),
     ("nemotron", Presence::Optional, false),
     ("phi2", Presence::Required, false),
+    ("starcoder", Presence::Required, false),
     ("starcoder2", Presence::Required, false),
 ];
 

@@ -1001,6 +1001,17 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // (`swa_window_override`, the `phi3` answer; libllama `n_swa = 0`,
     // measured).
     "phimoe",
+    // tests/position_embd_graphs.rs: `gpt2` (GPT-2) and `starcoder`
+    // (StarCoder, SantaCoder), ONE graph (`gpt2.cpp` and `starcoder.cpp`
+    // differ in `head_count_kv 1` and a size table): the biased
+    // LayerNorm, a fused `attn_qkv` with its bias, REQUIRED
+    // `attn_output.bias` and FFN biases, the ungated GELU, a sequential
+    // residual, `output` tied when absent, and `position_embd.weight`
+    // `{n_embd, n_ctx_train}` ADDED to the token embedding before layer 0
+    // (`:19,74-77`) with no `ggml_rope` anywhere (`crate::position_embd`,
+    // `rope_layers::RopeLayers::Never`).
+    "gpt2",
+    "starcoder",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1188,6 +1199,8 @@ pub const BIASED_LAYER_NORM: &[&str] = &[
     "gptneox",
     "falcon",
     "phi2",
+    "gpt2",
+    "starcoder",
 ];
 
 /// See [`BIASED_LAYER_NORM`].
@@ -1801,6 +1814,15 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // key dead metadata as `phi3`'s (tests/phimoe_graphs.rs). NEOX
         // RoPE: llama-model.cpp:2638.
         v.push(gqa_neox("phimoe"));
+        // `gpt2` and `starcoder` (GPT-2, StarCoder / SantaCoder): one
+        // graph, the `gptneox` sequential layer with a learned position
+        // table added to the embeddings and NO rotation
+        // (`crate::position_embd`, `rope_layers::RopeLayers::Never`;
+        // tests/position_embd_graphs.rs). The layout here is a filler
+        // nothing reads: `llama_model_rope_type` answers NONE for `gpt2`
+        // and NORM for `starcoder`, and neither graph calls `ggml_rope`.
+        v.push(gqa_norm("gpt2"));
+        v.push(gqa_norm("starcoder"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -1969,12 +1991,9 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // `LLAMA_NO_ROPE` pins the group so a later edit cannot quietly
         // put one back on a rotating path.
         for (n, reason) in [
-            (
-                "gpt2",
-                "learned absolute position embeddings (`position_embd.weight`, \
-                 src/models/gpt2.cpp:19,74) and no RoPE; the generic decoder has no \
-                 slot for them and rotates instead",
-            ),
+            // `gpt2` was HERE; audited now (tests/position_embd_graphs.rs):
+            // its learned table is `crate::position_embd` and it rotates
+            // nothing (`rope_layers::RopeLayers::Never`).
             (
                 "mpt",
                 "ALiBi attention bias (src/models/mpt.cpp:6), plus an optional \
@@ -2045,35 +2064,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         //   ONLY missing bias is this one no longer counts as dropped.
         //   `starcoder` and `bloom` still require five more each.
         //
-        // The bias group is one row now, and it loads clean and answers
-        // fluently, which is why it is refused here rather than left to
-        // a tensor gate. Pinned by `tests/attn_bias.rs`. The rest of the
-        // group left as their other blockers closed: `nemotron` /
-        // `orion` on `NormOp::LayerNormBias`, `codeshell` / `jais2` /
-        // `starcoder2` on `crate::proj_bias`, `stablelm` once its two
-        // other shapes had a refusal each, `phimoe` on
-        // `NormOp::RmsBias` (its "LayerNorm biases" were RMSNorm ones,
-        // `phi3.cpp:99-102`).
-        v.push(prof(
-            "starcoder",
-            TextGeneration,
-            StandardGqa,
-            KvGqa,
-            // The layout is real and `rope_layout_matches_llama_cpp`
-            // still checks it: refusing for a bias is not a licence to
-            // forget what it rotates as. (It does not: `position_embd`.)
-            Norm,
-            ArchPath::DedicatedOnly {
-                reason: "required bias tensors with no slot in the generic decoder. NOT the \
-                         *fused* `attn_qkv.bias` (src/models/starcoder.cpp:40) any more -- \
-                         `qkv_fused` applies that one now -- but `attn_output.bias`, \
-                         `ffn_down.bias`, `ffn_up.bias` (:43,49,52) and the LayerNorm \
-                         biases `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` \
-                         (:24,37,46). It also adds a learned `position_embd` to the \
-                         embeddings (:75) that the generic decoder has no slot for",
-            },
-            WholeVector,
-        ));
+        // The "LayerNorm-with-bias group" of `tests/attn_bias.rs` is
+        // EMPTY: `nemotron` / `orion` closed on `NormOp::LayerNormBias`,
+        // `codeshell` / `jais2` / `starcoder2` on `crate::proj_bias`,
+        // `stablelm` once its two other shapes had a refusal each,
+        // `phimoe` on `NormOp::RmsBias`, and `starcoder` last, on
+        // `crate::position_embd` (tests/position_embd_graphs.rs).
         v.push(prof(
             "qwen3",
             TextGeneration,
@@ -2834,7 +2830,7 @@ pub fn uses_relu_sqr(arch: &str) -> bool {
 pub fn uses_gelu_ungated(arch: &str) -> bool {
     matches!(
         arch,
-        "starcoder2" | "codeshell" | "gptneox" | "falcon" | "phi2"
+        "starcoder2" | "codeshell" | "gptneox" | "falcon" | "phi2" | "gpt2" | "starcoder"
     )
 }
 
@@ -3343,7 +3339,16 @@ mod audit_tests {
     /// counter-examples that motivated it.
     #[test]
     fn the_architectures_that_were_wrong_are_not_claimed_as_audited() {
-        for name in ["gpt2", "mpt", "refact", "bloom", "jais"] {
+        // `gpt2` left this list on 2026-09-14: it IS audited now, on a
+        // rule that rotates nothing (`rope_layers::RopeLayers::Never`)
+        // with its table added (`crate::position_embd`), which is what
+        // the finding asked for.
+        assert!(is_audited_generic("gpt2"));
+        assert_eq!(
+            crate::rope_layers::rope_layers("gpt2", 12, false),
+            crate::rope_layers::RopeLayers::Never
+        );
+        for name in ["mpt", "refact", "bloom", "jais"] {
             assert!(
                 !is_audited_generic(name),
                 "`{name}` was found computing ALiBi or learned position embeddings as \
@@ -3968,6 +3973,8 @@ mod tests {
             "phi2",
             "cohere2",
             "phimoe",
+            "gpt2",
+            "starcoder",
         ] {
             assert!(
                 matches!(

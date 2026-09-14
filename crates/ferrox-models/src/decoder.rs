@@ -487,6 +487,12 @@ pub struct Decoder {
     /// model's embedding table is multi-GB in f32 and only ever read
     /// row-wise.
     pub embedding: WeightMatrix,
+    /// The learned position table, `[context_length, hidden_dim]`, for
+    /// a graph that adds one to the embeddings (`crate::position_embd`;
+    /// `gpt2`, `starcoder`), read by [`Self::embed_token`] and nothing
+    /// else. `None` for every architecture that encodes position by
+    /// rotation or not at all.
+    pub position_embd: Option<WeightMatrix>,
     pub layers: Vec<LayerWeights>,
     /// The norm before the LM head.
     ///
@@ -822,6 +828,7 @@ impl Decoder {
         Decoder {
             config,
             embedding,
+            position_embd: None,
             layers,
             final_norm,
             output_head,
@@ -963,6 +970,9 @@ impl Decoder {
             // POST-ATTENTION residual into its kernel; a parallel layer
             // norms the layer INPUT (`crate::parallel_residual`).
             && !config.parallel_residual
+            // The GPU embedding gather has no add and no stack sees
+            // `pos` for it (`crate::position_embd`).
+            && !config.learned_positions
             // Every fused launch takes ONE head width for K and V (the
             // KV buffers, the attention tile, the `wo` fold); MiMo-V2's
             // split widths stay on the host (`crate::kv_head_dims`).
@@ -2106,10 +2116,10 @@ impl Decoder {
         let mut hidden = if metal_embd_kind.is_some() {
             Vec::new()
         } else {
-            self.embed_token(token_id)
+            self.embed_token(token_id, pos)
         };
         #[cfg(not(feature = "metal"))]
-        let mut hidden = self.embed_token(token_id);
+        let mut hidden = self.embed_token(token_id, pos);
         #[cfg(feature = "cuda")]
         if cuda_gqa_enabled() && self.config.layer_shapes.is_uniform() {
             // Fixed capacity so ensure_layer_kv does not recreate (and
@@ -2631,7 +2641,7 @@ impl Decoder {
         if run_cpu_layers && hidden.is_empty() && !metal_moe_resident {
             // GPU embedding gather or a skipped Metal dense stack can leave
             // `hidden` empty; CPU fallback must not call rms_norm on it.
-            hidden = self.embed_token(token_id);
+            hidden = self.embed_token(token_id, pos);
         }
 
         // The skip source: the (normed) embedding, before any layer
@@ -3116,7 +3126,7 @@ impl Decoder {
             }
         }
 
-        let mut hidden = self.embed_token(token_id);
+        let mut hidden = self.embed_token(token_id, pos);
         let skip_rows = self.config.skip_stream.then(|| hidden.clone());
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
 
@@ -3899,11 +3909,26 @@ impl Decoder {
     /// `talkie.cpp:50` norms `inpL` before layer 0. The ONE embedding
     /// site; what it returns is both layer 0's input and the skip
     /// source.
-    fn embed_token(&self, token_id: usize) -> Vec<f32> {
+    ///
+    /// `pos` is the token's position, which a learned position table
+    /// (`crate::position_embd`) indexes: `gpt2.cpp:74-77` add row `pos`
+    /// after `build_inp_embd`'s scale and before anything else.
+    fn embed_token(&self, token_id: usize, pos: usize) -> Vec<f32> {
         let mut row = self.embedding.dequant_row(token_id);
         if let Some(scale) = self.config.embedding_scale {
             for v in row.iter_mut() {
                 *v *= scale;
+            }
+        }
+        if let Some(table) = &self.position_embd {
+            assert!(
+                pos < table.rows(),
+                "position {pos} is past the {}-row learned position table \
+                 (`position_embd.weight`); the trained context is the model's limit",
+                table.rows()
+            );
+            for (v, p) in row.iter_mut().zip(table.dequant_row(pos)) {
+                *v += p;
             }
         }
         if self.config.skip_stream {
@@ -3913,9 +3938,13 @@ impl Decoder {
     }
 
     /// [`Self::embed_token`] for a whole batch: `[batch, hidden]`,
-    /// flattened row-major.
-    fn embed_tokens(&self, tokens: &[usize]) -> Vec<f32> {
-        tokens.iter().flat_map(|&t| self.embed_token(t)).collect()
+    /// flattened row-major, row `b` at `position(b)`.
+    fn embed_tokens(&self, tokens: &[usize], position: impl Fn(usize) -> usize) -> Vec<f32> {
+        tokens
+            .iter()
+            .enumerate()
+            .flat_map(|(b, &t)| self.embed_token(t, position(b)))
+            .collect()
     }
 
     /// The `output_head` half of a single-position forward: project the
@@ -4084,7 +4113,7 @@ impl Decoder {
         let n_kv_heads = self.config.n_kv_heads;
 
         // [batch, hidden], flattened row-major.
-        let mut hidden_batch: Vec<f32> = self.embed_tokens(tokens);
+        let mut hidden_batch: Vec<f32> = self.embed_tokens(tokens, |b| start_pos + b);
         let skip_rows = self.config.skip_stream.then(|| hidden_batch.clone());
 
         #[cfg(feature = "metal")]
@@ -4702,7 +4731,7 @@ impl Decoder {
         let v_head_dim = self.config.v_head_dim();
 
         // [batch, hidden], flattened row-major.
-        let mut hidden_batch: Vec<f32> = self.embed_tokens(tokens);
+        let mut hidden_batch: Vec<f32> = self.embed_tokens(tokens, |b| positions[b]);
         let skip_rows = self.config.skip_stream.then(|| hidden_batch.clone());
 
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
@@ -7019,6 +7048,27 @@ mod metal_rope_tests {
     /// predicate reads, because the per-layer fact lives on
     /// `MoeWeights` and the two config-only callers cannot see it. Only
     /// reachable in a `--features metal` build.
+    /// A learned-position model (`crate::position_embd`) stays off every
+    /// fused Metal path: the GPU embedding gather has no add, and no
+    /// stack sees `pos` for it. Only reachable in a `--features metal`
+    /// build.
+    #[test]
+    fn a_learned_position_table_keeps_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+        let mut positioned = plain;
+        positioned.learned_positions = true;
+        let d = Decoder::new_random_small(positioned.clone(), 1, 32);
+        assert!(!d.layer_supports_metal_attn(&d.layers[0]));
+        assert!(!Decoder::metal_can_serve_model(&positioned, false));
+    }
+
     #[test]
     fn a_parallel_residual_keeps_the_model_off_every_fused_metal_path() {
         let mut plain = phi_like_config();

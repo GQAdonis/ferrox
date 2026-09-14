@@ -60,16 +60,16 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **75** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **76** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`; `deepseek2` in both tensor forms, `tests/deepseek2_graphs.rs`; the real PLM-1.8B through `ferrox parity`), `Gemma4` has it on the real Gemma-4-E2B (parity MATCH, KL 5.1e-4 on Q4_K_M, against a libllama that has `gemma4.cpp`), `Glm52` and `Kimi` none |
 | Refuses as **unaudited**, now triaged | 2 |
-| Off the generic path: refuses by name, or reaches one of those 4 engines | 70 (38 `dedicated` + 32 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `refact`, `bloom`, `mpt` and `jais` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
+| Off the generic path: refuses by name, or reaches one of those 4 engines | 69 (37 `dedicated` + 32 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `refact`, `bloom`, `mpt`, `jais` and `minimax-m2` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 77 generic-gqa (75 of
-them audited), 38 dedicated, 32 deferred, 3 test fixtures.
+regenerated with `ferrox archs --write`: 150 rows, 78 generic-gqa (76 of
+them audited), 37 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
 opt-in: an architecture not on the audited list stops rather than
@@ -257,6 +257,11 @@ bias and the absence of rotation cannot disagree about Baichuan's
 layer count; every fused GPU path refuses. Each row had one more
 thing that was a table entry: `bloom`'s embedding norm, `jais`'s
 `1/d` attention scale, `mpt`'s clamp (`tests/alibi_graphs.rs`).
+`minimax-m2` (MiniMax-M2) closed the same day with NO code: its
+refusal had said "unaudited, not unimplemented, a fixture away" for a
+week while the fixture sat in `tests/fixtures/`; running it through
+libllama gave the golden, KL 3.4e-15 on the first try
+(`tests/minimax_m2_graphs.rs`).
 
 `olmo2` and `exaone4` closed TOGETHER, because they are one residual
 topology and not two. Neither has an `attn_norm` or an `ffn_norm`

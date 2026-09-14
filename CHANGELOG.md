@@ -17,6 +17,13 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`minimax-m2` runs: MiniMax-M2.** No code: the row's refusal had
+  said "unaudited, not unimplemented, a fixture away" while
+  `tests/fixtures/minimax_m2_tiny.gguf` sat in the tree; its libllama
+  golden matches at KL 3.44e-15 (`tests/minimax_m2_graphs.rs`). Plain
+  GQA, whole-vector Q/K norm, partial NEOX RoPE, a sigmoid MoE with
+  `exp_probs_b` on every layer. `minimax_engine.rs` refuses `minimax-m3`
+  alone now. 76 audited.
 - **ALiBi; `refact`, `bloom`, `mpt`, `jais` and Baichuan-13B run.**
   `ferrox_core::alibi::slopes` is llama.cpp's per-head slope formula
   (`ggml-cpu/ops.cpp:5489-5508`), and the row, paged and batched

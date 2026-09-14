@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **75** architectures run with
+Honest position, re-audited 2026-09-14. **76** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -888,6 +888,18 @@ line), 7.4e-13 (jais), 1.1e-12 (Baichuan-13B at 40 layers)
 two things the table had not: `mpt`'s clamp was not applied (4.8 off)
 and `jais` was scaled by `1/sqrt(d)` (1.36 off), which is what a
 golden is for.
+
+`minimax-m2` (MiniMax-M2, the 230B MoE) closed the same day with NO
+code, and it is the cheapest lesson in this file: its refusal had said
+"UNAUDITED, not unimplemented -- plain GQA, whole-vector QK norm,
+partial NEOX RoPE, a sigmoid MoE with `exp_probs_b`, all of which the
+generic path has; what is missing is a fixture" for a week, while
+`scripts/make_minimax_fixture.py` and `tests/fixtures/minimax_m2_tiny.
+gguf` sat in the tree evidencing that very claim. Running the fixture
+through libllama took a minute and matched at KL 3.4e-15 on the first
+try (`tests/minimax_m2_graphs.rs`). A verdict that names its own
+closing evidence and does not go and get it is a refusal that could
+have been a row.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

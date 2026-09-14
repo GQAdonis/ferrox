@@ -35,9 +35,11 @@
 //! how they came to disagree, so `reject` now reads the catalog's string
 //! rather than repeating it.
 //!
-//! In short: `minimax-m2` is UNAUDITED (a fixture or a parity run would
-//! settle it — see `tests/minimax_refusal.rs`), while `minimax-m3` is
-//! genuinely UNIMPLEMENTED (the MSA indexer and its own KV cache).
+//! In short: `minimax-m2` was UNAUDITED and is audited since 2026-09-14
+//! (`tests/minimax_m2_graphs.rs`, a libllama golden on the fixture that
+//! had evidenced the claim), while `minimax-m3` is genuinely
+//! UNIMPLEMENTED (the MSA indexer and its own KV cache). This module
+//! refuses `minimax-m3` and nothing else.
 
 use thiserror::Error;
 
@@ -63,8 +65,9 @@ impl MinimaxEngine {
             // say so rather than inventing an architecture reason.
             _ => {
                 return Err(MinimaxUnavailable {
-                    reason: "not a MiniMax architecture: expected `minimax-m2` or `minimax-m3`, \
-                             which the capability catalog marks DedicatedOnly",
+                    reason: "not a MiniMax architecture this shim refuses: `minimax-m3` is the \
+                             one the capability catalog marks DedicatedOnly (`minimax-m2` is on \
+                             the generic path)",
                 });
             }
         };
@@ -78,8 +81,11 @@ mod tests {
 
     #[test]
     fn reject_is_fail_closed() {
-        assert!(MinimaxEngine::reject("minimax-m2").is_err());
         assert!(MinimaxEngine::reject("minimax-m3").is_err());
+        // `minimax-m2` is generic now; the shim names that as the reason
+        // rather than inventing an architecture one.
+        let err = MinimaxEngine::reject("minimax-m2").unwrap_err();
+        assert!(err.reason.contains("not a MiniMax architecture"));
     }
 
     /// The defect this module was fixed for: the engine's reason and the
@@ -87,18 +93,16 @@ mod tests {
     /// was ever shown.
     #[test]
     fn reject_repeats_the_catalog_reason_verbatim() {
-        for arch in ["minimax-m2", "minimax-m3"] {
-            let Some(crate::capability::ArchPath::DedicatedOnly { reason }) =
-                crate::capability::resolve_architecture(arch)
-            else {
-                panic!("{arch} must be DedicatedOnly");
-            };
-            let err = MinimaxEngine::reject(arch).unwrap_err();
-            assert_eq!(
-                err.reason, reason,
-                "{arch}: the engine must not carry a second, different reason"
-            );
-        }
+        let Some(crate::capability::ArchPath::DedicatedOnly { reason }) =
+            crate::capability::resolve_architecture("minimax-m3")
+        else {
+            panic!("minimax-m3 must be DedicatedOnly");
+        };
+        let err = MinimaxEngine::reject("minimax-m3").unwrap_err();
+        assert_eq!(
+            err.reason, reason,
+            "minimax-m3: the engine must not carry a second, different reason"
+        );
     }
 
     /// Neither reason may claim MTP again: no MiniMax GGUF can carry
@@ -107,15 +111,13 @@ mod tests {
     /// one.
     #[test]
     fn no_minimax_reason_blames_mtp() {
-        for arch in ["minimax-m2", "minimax-m3"] {
-            let err = MinimaxEngine::reject(arch).unwrap_err();
-            let lower = err.reason.to_ascii_lowercase();
-            assert!(
-                !lower.contains("mtp") && !lower.contains("nextn"),
-                "{arch} may not be refused for MTP it cannot have: {}",
-                err.reason
-            );
-        }
+        let err = MinimaxEngine::reject("minimax-m3").unwrap_err();
+        let lower = err.reason.to_ascii_lowercase();
+        assert!(
+            !lower.contains("mtp") && !lower.contains("nextn"),
+            "minimax-m3 may not be refused for MTP it cannot have: {}",
+            err.reason
+        );
     }
 
     #[test]

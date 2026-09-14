@@ -302,7 +302,10 @@ fn phi3_ignores_the_sliding_window_its_own_checkpoints_declare() {
     }
     // The disable is per architecture and must not leak: these read
     // their windows normally.
-    for other in ["gemma2", "gemma3", "gpt-oss", "cohere2", "phimoe"] {
+    // `phimoe` is the other Drop: `phimoe.cpp:3-10` never read the key
+    // (libllama `n_swa = 0` on a file declaring one, measured).
+    assert!(swa_disabled_by_arch("phimoe", 32));
+    for other in ["gemma2", "gemma3", "gpt-oss", "cohere2"] {
         assert!(
             !swa_disabled_by_arch(other, 32),
             "{other} honours its declared window"

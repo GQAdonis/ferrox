@@ -5168,15 +5168,25 @@ mod tests {
                 crate::capability::POST_NORM_ONLY_ARCHITECTURES,
             ),
         ];
-        let function_lists: [(&str, &[&str]); 2] = [
+        // Every list `norm_function` consults, so a name on two of them
+        // -- which `norm_function`'s `if` chain would answer by order --
+        // fails here instead. It listed two of five until `phimoe`
+        // added the fifth.
+        let function_lists: [(&str, &[&str]); 5] = [
             (
                 "NON_PARAMETRIC_LAYER_NORM",
                 crate::capability::NON_PARAMETRIC_LAYER_NORM,
             ),
             (
+                "NON_PARAMETRIC_RMS_NORM",
+                crate::capability::NON_PARAMETRIC_RMS_NORM,
+            ),
+            (
                 "WEIGHTED_LAYER_NORM",
                 crate::capability::WEIGHTED_LAYER_NORM,
             ),
+            ("BIASED_LAYER_NORM", crate::capability::BIASED_LAYER_NORM),
+            ("BIASED_RMS_NORM", crate::capability::BIASED_RMS_NORM),
         ];
         let disjoint = |lists: &[(&str, &[&str])]| {
             for (i, (a_name, a)) in lists.iter().enumerate() {

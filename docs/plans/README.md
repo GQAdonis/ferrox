@@ -60,16 +60,16 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **68** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **69** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`; `deepseek2` in both tensor forms, `tests/deepseek2_graphs.rs`; the real PLM-1.8B through `ferrox parity`), `Gemma4` has it on the real Gemma-4-E2B (parity MATCH, KL 5.1e-4 on Q4_K_M, against a libllama that has `gemma4.cpp`), `Glm52` and `Kimi` none |
 | Refuses as **unaudited**, now triaged | 2 |
-| Off the generic path: refuses by name, or reaches one of those 4 engines | 77 (45 `dedicated` + 32 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2` and `cohere2` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
+| Off the generic path: refuses by name, or reaches one of those 4 engines | 76 (44 `dedicated` + 32 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2` and `phimoe` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 70 generic-gqa (68 of
-them audited), 45 dedicated, 32 deferred, 3 test fixtures.
+regenerated with `ferrox archs --write`: 150 rows, 71 generic-gqa (69 of
+them audited), 44 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
 opt-in: an architecture not on the audited list stops rather than
@@ -229,7 +229,13 @@ window key REQUIRED upstream is refused when absent, measured against
 libllama's own refusal). `cohere2moe` stays refused for its routed
 experts on the parallel input and its MTP block, and its
 `|| il < n_layer_dense_lead` rotation variant is recorded for when
-that row closes.
+that row closes. `phimoe` (Phi-3.5-MoE), the last of the bias group but
+`starcoder`, closed the same day and corrected its own refusal on the
+way: the norm biases it "required LayerNorm" for are RMSNorm biases
+(`phi3.cpp:99-102` under `LLM_NORM_RMS`, `NormOp::RmsBias`, one graph of
+140), and its two projection biases were slots already
+(`tests/phimoe_graphs.rs`, KL 1.9e-11); the window key it writes is
+dead metadata as `phi3`'s, and a test had asserted the opposite.
 
 `olmo2` and `exaone4` closed TOGETHER, because they are one residual
 topology and not two. Neither has an `attn_norm` or an `ffn_norm`

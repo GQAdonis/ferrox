@@ -989,6 +989,18 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // (`rope_layers::SlidingOnly`, the `exaone-moe` rule the first
     // census missed), a tied lm_head, NORM RoPE, no biases.
     "cohere2",
+    // tests/phimoe_graphs.rs: `phimoe` (Phi-3.5-MoE-instruct). `phi3`'s
+    // graph (`models.h:632`) on `phimoe.cpp`'s tensors: the RMSNorm with
+    // a bias at every site (`:20-21,28-29,35-36`, `NormOp::RmsBias`),
+    // Q/K/V biases through `create_tensor_qkv`, `attn_output.bias` and
+    // `output.bias` REQUIRED (`crate::proj_bias`), softmax top-2
+    // routing renormalised (`phi3.cpp:153-163`), LongRoPE's
+    // `rope_factors_long` / `_short` pair with `rope.scaling.attn_factor`,
+    // NEOX. `phimoe.cpp:3-10` read no window key, so the
+    // `attention.sliding_window` every export writes is dead metadata
+    // (`swa_window_override`, the `phi3` answer; libllama `n_swa = 0`,
+    // measured).
+    "phimoe",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1181,6 +1193,22 @@ pub const BIASED_LAYER_NORM: &[&str] = &[
 /// See [`BIASED_LAYER_NORM`].
 pub fn uses_biased_layer_norm(arch: &str) -> bool {
     BIASED_LAYER_NORM.contains(&arch)
+}
+
+/// Architectures that normalise with an **RMSNorm with a learned weight
+/// AND bias** -- `build_norm(x, w, b, LLM_NORM_RMS, il)` -- at every
+/// norm site, all REQUIRED: `phimoe` (Phi-3.5-MoE), whose tensors are
+/// `phimoe.cpp:20-21,28-29,35-36` and whose graph is `phi3`'s
+/// (`phi3.cpp:99-102,137-139,174-177` pass the bias; `phi3` never
+/// creates one). Measured: `grep -B3 LLM_NORM_RMS src/models/*.cpp |
+/// grep norm_b` is `phi3` (this row's graph), `chameleon` (passes NULL),
+/// and `deepseek32` / `glm-dsa` / `rwkv6qwen2` / `arwkv7` on other
+/// engines. [`crate::norm::NormOp::RmsBias`]; `tests/phimoe_graphs.rs`.
+pub const BIASED_RMS_NORM: &[&str] = &["phimoe"];
+
+/// See [`BIASED_RMS_NORM`].
+pub fn uses_biased_rms_norm(arch: &str) -> bool {
+    BIASED_RMS_NORM.contains(&arch)
 }
 
 /// How the generic `Decoder` / `ModelConfig::from_gguf` path treats a
@@ -1767,6 +1795,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // `logit_scale` REQUIRED (tests/cohere2_graphs.rs). NORM RoPE:
         // llama-model.cpp:2583.
         v.push(gqa_norm("cohere2"));
+        // `phimoe` (Phi-3.5-MoE): `phi3`'s graph on routed experts with
+        // the biased RMSNorm (`BIASED_RMS_NORM`), `attn_output.bias`
+        // and `output.bias` (`crate::proj_bias`), LongRoPE, its window
+        // key dead metadata as `phi3`'s (tests/phimoe_graphs.rs). NEOX
+        // RoPE: llama-model.cpp:2638.
+        v.push(gqa_neox("phimoe"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -2011,56 +2045,35 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         //   ONLY missing bias is this one no longer counts as dropped.
         //   `starcoder` and `bloom` still require five more each.
         //
-        // Every one of these loads clean and answers fluently, which is
-        // why they are refused here rather than left to a tensor gate.
-        // Pinned by `tests/attn_bias.rs`.
-        // `codeshell`, `jais2` and `starcoder2` were HERE for their
-        // REQUIRED projection biases on top of the LayerNorm biases, and
-        // closed together on `crate::proj_bias` (tests/proj_bias_graphs.rs)
-        // once the norm had closed on `orion` / `nemotron`.
-        for (n, rope, reason) in [
-            (
-                "starcoder",
-                Norm,
-                "required bias tensors with no slot in the generic decoder. NOT the \
-                 *fused* `attn_qkv.bias` (src/models/starcoder.cpp:40) any more -- \
-                 `qkv_fused` applies that one now -- but `attn_output.bias`, \
-                 `ffn_down.bias`, `ffn_up.bias` (:43,49,52) and the LayerNorm \
-                 biases `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` \
-                 (:24,37,46). It also adds a learned `position_embd` to the \
-                 embeddings (:75) that the generic decoder has no slot for",
-            ),
-            (
-                "phimoe",
-                Neox,
-                "required bias tensors with no slot in the generic decoder: \
-                 `attn_output.bias` and an `output.bias` on the LM head \
-                 (src/models/phimoe.cpp:33,23), plus the LayerNorm biases \
-                 `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` (:21,29,36). \
-                 `phi3` stays generic: it requires none of them",
-            ),
-            // `nemotron` and `orion` were HERE for their REQUIRED LayerNorm
-            // biases alone, and closed together on `NormOp::LayerNormBias`
-            // (`BIASED_LAYER_NORM`, tests/biased_layer_norm_graphs.rs).
-            // `stablelm` was HERE for the same biases and closed on the
-            // same variant once its two OTHER shapes -- the parallel
-            // residual and the per-head LayerNorm QK norm -- had a
-            // refusal by name each (tests/stablelm_graphs.rs).
-        ] {
-            v.push(prof(
-                n,
-                TextGeneration,
-                StandardGqa,
-                KvGqa,
-                // Unlike the no-RoPE group above, the layout here is
-                // real and `rope_layout_matches_llama_cpp` still checks
-                // it: refusing for a bias is not a licence to forget
-                // what these rotate as.
-                rope,
-                ArchPath::DedicatedOnly { reason },
-                WholeVector,
-            ));
-        }
+        // The bias group is one row now, and it loads clean and answers
+        // fluently, which is why it is refused here rather than left to
+        // a tensor gate. Pinned by `tests/attn_bias.rs`. The rest of the
+        // group left as their other blockers closed: `nemotron` /
+        // `orion` on `NormOp::LayerNormBias`, `codeshell` / `jais2` /
+        // `starcoder2` on `crate::proj_bias`, `stablelm` once its two
+        // other shapes had a refusal each, `phimoe` on
+        // `NormOp::RmsBias` (its "LayerNorm biases" were RMSNorm ones,
+        // `phi3.cpp:99-102`).
+        v.push(prof(
+            "starcoder",
+            TextGeneration,
+            StandardGqa,
+            KvGqa,
+            // The layout is real and `rope_layout_matches_llama_cpp`
+            // still checks it: refusing for a bias is not a licence to
+            // forget what it rotates as. (It does not: `position_embd`.)
+            Norm,
+            ArchPath::DedicatedOnly {
+                reason: "required bias tensors with no slot in the generic decoder. NOT the \
+                         *fused* `attn_qkv.bias` (src/models/starcoder.cpp:40) any more -- \
+                         `qkv_fused` applies that one now -- but `attn_output.bias`, \
+                         `ffn_down.bias`, `ffn_up.bias` (:43,49,52) and the LayerNorm \
+                         biases `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` \
+                         (:24,37,46). It also adds a learned `position_embd` to the \
+                         embeddings (:75) that the generic decoder has no slot for",
+            },
+            WholeVector,
+        ));
         v.push(prof(
             "qwen3",
             TextGeneration,
@@ -2744,6 +2757,11 @@ pub const SMALLTHINKER_PINNED_WINDOW: usize = 4096;
 pub fn swa_window_override(arch: &str, n_layers: usize) -> SwaWindowOverride {
     match arch {
         "phi3" => SwaWindowOverride::Drop,
+        // phimoe.cpp:3-10 read no window key at all, so `swa_type` stays
+        // NONE and the key `conversion/phi.py:171` writes for every
+        // export is dead metadata: libllama reports `n_swa = 0` for a
+        // file declaring one (measured, tests/phimoe_graphs.rs).
+        "phimoe" => SwaWindowOverride::Drop,
         // exaone4.cpp:4. NOT `>= 64` and not a range: llama.cpp tests
         // equality, so a hypothetical 63- or 65-layer EXAONE-4 gets no
         // window there either.
@@ -3949,6 +3967,7 @@ mod tests {
             "falcon",
             "phi2",
             "cohere2",
+            "phimoe",
         ] {
             assert!(
                 matches!(
@@ -3957,15 +3976,6 @@ mod tests {
                 ),
                 "{arch} must stay generic"
             );
-        }
-        for arch in ["phimoe"] {
-            match resolve_architecture(arch) {
-                Some(ArchPath::DedicatedOnly { reason }) => assert!(
-                    reason.contains("bias"),
-                    "{arch} is refused for the wrong reason: {reason}"
-                ),
-                other => panic!("{arch} must be refused for its biases, got {other:?}"),
-            }
         }
     }
 

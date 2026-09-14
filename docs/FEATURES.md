@@ -171,6 +171,17 @@ is faster.
   `tests/cohere2_graphs.rs`: KL 1.0e-14 and 8.9e-14 (the key's period
   2); rotating the full layer, dropping the multiplier, or reading the
   LayerNorm as RMSNorm each diverge.
+- **Phi-3.5-MoE (`phimoe`) runs.** `phi3`'s graph on routed experts,
+  whose only differences from a Phi-3 file are biases: an RMSNorm WITH
+  a bias at every norm site (`NormOp::RmsBias`, `capability::
+  BIASED_RMS_NORM`, one graph of 140 on the generic path; the old
+  refusal had called these LayerNorm biases, and they are not) plus
+  `attn_output.bias` and `output.bias`, both slots that already
+  existed. LongRoPE's factor pair and attn factor, softmax top-2
+  renormalised, NEOX; the window key every export writes is dead
+  metadata as for `phi3` (libllama `n_swa = 0`, measured, and the
+  table said the opposite until this row). `tests/phimoe_graphs.rs`:
+  KL 1.9e-11 (LongRoPE) and 1.9e-12 (plain) at the `orion` line.
 - **The LayerNorm with a bias, and with it Orion-14B (`orion`) and
   Nemotron-4 / Minitron (`nemotron`).** `NormOp::LayerNormBias` is
   `build_norm(x, w, b, LLM_NORM)`, the variant the eight-row

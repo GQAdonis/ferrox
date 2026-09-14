@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **68** architectures run with
+Honest position, re-audited 2026-09-14. **69** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -809,6 +809,27 @@ refused by libllama with `key not found`, measured). KL 1.0e-14
 (`tests/cohere2_graphs.rs`), 8.9e-14 with the scalar pattern key at 2.
 `cohere2moe` stays refused with what it needs ON TOP of the residual
 written into the reason.
+
+`phimoe` (Phi-3.5-MoE) closed the same day, and it is the bias group's
+last row but `starcoder`, with a correction to its own refusal: the
+"LayerNorm biases" the reason named are RMSNorm biases. `phimoe.cpp`
+has no graph of its own (`models.h:632`, `using graph =
+llama_model_phi3::graph`), and `phi3.cpp:99-102,137-139,174-177` pass
+each norm's bias to `LLM_NORM_RMS`; `phi3` never creates one, so its
+files take the plain RMS and `phimoe`'s take `NormOp::RmsBias`,
+`capability::BIASED_RMS_NORM`, one graph of 140 on the generic path
+(measured: `chameleon` passes NULL there, `deepseek32` / `glm-dsa` are
+other engines). Its two projection biases were slots already
+(`attn_output.bias`, `output.bias`), so the row is one `NormFunction`
+variant. A second correction came free: `phimoe.cpp:3-10` read no
+window key, so the `attention.sliding_window` every export writes is
+dead metadata as `phi3`'s (libllama `n_swa = 0` on a file declaring
+8, measured) -- and a test had asserted that `phimoe` HONOURS its
+window, which nothing had ever checked. KL 1.9e-11 (LongRoPE's long
+pair in use, attn factor 1.0955) and 1.9e-12 (plain), at the `orion`
+line for the same reason (`tests/phimoe_graphs.rs`). The loader's
+norm-function census listed two of five function lists; it lists all
+five now.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

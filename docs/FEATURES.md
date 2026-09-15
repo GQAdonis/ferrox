@@ -300,7 +300,7 @@ is faster.
   SLIDING layers alone are rotated (`cohere2.cpp:72,91`): that is
   `rope_layers::SlidingOnly`, the `exaone-moe` rule, which the module's
   first census had missed by grepping for `use_rope` (the census is
-  eight graphs now, `cohere2moe`'s variant recorded). `logit_scale` is
+  eight graphs now, all served). `logit_scale` is
   REQUIRED and multiplied; a file without the window key is refused as
   libllama refuses it (`swa_geometry::window_required`, measured).
   `tests/cohere2_graphs.rs`: KL 1.0e-14 and 8.9e-14 (the key's period
@@ -553,10 +553,25 @@ is faster.
   `ferrox_models::rope_finetuned`): every Granite-4.0 hybrid export
   writes the key false, and the fixture that had evidenced the refusal
   matches its libllama golden.
-- **One parallel-residual architecture still does not load**:
-  `cohere2moe`, for its routed experts on the parallel branch's input
-  and its MTP block; the residual itself is served
-  (`ferrox_models::parallel_residual`, below).
+- **Cohere2 MoE** (`cohere2moe`, the 49-layer 30B-A3B), audited
+  against libllama on 2026-09-14 (`tests/cohere2moe_graphs.rs`, KL
+  1.7e-14 / 1.3e-14 / 6.4e-15, and the MTP-block file byte-identical
+  to the trunk's golden). The `cohere2` graph with routed experts, and
+  the last parallel-residual row off the generic path. Three rows: a
+  layer rotates when it slides OR sits in the dense prefix
+  (`cohere2moe.cpp:177-179,192`, `rope_layers::RopeLayers::
+  SlidingOrLeadingDense`); `(moe_out + shexp) * 0.5` on a layer with a
+  shared expert (`:248-260`, `parallel_dense_ffn::
+  SHARED_EXPERT_SUM_SCALE`, the field the Grok-2 / Arctic sum scale
+  already fills); the norm FUNCTION from which epsilon key the file
+  carries (`:4-11,166`, `norm::NORM_BY_RMS_EPS_KEY`: LayerNorm for
+  every real export, RMS under a nonzero `layer_norm_rms_epsilon`).
+  Its window array is one entry per TRUNK layer because `:23` reads
+  the MTP count before `:35` reads the array
+  (`swa_layers::ARRAY_AT_TRUNK_LENGTH`), where `mimo2` / `step35` read
+  it at `block_count`. Sigmoid when the gating key is absent,
+  `expert_weights_norm` / `_scale` read, the window and `logit_scale`
+  REQUIRED.
 
 Full matrix: [`MODELS.md`](MODELS.md) ·
 [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) ·

@@ -352,6 +352,31 @@ impl NormFunction {
 /// `the_norm_slot_and_function_lists_cannot_contradict` pins that the
 /// situation never arises.
 pub fn norm_function(arch: &str) -> NormFunction {
+    norm_function_for_file(arch, None)
+}
+
+/// The ONE graph of 140 whose norm function is decided by the FILE:
+/// `cohere2moe.cpp:4-11` read both epsilon keys as optional, zero the
+/// RMS one when it is absent, and `:166,314` pick `LLM_NORM` when
+/// `f_norm_rms_eps == 0.0f` and `LLM_NORM_RMS` otherwise. Every real
+/// export writes `attention.layer_norm_epsilon` alone
+/// (`conversion/base.py:1354-1355` from `layer_norm_eps`), so the
+/// architecture's default is the weighted LayerNorm
+/// (`capability::WEIGHTED_LAYER_NORM`) and a file carrying a nonzero
+/// `attention.layer_norm_rms_epsilon` switches to RMS; measured
+/// (`grep -n 'f_norm_rms_eps == 0' src/models/*.cpp`).
+pub const NORM_BY_RMS_EPS_KEY: &[(&str, &str)] =
+    &[("cohere2moe", "src/models/cohere2moe.cpp:4-11,166")];
+
+/// [`norm_function`] with what the file declares for
+/// `attention.layer_norm_rms_epsilon`, for [`NORM_BY_RMS_EPS_KEY`];
+/// every other architecture ignores the argument.
+pub fn norm_function_for_file(arch: &str, declared_rms_eps: Option<f32>) -> NormFunction {
+    if NORM_BY_RMS_EPS_KEY.iter().any(|(a, _)| *a == arch)
+        && declared_rms_eps.is_some_and(|eps| eps != 0.0)
+    {
+        return NormFunction::Rms;
+    }
     if crate::capability::uses_non_parametric_layer_norm(arch) {
         NormFunction::LayerNormNoParams
     } else if crate::capability::uses_non_parametric_rms_norm(arch) {

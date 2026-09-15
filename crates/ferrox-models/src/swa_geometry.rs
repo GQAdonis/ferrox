@@ -101,6 +101,7 @@ pub fn full_layers_rotate_half(arch: &str) -> Option<&'static str> {
 pub fn window_required(arch: &str) -> Option<&'static str> {
     match arch {
         "cohere2" => Some("cohere2.cpp:13"),
+        "cohere2moe" => Some("cohere2moe.cpp:13"),
         "exaone-moe" => Some("exaone-moe.cpp:13"),
         _ => None,
     }

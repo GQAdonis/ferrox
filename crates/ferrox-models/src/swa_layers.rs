@@ -45,7 +45,12 @@
 //! `step3.py:164-173`). [`read_swa_layers`] therefore checks the length
 //! against `block_count` and keeps the first `n_layers` entries, and
 //! `set_swa_pattern` (`llama-hparams.cpp:19-21`) zeroes the entries past
-//! the trunk anyway.
+//! the trunk anyway. `cohere2moe.cpp:23` reads `nextn_predict_layers`
+//! BEFORE `:35` reads the array, so `n_layer()` is the TRUNK there and
+//! its converter writes one entry per trunk layer (`command_r.py:98`
+//! from `layer_types`); [`ARRAY_AT_TRUNK_LENGTH`] is that one row, and
+//! a file with the array at `block_count` length is refused there as
+//! llama.cpp refuses it.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -165,6 +170,22 @@ pub const PER_LAYER_ARRAY_READERS: &[(&str, &str)] = &[
     ("mimo2", "src/models/mimo2.cpp:12"),
 ];
 
+/// The graphs that read `nextn_predict_layers` BEFORE the array, so
+/// `hparams.n_layer()` at the read is the trunk and the array is one
+/// entry per TRUNK layer (module doc). Every other array reader takes
+/// it at `block_count`.
+pub const ARRAY_AT_TRUNK_LENGTH: &[(&str, &str)] =
+    &[("cohere2moe", "src/models/cohere2moe.cpp:23,35")];
+
+/// The length `arch`'s array read passes as `n`.
+pub fn array_length(arch: &str, trunk: &TrunkLayers) -> usize {
+    if ARRAY_AT_TRUNK_LENGTH.iter().any(|(a, _)| *a == arch) {
+        trunk.n_layers
+    } else {
+        trunk.block_count
+    }
+}
+
 /// Every graph that tries the scalar and falls back to the array, with
 /// the line.
 pub const SCALAR_THEN_ARRAY_READERS: &[(&str, &str)] = &[
@@ -216,15 +237,19 @@ pub fn read_swa_layers(
     };
     let per_layer = |items: &[GgufValue]| -> Result<SwaLayers, LoadError> {
         // `llama-model-loader.cpp:461-465`: the length must equal the
-        // `n` passed, which is `block_count` (module doc).
-        if items.len() != trunk.block_count {
+        // `n` passed, which is `block_count` for every reader but
+        // `ARRAY_AT_TRUNK_LENGTH` (module doc).
+        let want = array_length(arch, trunk);
+        if items.len() != want {
             return Err(LoadError::UnsupportedFeature(
                 arch.to_string(),
                 format!(
-                    "{key} has {} entries for block_count {}; llama.cpp refuses this too \
-                     (`key has wrong array length`, llama-model-loader.cpp:461-465)",
+                    "{key} has {} entries where llama.cpp's read passes n_layer() = {want} \
+                     (block_count {}, trunk {}); llama.cpp refuses this too (`key has wrong \
+                     array length`, llama-model-loader.cpp:461-465)",
                     items.len(),
-                    trunk.block_count
+                    trunk.block_count,
+                    trunk.n_layers
                 ),
             ));
         }
@@ -328,6 +353,10 @@ mod tests {
         period: 4,
         dense_first: false,
     });
+    const DENSE_FIRST_4: Option<SwaPattern> = Some(SwaPattern {
+        period: 4,
+        dense_first: true,
+    });
 
     /// The two phases of `set_swa_pattern` and its two degenerate
     /// periods, layer by layer against `llama-hparams.cpp:8-22`.
@@ -419,12 +448,32 @@ mod tests {
         let file = with(Some(bools(&[false, true, true, false])));
         assert!(matches!(
             read_swa_layers(&file, "mimo2", KEY, &trunk(5, 4), None),
-            Err(LoadError::UnsupportedFeature(a, m)) if a == "mimo2" && m.contains("4 entries for block_count 5")
+            Err(LoadError::UnsupportedFeature(a, m)) if a == "mimo2" && m.contains("4 entries where llama.cpp's read passes n_layer() = 5")
         ));
         // Absent is REQUIRED.
         assert!(matches!(
             read_swa_layers(&with(None), "mimo2", KEY, &trunk(4, 4), None),
             Err(LoadError::MissingHparam(k)) if k == KEY
+        ));
+    }
+
+    /// `cohere2moe.cpp:23,35` read the MTP count first, so its array
+    /// is one entry per TRUNK layer, and the `block_count`-long
+    /// spelling is the wrong length there.
+    #[test]
+    fn cohere2moe_s_array_is_trunk_length() {
+        assert_eq!(array_length("cohere2moe", &trunk(5, 4)), 4);
+        assert_eq!(array_length("mimo2", &trunk(5, 4)), 5);
+        let file = with(Some(bools(&[false, true, true, false])));
+        let got = read_swa_layers(&file, "cohere2moe", KEY, &trunk(5, 4), DENSE_FIRST_4).unwrap();
+        assert_eq!(
+            got,
+            SwaLayers::PerLayer(vec![false, true, true, false].into())
+        );
+        let file = with(Some(bools(&[false, true, true, false, true])));
+        assert!(matches!(
+            read_swa_layers(&file, "cohere2moe", KEY, &trunk(5, 4), DENSE_FIRST_4),
+            Err(LoadError::UnsupportedFeature(a, m)) if a == "cohere2moe" && m.contains("n_layer() = 4")
         ));
     }
 

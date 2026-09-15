@@ -17,6 +17,12 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`cohere2moe` runs: Cohere2 MoE 30B-A3B.** `rope_layers::
+  RopeLayers::SlidingOrLeadingDense`, `parallel_dense_ffn::
+  SHARED_EXPERT_SUM_SCALE`, `norm::NORM_BY_RMS_EPS_KEY` (`ModelConfig::
+  norm_function`), `swa_layers::ARRAY_AT_TRUNK_LENGTH`. KL 1.7e-14
+  (`tests/cohere2moe_graphs.rs`, `make_cohere2moe_fixture.py`). 92
+  audited; no parallel-residual row refuses.
 - **`llama4` runs: Llama 4 Scout 17B-16E and Maverick 17B-128E.**
   `chunked_swa` (the 8192-position chunk, per-query windows,
   `BatchWindow`), `attn_temperature::LITERAL_ATTN_TEMPERATURE` with

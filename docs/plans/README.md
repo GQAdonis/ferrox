@@ -60,16 +60,16 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **91** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **92** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`; `deepseek2` in both tensor forms, `tests/deepseek2_graphs.rs`; the real PLM-1.8B through `ferrox parity`), `Gemma4` has it on the real Gemma-4-E2B (parity MATCH, KL 5.1e-4 on Q4_K_M, against a libllama that has `gemma4.cpp`), `Glm52` and `Kimi` none |
 | Refuses as **unaudited**, now triaged | 2 |
-| Off the generic path: refuses by name, or reaches one of those 4 engines | 54 (23 `dedicated` + 31 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `refact`, `bloom`, `mpt`, `jais`, `minimax-m2`, `lfm2`, `lfm2moe`, `granitehybrid`, `granite-hybrid`, `nemotron_h`, `nemotron_h_moe`, `falcon-h1`, `jamba`, `mamba`, `mamba2`, `qwen35`, `qwen35moe`, `qwen3next` and `llama4` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
+| Off the generic path: refuses by name, or reaches one of those 4 engines | 53 (22 `dedicated` + 31 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `plamo`, `command-r`, `falcon`, `phi2`, `cohere2`, `phimoe`, `gpt2`, `starcoder`, `refact`, `bloom`, `mpt`, `jais`, `minimax-m2`, `lfm2`, `lfm2moe`, `granitehybrid`, `granite-hybrid`, `nemotron_h`, `nemotron_h_moe`, `falcon-h1`, `jamba`, `mamba`, `mamba2`, `qwen35`, `qwen35moe`, `qwen3next`, `llama4` and `cohere2moe` left the dedicated column for the generic path on 2026-09-12 / 14 and `plm` went the other way) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 93 generic-gqa (91 of
-them audited), 23 dedicated, 31 deferred, 3 test fixtures.
+regenerated with `ferrox archs --write`: 150 rows, 94 generic-gqa (92 of
+them audited), 22 dedicated, 31 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
 opt-in: an architecture not on the audited list stops rather than
@@ -231,10 +231,18 @@ the sliding layers only" is `rope_layers::SlidingOnly`, the rule
 missed because it grepped for `use_rope` and `cohere2.cpp:91` spells
 the gate `if (is_swa)` (`tests/cohere2_graphs.rs`, KL 1.0e-14; the
 window key REQUIRED upstream is refused when absent, measured against
-libllama's own refusal). `cohere2moe` stays refused for its routed
-experts on the parallel input and its MTP block, and its
-`|| il < n_layer_dense_lead` rotation variant is recorded for when
-that row closes. `phimoe` (Phi-3.5-MoE), the last of the bias group but
+libllama's own refusal). `cohere2moe` closed on 2026-09-14 on three
+rows (`tests/cohere2moe_graphs.rs`, KL 1.7e-14): the
+`|| il < n_layer_dense_lead` rotation variant its refusal had
+recorded (`RopeLayers::SlidingOrLeadingDense`), the `0.5` on
+`moe_out + shexp` (`parallel_dense_ffn::SHARED_EXPERT_SUM_SCALE`, the
+field Grok-2's sum scale already fills), and a norm FUNCTION the FILE
+decides (`norm::NORM_BY_RMS_EPS_KEY`, one graph of 140); its window
+array is read at trunk length because it reads the MTP count first
+(`swa_layers::ARRAY_AT_TRUNK_LENGTH`), and the MTP block itself was
+already `mtp_blocks`' (libllama's golden for the file with the block
+is byte-identical to the trunk's). No parallel-residual row is
+refused any more. `phimoe` (Phi-3.5-MoE), the last of the bias group but
 `starcoder`, closed the same day and corrected its own refusal on the
 way: the norm biases it "required LayerNorm" for are RMSNorm biases
 (`phi3.cpp:99-102` under `LLM_NORM_RMS`, `NormOp::RmsBias`, one graph of

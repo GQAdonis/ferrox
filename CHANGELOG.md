@@ -17,6 +17,25 @@ are the ones worth reading twice.
 
 ### Added
 
+- **x86 CPU and CUDA re-measured on rented hardware; the Q5_K batch
+  gate asks the kernels.** `benchmarks/RESULTS.md` has a Ryzen 9 3900X
+  section (CPU and RTX 3090 CUDA, 26 receipts), the first x86 rows
+  since #159's AVX2 GEMMs: K-quant prefill 1.04x to 1.36x, decode
+  1.04x to 1.17x. The first run found Q5_K_M prefill at 8.56x: the
+  Q5_K batched matmul gated its Kx8 path on `cfg!(target_arch =
+  "aarch64")` where the Q4_K and Q6_K arms asked the kernels, so x86
+  ran the per-row GEMM (`weight_matrix::q5k_batch_takes_kx8` now;
+  0.91x on a 5950X, 1.04x on the 3900X; Phi-4-mini 3.24x to 1.18x).
+  On CUDA the K-quant GEMM ran on a GPU for the first time: all 13
+  hardware tests pass and `ferrox verify --backend cuda` is
+  token-identical on five quant kinds; `launch_mul_mm_matches_the_
+  scalar_twin`'s tolerance gained the absolute floor FMA drift over
+  256 columns needs (measured 4.8e-4 worst). Utilization sampled
+  during the runs: prefill 30% to 39% at 175 W, decode 45% to 75%,
+  which reframes the 25x to 43x CUDA prefill gap as launch- or
+  host-bound before it is arithmetic (`docs/plans/cpu-cuda-parity.md`,
+  `benchmarks/HISTORY.md`). Still open on x86: IQ4_XS prefill 4.45x
+  (no batch kernel) and the small-model per-op constant (SmolLM2 2.08x).
 - **`cohere2moe` runs: Cohere2 MoE 30B-A3B.** `rope_layers::
   RopeLayers::SlidingOrLeadingDense`, `parallel_dense_ffn::
   SHARED_EXPERT_SUM_SCALE`, `norm::NORM_BY_RMS_EPS_KEY` (`ModelConfig::

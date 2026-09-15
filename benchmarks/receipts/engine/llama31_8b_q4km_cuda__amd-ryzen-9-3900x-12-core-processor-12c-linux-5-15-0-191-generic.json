@@ -1,0 +1,75 @@
+{
+  "accelerator": "NVIDIA GeForce RTX 3090",
+  "approx_params": 8835301376,
+  "arch": "llama",
+  "backend": "cuda",
+  "backend_active": "CUDA",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.21.0",
+  "host_load_1min_end": 2.9,
+  "host_load_1min_start": 1.85,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 12,
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+    "label": "AMD Ryzen 9 3900X 12-Core Processor (12c) Linux 5.15.0-191-generic",
+    "os": "Linux 5.15.0-191-generic",
+    "perf_cores": null,
+    "ram_gb": 78.5
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "llama31_8b_q4km",
+  "kind": "engine",
+  "load_s": 0.043921919,
+  "model_path": "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 4920739232,
+  "tests": [
+    {
+      "ferrox_samples": [
+        139.9717712477101,
+        140.12116885574935,
+        139.64626748930024
+      ],
+      "ferrox_stddev": 0.19827132080449178,
+      "ferrox_tps": 139.9717712477101,
+      "gap": 37.45526653886484,
+      "llama_tps": 5242.68,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        48.67489424412383,
+        48.7118671340379,
+        48.802774603665654
+      ],
+      "ferrox_stddev": 0.05373241208811779,
+      "ferrox_tps": 48.7118671340379,
+      "gap": 3.049975472941484,
+      "llama_tps": 148.57,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 12,
+  "warmup_reps": 1
+}

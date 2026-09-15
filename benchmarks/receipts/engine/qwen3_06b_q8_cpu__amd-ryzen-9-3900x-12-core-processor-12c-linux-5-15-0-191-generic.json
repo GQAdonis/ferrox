@@ -1,0 +1,75 @@
+{
+  "accelerator": null,
+  "approx_params": 692846592,
+  "arch": "qwen3",
+  "backend": "cpu",
+  "backend_active": "CPU",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.21.0",
+  "host_load_1min_end": 4.07,
+  "host_load_1min_start": 1.88,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 12,
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+    "label": "AMD Ryzen 9 3900X 12-Core Processor (12c) Linux 5.15.0-191-generic",
+    "os": "Linux 5.15.0-191-generic",
+    "perf_cores": null,
+    "ram_gb": 78.5
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "qwen3_06b_q8",
+  "kind": "engine",
+  "load_s": 0.033832678,
+  "model_path": "models/hf_test/Qwen3-0.6B-Q8_0.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 639446688,
+  "tests": [
+    {
+      "ferrox_samples": [
+        439.7493664289531,
+        434.71301400672667,
+        433.1619210089575
+      ],
+      "ferrox_stddev": 2.811981752153849,
+      "ferrox_tps": 434.71301400672667,
+      "gap": 1.4990809545672266,
+      "llama_tps": 651.67,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        35.009962095654934,
+        35.14889194610595,
+        34.902559754904935
+      ],
+      "ferrox_stddev": 0.10083887839673988,
+      "ferrox_tps": 35.009962095654934,
+      "gap": 1.1459595383274999,
+      "llama_tps": 40.12,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 12,
+  "warmup_reps": 1
+}

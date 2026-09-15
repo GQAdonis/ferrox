@@ -18,6 +18,8 @@ pub use encode::q5_k::{encode_block_q5_k, encode_row_q5_k};
 pub use encode::q6_k::{encode_block_q6_k, encode_row_q6_k, probe_q6_k_group};
 pub use encode::{encode_block_q8_0, encode_row_q8_0};
 
+pub mod iq4_xs_q8;
+pub use iq4_xs_q8::{dot_iq4_xs_q8_k, dot_iq4_xs_q8_k_scalar};
 pub mod iq_tables;
 /// ggml-produced golden vectors for the IQ2_XS/IQ2_S/IQ3_S/IQ1_M
 /// kernels. Test-only: a ~60 KB data blob has no business in a release
@@ -4880,7 +4882,7 @@ pub const IQ4_XS_BLOCK_ELEMS: usize = 256;
 /// index maps to one of these signed `i8` values instead of a linear
 /// `nibble*scale` transform. Verified against real ggml-quants.c
 /// (`kvalues_iq4nl`) rather than derived.
-const KVALUES_IQ4NL: [i8; 16] = [
+pub(crate) const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 

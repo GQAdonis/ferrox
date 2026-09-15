@@ -74,12 +74,18 @@ What is left on x86, by class:
 1. **No kernel: IQ4_XS prefill, 4.45x.** The batched arm for every
    kind without a Kx8 tier is the generic fallback: per row, per
    activation, `dot_iq4_xs_f32`, which re-decodes the row's nibbles
-   `batch` times per prefill. llama.cpp's `ggml_vec_dot_iq4_xs_q8_K`
-   is an int8 dot over Q8_K-quantized activations (the codebook lookup
-   into `maddubs` / `vdotq`). Decode is 1.17x, so it is the reuse
-   across the batch that is missing, not the single-row kernel. The
-   same fallback serves IQ4_NL, Q2_K, Q3_K, Q5_0, Q4_1 and MXFP4;
-   IQ4_XS is the only one in the suite.
+   `batch` times per prefill and multiplies in f32. llama.cpp's
+   `ggml_vec_dot_iq4_xs_q8_K` is an int8 dot over Q8_K-quantized
+   activations (the codebook lookup into `maddubs` / `sdot`).
+   **Closed on the same day**, `ferrox_quant::iq4_xs_q8` (scalar twin,
+   SDOT, AVX2; the activations quantized once per matmul on both the
+   single-vector and the batched path): on the M2 Pro, interleaved
+   twice against the previous binary, Llama-3.2-1B IQ4_XS prefill went
+   53 to 170 tok/s and decode 40 to 85, and `ferrox parity` against
+   libllama is MATCH at KL 3.8e-5. The x86 number needs a rented box;
+   the local ratio is the evidence that the missing kernel was the
+   gap. The same fallback still serves IQ4_NL, Q2_K, Q3_K, Q5_0, Q4_1
+   and MXFP4, none of which is in the suite.
 3. **Fixed per-op cost: the Q8_0 rows at 1.5x-2.1x that shrink with
    size** (SmolLM2 2.08x, Qwen 1.5x-1.6x, TinyLlama 1.5x, 8B 1.2x), and
    SmolLM2's decode at 1.34x where every other decode row is 1.04x to

@@ -17,6 +17,16 @@ are the ones worth reading twice.
 
 ### Added
 
+- **IQ4_XS on the CPU dots against Q8_K activations.**
+  `ferrox_quant::iq4_xs_q8` is llama.cpp's `ggml_vec_dot_iq4_xs_q8_K`
+  (a scalar twin, an SDOT arm, an AVX2 arm), and both the single-vector
+  and the batched matmul take it for a 256-multiple width, quantizing
+  the activations once per matmul as the K-quants do; the batched path
+  had been the generic fallback, an f32 dot per (row, activation) that
+  re-decoded each row's nibbles `batch` times, measured 4.45x behind
+  llama.cpp on a Ryzen 9 3900X. On the M2 Pro, interleaved twice,
+  Llama-3.2-1B IQ4_XS prefill 53 to 170 tok/s and decode 40 to 85;
+  `ferrox parity` MATCH at KL 3.8e-5 against libllama.
 - **x86 CPU and CUDA re-measured on rented hardware; the Q5_K batch
   gate asks the kernels.** `benchmarks/RESULTS.md` has a Ryzen 9 3900X
   section (CPU and RTX 3090 CUDA, 26 receipts), the first x86 rows

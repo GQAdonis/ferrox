@@ -1586,6 +1586,23 @@ impl WeightMatrix {
                             );
                             return out;
                         }
+                        // IQ4_XS over Q8_K activations, llama.cpp's
+                        // `ggml_vec_dot_iq4_xs_q8_K` (`ferrox_quant::
+                        // iq4_xs_q8`): the same int8 lane the K-quants
+                        // take, so decode and prefill agree on the
+                        // activation quantization.
+                        QuantKind::IQ4XS if x.len().is_multiple_of(256) => {
+                            let act = ferrox_quant::quantize_activations_q8_k(x);
+                            crate::par::items_mut(
+                                &mut out,
+                                Self::min_rows_per_task(*rows),
+                                |r, o| {
+                                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    *o = ferrox_quant::dot_iq4_xs_q8_k(row, &act);
+                                },
+                            );
+                            return out;
+                        }
                         QuantKind::Q6K if x.len().is_multiple_of(256) => {
                             let act = ferrox_quant::quantize_activations_q8_k(x);
                             let n_groups = *rows / ferrox_quant::Q6_KX8_NROWS;
@@ -2785,6 +2802,34 @@ impl WeightMatrix {
                                     }
                                 });
                             }
+                            return out;
+                        }
+                        // IQ4_XS: quantize the activations to Q8_K ONCE
+                        // per matmul and run the int8 dot per (row,
+                        // activation). No Kx8 tier, so the row's nibbles
+                        // are still decoded per activation, as llama.cpp's
+                        // own IQ4_XS prefill decodes them; what the f32
+                        // fallback below paid on top was an f32 FMA per
+                        // element and a per-activation f32 read of the
+                        // row, measured 4.45x behind llama.cpp on a Ryzen
+                        // 9 3900X (2026-09-15) where every K-quant on the
+                        // same host was 1.0x to 1.4x.
+                        QuantKind::IQ4XS if cols.is_multiple_of(256) => {
+                            let mut acts_owned = Vec::new();
+                            let (acts, _) =
+                                Self::q8k_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
+                            let data_slice = data.as_slice();
+                            crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                                let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                for (b, act) in acts.iter().enumerate() {
+                                    unsafe {
+                                        out_w.set(
+                                            b * rows + r,
+                                            ferrox_quant::dot_iq4_xs_q8_k(row, act),
+                                        );
+                                    }
+                                }
+                            });
                             return out;
                         }
                         QuantKind::Q5K | QuantKind::Q6K => {}

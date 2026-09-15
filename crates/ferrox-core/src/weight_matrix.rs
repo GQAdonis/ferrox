@@ -565,6 +565,24 @@ impl IntDotTier {
 /// runtime probe rather than a guess. The two predicates also answer
 /// different questions and must not be merged: `policy::backend` picks
 /// the SCHEDULER by work size; this picks the KERNEL by workload shape.
+/// Whether the Q5_K batched matmul takes the Kx8 path: every aarch64
+/// host (the i8mm quad GEMM, the width-4 `sdot` GEMM, or the scalar Kx8
+/// body, as the Q4_K arm takes it unconditionally), and any other host
+/// whose `x4` GEMM has a SIMD kernel at this width (AVX2 since #159).
+///
+/// Asked of the kernels rather than written beside them, the shape
+/// `int_dot_tier_here` has: this read `cfg!(target_arch = "aarch64")`
+/// alone until 2026-09-15, which sent every x86 Q5_K prefill through
+/// the per-row GEMM -- 44.2 against llama.cpp's 378.7 tok/s on
+/// Llama-3.2-1B Q5_K_M (8.56x) on a Ryzen 5950X, beside Q4_K and Q6_K
+/// at 1.19x on the same host, because those two arms asked the kernels
+/// and this one asked the architecture. With the predicate: 417.1
+/// tok/s, 0.91x. Phi-4-mini's `attn_qkv` is Q5_K too.
+#[inline]
+fn q5k_batch_takes_kx8(interleave: usize) -> bool {
+    cfg!(target_arch = "aarch64") || ferrox_quant::q5_kx8_gemm_uses_acts_x4(interleave)
+}
+
 fn int_dot_tier_here() -> IntDotTier {
     #[cfg(target_arch = "aarch64")]
     {
@@ -2548,15 +2566,26 @@ impl WeightMatrix {
                             let mut acts_owned = Vec::new();
                             let (acts, shared_tiles) =
                                 Self::q8k_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
-                            // Q5_Kx8 multi-act NEON GEMM amortizes weight unpack.
-                            let use_kx8 = cfg!(target_arch = "aarch64");
+                            // The Kx8 batch path: every aarch64 host (i8mm,
+                            // dotprod, or the scalar Kx8 body, as the Q4_K arm
+                            // takes it), and any other host whose `x4` GEMM
+                            // has a SIMD kernel at this width (AVX2 since
+                            // #159). This read `cfg!(target_arch = "aarch64")`
+                            // alone until 2026-09-15, which sent every x86
+                            // Q5_K prefill through the per-row GEMM below:
+                            // 44.2 against llama.cpp's 378.7 tok/s on
+                            // Llama-3.2-1B Q5_K_M (8.56x) on a Ryzen 5950X,
+                            // beside Q4_K at 1.19x and Q6_K at 1.19x on the
+                            // same host, because those two arms asked the
+                            // kernels and this one asked the architecture.
+                            let interleave = ferrox_quant::q5_kx8_interleave();
+                            let use_kx8 = q5k_batch_takes_kx8(interleave);
                             let n_groups = if use_kx8 {
                                 *rows / ferrox_quant::Q5_KX8_NROWS
                             } else {
                                 0
                             };
                             if n_groups > 0 {
-                                let interleave = ferrox_quant::q5_kx8_interleave();
                                 let packed = get_or_repack_q5k(data, *rows, cols);
                                 let nc = ferrox_quant::Q5_KX8_GEMM_NC;
                                 // On the i8mm path, interleave each quad of
@@ -5094,6 +5123,21 @@ mod int_dot_default_tests {
                 && cfg!(any(target_arch = "aarch64", target_arch = "x86_64")),
             "the batch half must agree with the kernel probe, not with a written-down list"
         );
+    }
+
+    /// The Q5_K batch gate asks the kernels: wherever the Q5_K `x4`
+    /// GEMM has a SIMD kernel the Kx8 path is taken, whatever the
+    /// architecture. A `cfg!` alone here is the defect this test exists
+    /// for (8.56x on x86 prefill, 2026-09-15).
+    #[test]
+    fn the_q5k_batch_path_is_taken_wherever_its_simd_gemm_exists() {
+        let interleave = ferrox_quant::q5_kx8_interleave();
+        if ferrox_quant::q5_kx8_gemm_uses_acts_x4(interleave) {
+            assert!(super::q5k_batch_takes_kx8(interleave));
+        }
+        // And on a host with no such kernel, the gate agrees with the
+        // Q4_K arm's rule, which is "aarch64 always".
+        assert!(super::q5k_batch_takes_kx8(interleave) || !cfg!(target_arch = "aarch64"));
     }
 
     /// The two probes are not interchangeable, and this pins the

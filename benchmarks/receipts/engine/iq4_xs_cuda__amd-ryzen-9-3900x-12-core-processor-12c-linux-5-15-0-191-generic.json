@@ -1,0 +1,75 @@
+{
+  "accelerator": "NVIDIA GeForce RTX 3090",
+  "approx_params": 1599078400,
+  "arch": "llama",
+  "backend": "cuda",
+  "backend_active": "CUDA",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.21.0",
+  "host_load_1min_end": 1.72,
+  "host_load_1min_start": 1.85,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 12,
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+    "label": "AMD Ryzen 9 3900X 12-Core Processor (12c) Linux 5.15.0-191-generic",
+    "os": "Linux 5.15.0-191-generic",
+    "perf_cores": null,
+    "ram_gb": 78.5
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "iq4_xs",
+  "kind": "engine",
+  "load_s": 0.044487634,
+  "model_path": "models/Llama-3.2-1B-Instruct-IQ4_XS.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 743141504,
+  "tests": [
+    {
+      "ferrox_samples": [
+        898.8328814787499,
+        895.9130917265587,
+        892.1999466711878
+      ],
+      "ferrox_stddev": 2.71433320153493,
+      "ferrox_tps": 895.9130917265587,
+      "gap": 29.628186310845393,
+      "llama_tps": 26544.28,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        66.88430278842618,
+        66.8896061705227,
+        66.90426633144548
+      ],
+      "ferrox_stddev": 0.008443203906279593,
+      "ferrox_tps": 66.8896061705227,
+      "gap": 9.247774585830937,
+      "llama_tps": 618.58,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 12,
+  "warmup_reps": 1
+}

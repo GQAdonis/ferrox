@@ -1,0 +1,75 @@
+{
+  "accelerator": null,
+  "approx_params": 3387949056,
+  "arch": "gemma2",
+  "backend": "cpu",
+  "backend_active": "CPU",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.21.0",
+  "host_load_1min_end": 8.39,
+  "host_load_1min_start": 1.99,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 12,
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+    "label": "AMD Ryzen 9 3900X 12-Core Processor (12c) Linux 5.15.0-191-generic",
+    "os": "Linux 5.15.0-191-generic",
+    "perf_cores": null,
+    "ram_gb": 78.5
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "gemma2_2b_q4km",
+  "kind": "engine",
+  "load_s": 0.038542939,
+  "model_path": "models/gemma-2-2b-it-Q4_K_M.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 1708582752,
+  "tests": [
+    {
+      "ferrox_samples": [
+        169.64222334822173,
+        167.1899654897249,
+        166.79808520567565
+      ],
+      "ferrox_stddev": 1.2585821182528072,
+      "ferrox_tps": 167.1899654897249,
+      "gap": 1.3645555780321095,
+      "llama_tps": 228.14,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        13.661000465292288,
+        13.586485590969838,
+        13.37806416876544
+      ],
+      "ferrox_stddev": 0.11974273516414898,
+      "ferrox_tps": 13.586485590969838,
+      "gap": 1.090789807325156,
+      "llama_tps": 14.82,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 12,
+  "warmup_reps": 1
+}

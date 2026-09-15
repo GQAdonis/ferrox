@@ -1,0 +1,75 @@
+{
+  "accelerator": null,
+  "approx_params": 8046772224,
+  "arch": "llama",
+  "backend": "cpu",
+  "backend_active": "CPU",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.21.0",
+  "host_load_1min_end": 16.54,
+  "host_load_1min_start": 1.95,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 12,
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+    "label": "AMD Ryzen 9 3900X 12-Core Processor (12c) Linux 5.15.0-191-generic",
+    "os": "Linux 5.15.0-191-generic",
+    "perf_cores": null,
+    "ram_gb": 78.5
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "mistral_7b_q4km",
+  "kind": "engine",
+  "load_s": 0.012137915,
+  "model_path": "models/Mistral-7B-Instruct-v0.2-Q4_K_M.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 4368439584,
+  "tests": [
+    {
+      "ferrox_samples": [
+        58.9448083888856,
+        59.542280900809786,
+        58.60198937791763
+      ],
+      "ferrox_stddev": 0.3885366313073391,
+      "ferrox_tps": 58.9448083888856,
+      "gap": 1.1985788389350587,
+      "llama_tps": 70.65,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        5.797912042806428,
+        5.8195198712882235,
+        5.813272587168416
+      ],
+      "ferrox_stddev": 0.009079116046478992,
+      "ferrox_tps": 5.813272587168416,
+      "gap": 1.0923279279929687,
+      "llama_tps": 6.35,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 12,
+  "warmup_reps": 1
+}

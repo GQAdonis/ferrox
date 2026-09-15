@@ -7,15 +7,57 @@ Same machine, same GGUF, same backend. `pp` is prefill, `tg` is decode.
 **Gap = llama.cpp ÷ ferrox. Below 1.00 means ferrox is faster.**
 🟢 faster · ⚪ within 5% · 🔴 slower
 
-Measured on **3 machines**, one section each. A gap only means something against the machine it was measured on, so rows are never compared across sections.
+Measured on **5 machines**, one section each. A gap only means something against the machine it was measured on, so rows are never compared across sections.
 
 ### At a glance
 
 | Machine | Backend | Prefill | Decode |
 |---|---|---|---|
+| AMD Ryzen 9 3900X 12-Core Processor (12c) Linux 5.15.0-191-generic | CPU | ⚪ **1.04×** to 🔴 **4.45×** | ⚪ **1.04×** to 🔴 **1.34×** |
+| AMD Ryzen 9 3900X 12-Core Processor (12c) Linux 5.15.0-191-generic + NVIDIA GeForce RTX 3090 | CUDA | 🔴 **25.53×** to 🔴 **43.29×** | 🔴 **2.75×** to 🔴 **9.25×** |
 | AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic | CPU | 🔴 **6.26×** to 🔴 **10.14×** | 🔴 **1.06×** to 🔴 **1.92×** |
 | Apple M2 Pro (10c/6p) macOS 26.6.2 + Apple M2 Pro | METAL | ⚪ **0.99×** to 🔴 **1.09×** | 🟢 **0.60×** to ⚪ **0.96×** |
 | Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-186-generic + NVIDIA GeForce RTX 3060 | CUDA | 🔴 **22.55×** to 🔴 **33.79×** | 🔴 **2.18×** to 🔴 **5.04×** |
+
+### AMD Ryzen 9 3900X 12-Core Processor (12c) Linux 5.15.0-191-generic
+
+#### CPU
+
+| Model | Prefill | Decode | ferrox pp512 | llama.cpp pp512 | ferrox tg128 | llama.cpp tg128 |
+|---|---|---|---:|---:|---:|---:|
+| Gemma-2-2B-IT Q4_K_M | 🔴 **1.36×** | 🔴 **1.09×** | 167 | 228 | 13.6 | 14.8 |
+| Gemma-3-1B-IT Q8_0 | 🔴 **1.63×** | ⚪ **1.04×** | 302 | 492 | 23.7 | 24.8 |
+| Llama-3.2-1B-Instruct IQ4_XS | 🔴 **4.45×** | 🔴 **1.17×** | 56.5 | 251 | 30.8 | 36.1 |
+| Llama-3.2-1B-Instruct Q4_K_M | 🔴 **1.29×** | 🔴 **1.11×** | 368 | 476 | 29.6 | 32.9 |
+| Llama-3.2-1B-Instruct Q5_K_M | ⚪ **1.04×** | 🔴 **1.16×** | 265 | 276 | 25.9 | 30.0 |
+| Llama-3.2-1B-Instruct Q6_K | 🔴 **1.36×** | 🔴 **1.16×** | 239 | 325 | 23.1 | 26.8 |
+| Llama-3.2-3B-Instruct Q4_K_M | 🔴 **1.25×** | 🔴 **1.13×** | 139 | 173 | 11.9 | 13.4 |
+| Meta-Llama-3.1-8B-Instruct Q4_K_M | 🔴 **1.20×** | 🔴 **1.10×** | 58.8 | 70.6 | 5.4 | 6.0 |
+| Mistral-7B-Instruct-v0.2 Q4_K_M | 🔴 **1.20×** | 🔴 **1.09×** | 58.9 | 70.7 | 5.8 | 6.3 |
+| Phi-4-mini-Instruct Q4_K_M | 🔴 **1.18×** | 🔴 **1.12×** | 114 | 134 | 9.8 | 10.9 |
+| Qwen2.5-0.5B-Instruct Q8_0 | 🔴 **1.64×** | 🔴 **1.16×** | 558 | 914 | 42.8 | 49.6 |
+| Qwen3-0.6B Q8_0 | 🔴 **1.50×** | 🔴 **1.15×** | 435 | 652 | 35.0 | 40.1 |
+| SmolLM2-135M-Instruct Q8_0 | 🔴 **2.08×** | 🔴 **1.34×** | 990 | 2064 | 111 | 149 |
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | 🔴 **1.52×** | 🔴 **1.08×** | 250 | 380 | 23.0 | 24.7 |
+
+### AMD Ryzen 9 3900X 12-Core Processor (12c) Linux 5.15.0-191-generic + NVIDIA GeForce RTX 3090
+
+#### CUDA
+
+| Model | Prefill | Decode | ferrox pp512 | llama.cpp pp512 | ferrox tg128 | llama.cpp tg128 |
+|---|---|---|---:|---:|---:|---:|
+| Gemma-2-2B-IT Q4_K_M | 🔴 **30.86×** | 🔴 **3.95×** | 400 | 12360 | 70.4 | 278 |
+| Gemma-3-1B-IT Q8_0 | 🔴 **30.75×** | 🔴 **3.98×** | 739 | 22732 | 85.8 | 342 |
+| Llama-3.2-1B-Instruct IQ4_XS | 🔴 **29.63×** | 🔴 **9.25×** | 896 | 26544 | 66.9 | 619 |
+| Llama-3.2-1B-Instruct Q4_K_M | 🔴 **27.92×** | 🔴 **3.30×** | 873 | 24370 | 189 | 625 |
+| Llama-3.2-1B-Instruct Q5_K_M | 🔴 **27.24×** | 🔴 **3.36×** | 875 | 23834 | 174 | 583 |
+| Llama-3.2-1B-Instruct Q6_K | 🔴 **25.53×** | 🔴 **2.75×** | 886 | 22626 | 191 | 526 |
+| Llama-3.2-3B-Instruct Q4_K_M | 🔴 **31.41×** | 🔴 **3.25×** | 329 | 10327 | 85.6 | 278 |
+| Meta-Llama-3.1-8B-Instruct Q4_K_M | 🔴 **37.46×** | 🔴 **3.05×** | 140 | 5243 | 48.7 | 149 |
+| Qwen2.5-0.5B-Instruct Q8_0 | 🔴 **27.86×** | 🔴 **5.08×** | 1360 | 37873 | 129 | 656 |
+| Qwen3-0.6B Q8_0 | 🔴 **33.62×** | 🔴 **5.46×** | 843 | 28335 | 97.6 | 533 |
+| SmolLM2-135M-Instruct Q8_0 | 🔴 **27.04×** | 🔴 **4.67×** | 1617 | 43736 | 176 | 823 |
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | 🔴 **43.29×** | 🔴 **5.46×** | 526 | 22790 | 88.4 | 483 |
 
 ### AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic
 

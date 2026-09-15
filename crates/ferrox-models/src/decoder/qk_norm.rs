@@ -173,7 +173,7 @@ mod tests {
         cfg.weightless_qk_norm = true;
         // Layer 3 does not rotate (`crate::rope_layers`, llama4's rule).
         cfg.sliding_window = Some(8);
-        cfg.rope_layers = crate::rope_layers::rope_layers("llama4", 4, true);
+        cfg.rope_layers = crate::rope_layers::rope_layers("llama4", 4, true, 0);
         let decoder = Decoder::new_random_small(cfg, 4, 8);
         assert!(decoder.config.layer_rotates(0) && !decoder.config.layer_rotates(3));
         let (q_width, kv_width) = (16, 8);

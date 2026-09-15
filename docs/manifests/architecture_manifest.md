@@ -86,7 +86,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `gemma3` | TextGeneration | GemmaFamily | KvIswa | generic-gqa |
 | `gemma4` | TextGeneration | GemmaFamily | KvIswa | dedicated |
 | `gemma4-assistant` | TextGeneration | GemmaFamily | KvIswa | dedicated |
-| `cohere2moe` | TextGeneration | StandardGqa | KvGqa | dedicated |
+| `cohere2moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `minicpm` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `phi3` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
 | `phi4` | TextGeneration | PhiFamily | KvGqa | generic-gqa |

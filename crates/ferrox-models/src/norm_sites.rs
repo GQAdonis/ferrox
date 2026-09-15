@@ -299,9 +299,15 @@ pub struct NormSites {
 }
 
 impl NormSites {
-    /// The table row for `arch`.
+    /// The table row for `arch`, with the architecture's own norm
+    /// function.
     pub fn for_arch(arch: &str) -> Self {
-        let function = norm_function(arch);
+        Self::with_function(arch, norm_function(arch))
+    }
+
+    /// The table row for `arch` under `function`: the loader's entry,
+    /// which has read the file (`crate::norm::norm_function_for_file`).
+    pub fn with_function(arch: &str, function: NormFunction) -> Self {
         let mut sites = Self {
             function,
             attn: Some(StoredNorm::required(&["attn_norm"])),

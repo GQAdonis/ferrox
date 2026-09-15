@@ -283,7 +283,7 @@ fn every_llama4_seam_is_visible_in_the_logits() {
     d.config.rope_layers = ferrox_models::rope_layers::RopeLayers::All;
     let worst = worst_vs(&decode(&d), &L4_GOLDEN);
     assert!(worst > 1e-2, "the no-RoPE layer not seen: {worst}");
-    d.config.rope_layers = ferrox_models::rope_layers::rope_layers("llama4", 4, true);
+    d.config.rope_layers = ferrox_models::rope_layers::rope_layers("llama4", 4, true, 0);
     assert_decoder_matches_on_all_three_paths(&d, &L4_GOLDEN, GRAPH_TOL, "restored");
 }
 

@@ -111,8 +111,15 @@ pub enum LoadError {
 /// one, where the GGUF carries no key to correct it. Nothing is live
 /// today -- all three are `NewCode` for other reasons and refuse before
 /// reaching here -- but the list is what a later admission would trust.
-const SIGMOID_GATING_ARCHITECTURES: &[&str] =
-    &["afmoe", "deepseek2", "glm4moe", "laguna", "step35"];
+const SIGMOID_GATING_ARCHITECTURES: &[&str] = &[
+    "afmoe",
+    // cohere2moe.cpp:27-29: the key read optional, SIGMOID when absent.
+    "cohere2moe",
+    "deepseek2",
+    "glm4moe",
+    "laguna",
+    "step35",
+];
 
 /// Architectures whose graph passes a gating LITERAL into
 /// `build_moe_ffn`, so the file's `expert_gating_func` is never read:
@@ -155,14 +162,16 @@ const GATING_LITERAL_NAMES: &[&str] = &["mimo2", "nemotron_h_moe", "llama4"];
 /// src/models/*.cpp` is twenty graphs; these are the eight on this
 /// loader (`deepseek2` / `deepseek32` / `deepseek2ocr` / `deepseek4` /
 /// `glm-dsa` / `glm4-moe` / `kimi-linear` / `minimax-m3` / `dflash` /
-/// `nemotron-h` / `hy-v3` / `cohere2moe` are on other engines, refused,
-/// or unknown here). Found by `mimo2`'s fixture: `mimo2.cpp` reads the
+/// `nemotron-h` / `hy-v3` are on other engines, refused, or unknown
+/// here; `cohere2moe.cpp:20` joined on 2026-09-14). Found by `mimo2`'s fixture: `mimo2.cpp` reads the
 /// key nowhere, libllama ran the fixture unscaled, and ferrox -- which
 /// honoured the key for any architecture -- scaled it by 2.5.
 const EXPERT_WEIGHTS_SCALE_READERS: &[&str] = &[
     "afmoe",
     "bailingmoe",
     "bailingmoe2",
+    // `cohere2moe.cpp:19-20` read both the norm and the scale.
+    "cohere2moe",
     "deepseek",
     "dots1",
     "exaone-moe",
@@ -184,6 +193,7 @@ const EXPERT_WEIGHTS_NORM_READERS: &[&str] = &[
     "afmoe",
     "bailingmoe",
     "bailingmoe2",
+    "cohere2moe",
     "dots1",
     "exaone-moe",
     "glm4moe",
@@ -563,18 +573,26 @@ impl ModelConfig {
             head_dim,
             metadata_f32_any(file, &[key("rope.scaling.alpha")]),
         );
-        let rms_norm_eps = metadata_f32_any(
-            file,
-            &[
-                key("attention.layer_norm_rms_epsilon"),
-                key("attention.layer_norm_epsilon"),
-            ],
-        )
-        .unwrap_or_else(|| {
-            best_effort_fields
-                .push("rms_norm_eps (no layer_norm_rms_epsilon key; defaulted to 1e-5)");
-            1e-5
-        });
+        // The norm FUNCTION is the architecture's, except where the file
+        // decides it (`crate::norm::NORM_BY_RMS_EPS_KEY`): a present and
+        // nonzero RMS epsilon means RMSNorm there, and a zero one is
+        // llama.cpp's "absent", so it is dropped before the epsilon
+        // itself is read below.
+        let declared_rms_eps = metadata_f32_any(file, &[key("attention.layer_norm_rms_epsilon")])
+            .filter(|eps| {
+                *eps != 0.0
+                    || !crate::norm::NORM_BY_RMS_EPS_KEY
+                        .iter()
+                        .any(|(a, _)| *a == arch)
+            });
+        let norm_function = crate::norm::norm_function_for_file(&arch, declared_rms_eps);
+        let rms_norm_eps = declared_rms_eps
+            .or_else(|| metadata_f32_any(file, &[key("attention.layer_norm_epsilon")]))
+            .unwrap_or_else(|| {
+                best_effort_fields
+                    .push("rms_norm_eps (no layer_norm_rms_epsilon key; defaulted to 1e-5)");
+                1e-5
+            });
 
         let n_experts = metadata_u64_any(file, &[key("expert_count")]).unwrap_or(0) as usize;
         let is_moe = n_experts > 1;
@@ -1455,7 +1473,12 @@ impl ModelConfig {
             rope_layers: if rope_switched_off {
                 crate::rope_layers::RopeLayers::Never
             } else {
-                crate::rope_layers::rope_layers(&arch, n_layers, sliding_window.is_some())
+                crate::rope_layers::rope_layers(
+                    &arch,
+                    n_layers,
+                    sliding_window.is_some(),
+                    n_dense_leading_layers,
+                )
             },
             router_input: crate::router_input::router_input(&arch),
             block_sub_norms: crate::sub_norms::block_sub_norms(&arch),
@@ -1492,6 +1515,7 @@ impl ModelConfig {
             },
             n_dense_leading_layers,
             moe_interleave_step,
+            norm_function,
             rope_freqs,
             rope_layout,
             qk_norm_style,
@@ -2554,7 +2578,7 @@ impl Decoder {
         // uses for a different site (`gpt-oss` / `seed_oss`, `dbrx`,
         // `grok`). `crate::norm_sites` is the one table for all of it;
         // this loader used to restate the decision at every site.
-        let norm_sites = crate::norm_sites::NormSites::for_arch(&arch);
+        let norm_sites = crate::norm_sites::NormSites::with_function(&arch, config.norm_function);
         let mut gpt_oss_layers: Vec<crate::decoder::GptOssLayer> = Vec::new();
 
         // One store for the whole model (keys are (layer, expert)),
@@ -2945,6 +2969,9 @@ impl Decoder {
             // shared-expert slot under the dense names, plus the row's
             // scale on the sum (`crate::parallel_dense_ffn`). Decided per
             // layer: Grok-1's layers have no triple and take neither.
+            // ...and the same scale under the `_shexp` names
+            // (`SHARED_EXPERT_SUM_SCALE`, cohere2moe's `* 0.5`), on a
+            // layer that loaded a shared expert above.
             let parallel_sum_scale = if is_dense_layer {
                 None
             } else {
@@ -2957,7 +2984,10 @@ impl Decoder {
                         });
                         row.sum_scale
                     }
-                    None => None,
+                    None => crate::parallel_dense_ffn::shared_expert_sum_scale(
+                        &arch,
+                        !shared_experts.is_empty(),
+                    ),
                 }
             };
             // Arctic's second per-layer norm, the routed branch's operand
@@ -5163,7 +5193,7 @@ mod tests {
             ("baichuan", 40),
         ] {
             assert_eq!(
-                crate::rope_layers::rope_layers(arch, n_layers, false),
+                crate::rope_layers::rope_layers(arch, n_layers, false, 0),
                 crate::rope_layers::RopeLayers::Never,
                 "{arch} positions without RoPE and must rotate nothing"
             );
@@ -5248,12 +5278,12 @@ mod tests {
             Some(8.0)
         );
         assert_eq!(
-            crate::rope_layers::rope_layers("baichuan", 40, false),
+            crate::rope_layers::rope_layers("baichuan", 40, false, 0),
             crate::rope_layers::RopeLayers::Never
         );
         assert_eq!(crate::alibi::max_alibi_bias("baichuan", 32, None), None);
         assert_eq!(
-            crate::rope_layers::rope_layers("baichuan", 32, false),
+            crate::rope_layers::rope_layers("baichuan", 32, false, 0),
             crate::rope_layers::RopeLayers::All
         );
         // Both sizes pass the header stage and fail on the next missing

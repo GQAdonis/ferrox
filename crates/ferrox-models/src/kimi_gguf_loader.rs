@@ -935,6 +935,7 @@ mod tests {
             },
             n_dense_leading_layers: 1,
             moe_interleave_step: None,
+            norm_function: crate::norm::NormFunction::Rms,
             attention: crate::config::AttentionKind::KimiHybrid(
                 crate::config::KimiHybridAttention {
                     kda_layers: vec![1],

@@ -414,7 +414,8 @@ fn the_residual_topology_is_visible_in_the_logits() {
 }
 
 /// The table's generic-path rows are exactly the ones with a golden
-/// here, in `tests/stablelm_graphs.rs` or in `tests/command_r_graphs.rs`.
+/// here or in their own graph test (`stablelm`, `command_r`, `falcon`,
+/// `phi2`, `cohere2`, `cohere2moe`).
 #[test]
 fn every_generic_path_row_of_the_table_has_a_golden() {
     let with_golden = [
@@ -425,6 +426,7 @@ fn every_generic_path_row_of_the_table_has_a_golden() {
         "falcon",
         "phi2",
         "cohere2",
+        "cohere2moe",
     ];
     for row in PARALLEL_RESIDUAL_GRAPHS {
         let generic = matches!(

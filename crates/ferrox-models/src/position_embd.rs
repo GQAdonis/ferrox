@@ -137,7 +137,7 @@ mod tests {
                         "`{arch}` has a golden (tests/position_embd_graphs.rs)"
                     );
                     assert_eq!(
-                        crate::rope_layers::rope_layers(arch, 12, false),
+                        crate::rope_layers::rope_layers(arch, 12, false, 0),
                         crate::rope_layers::RopeLayers::Never,
                         "`{arch}` adds positions and must rotate nothing"
                     );
@@ -149,7 +149,7 @@ mod tests {
                 Presence::Optional => {
                     assert!(generic, "`{arch}` is audited on its ALiBi");
                     assert_eq!(
-                        crate::rope_layers::rope_layers(arch, 32, false),
+                        crate::rope_layers::rope_layers(arch, 32, false, 0),
                         crate::rope_layers::RopeLayers::Never
                     );
                 }

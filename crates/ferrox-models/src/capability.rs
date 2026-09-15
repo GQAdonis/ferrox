@@ -829,6 +829,22 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // Two fixtures: 16 experts at step 2 and 128 experts at step 1
     // with a separate `output.weight` (no QK norm).
     "llama4",
+    // tests/cohere2moe_graphs.rs: `cohere2moe` (Cohere2 MoE, the 49-layer
+    // 30B-A3B), the `cohere2` graph -- the shared-norm parallel
+    // residual, a REQUIRED window and `logit_scale`, NORM RoPE -- with
+    // routed experts on three rows: a layer rotates when it slides OR
+    // sits in the dense prefix (`cohere2moe.cpp:177-179,192`,
+    // `RopeLayers::SlidingOrLeadingDense`); `(moe_out + shexp) * 0.5`
+    // on a layer with a shared expert (`:248-260`,
+    // `parallel_dense_ffn::SHARED_EXPERT_SUM_SCALE`); the norm FUNCTION
+    // from which epsilon key the file carries (`:4-11,166`,
+    // `norm::NORM_BY_RMS_EPS_KEY`: LayerNorm for every real export, RMS
+    // under a nonzero `layer_norm_rms_epsilon`). Sigmoid when the gating
+    // key is absent, `expert_weights_norm` / `_scale` read, the
+    // per-layer window array, an MTP block skipped. Four fixtures:
+    // LayerNorm, RMS, the MTP block (libllama byte-identical to the
+    // trunk's golden), softmax with `norm_w = true`.
+    "cohere2moe",
     // tests/layer_loop_graphs.rs: `nanbeige`, NEW CODE on RUNNING THE
     // SAME PHYSICAL LAYERS MORE THAN ONCE. `nanbeige.cpp:6-12` read
     // `num_loops` / `skip_loop_final_norm`, `:19-31` set `n_layer_all =
@@ -1290,7 +1306,7 @@ pub fn uses_non_parametric_rms_norm(arch: &str) -> bool {
 /// (`crate::scalar_multipliers`); `tests/command_r_graphs.rs`. The
 /// third is `cohere2` (Command-R7B), the same graph with a window
 /// (`cohere2.cpp:78,147`); `tests/cohere2_graphs.rs`.
-pub const WEIGHTED_LAYER_NORM: &[&str] = &["dbrx", "command-r", "cohere2", "mpt"];
+pub const WEIGHTED_LAYER_NORM: &[&str] = &["dbrx", "command-r", "cohere2", "cohere2moe", "mpt"];
 
 /// Does this architecture normalise with a weighted LayerNorm?
 /// See [`WEIGHTED_LAYER_NORM`].
@@ -2292,23 +2308,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // (tests/parallel_residual_graphs.rs), `command-r`
         // (tests/command_r_graphs.rs), `falcon` (tests/falcon_graphs.rs),
         // `phi2` (tests/phi2_graphs.rs), `cohere2`
-        // (tests/cohere2_graphs.rs). The one left needs something ELSE
-        // on top of it, and the reason names it.
-        v.push(prof(
-            "cohere2moe",
-            TextGeneration,
-            StandardGqa,
-            KvGqa,
-            Norm,
-            ArchPath::DedicatedOnly {
-                reason: "the `cohere2` graph with routed experts whose router reads the \
-                         parallel branch's one normed input (src/models/cohere2moe.cpp:234), \
-                         a rotation gate of `is_swa || il < n_layer_dense_lead` (:177-179,192) \
-                         `crate::rope_layers` has no variant for, and an MTP block \
-                         (:51-53,380-420); nothing here has run it",
-            },
-            WholeVector,
-        ));
+        // (tests/cohere2_graphs.rs), and `cohere2moe`
+        // (tests/cohere2moe_graphs.rs, 2026-09-14): the `cohere2` graph
+        // with routed experts, on `rope_layers::RopeLayers::
+        // SlidingOrLeadingDense`, `parallel_dense_ffn::
+        // SHARED_EXPERT_SUM_SCALE`, `norm::NORM_BY_RMS_EPS_KEY`.
+        v.push(gqa_norm("cohere2moe"));
         // MiniCPM was the case `unsupported_scaling_keys` cannot catch:
         // `src/models/minicpm.cpp:5-7` *hardcodes* an embedding
         // multiplier of 12.0, a residual multiplier of
@@ -3572,7 +3577,7 @@ mod audit_tests {
         // the finding asked for.
         assert!(is_audited_generic("gpt2"));
         assert_eq!(
-            crate::rope_layers::rope_layers("gpt2", 12, false),
+            crate::rope_layers::rope_layers("gpt2", 12, false, 0),
             crate::rope_layers::RopeLayers::Never
         );
         // The four ALiBi rows followed `gpt2` the same way
@@ -3581,7 +3586,7 @@ mod audit_tests {
         for name in ["mpt", "refact", "bloom", "jais"] {
             assert!(is_audited_generic(name));
             assert_eq!(
-                crate::rope_layers::rope_layers(name, 24, false),
+                crate::rope_layers::rope_layers(name, 24, false, 0),
                 crate::rope_layers::RopeLayers::Never,
                 "`{name}` positions by ALiBi and must rotate nothing"
             );
@@ -4140,10 +4145,10 @@ mod tests {
     }
 
     /// The parallel residual is served now (`crate::parallel_residual`),
-    /// and what this test pins is that each row still off the generic
-    /// path for something ON TOP of it says so, and that no row is
-    /// refused for the residual alone any more: a reason that names
-    /// only the residual would be a refusal nobody can act on.
+    /// and every row that was refused for it is audited: what this test
+    /// pins is that no row is refused for the residual any more.
+    /// `cohere2moe` was the last to leave (2026-09-14) and is checked
+    /// with the rest.
     ///
     /// `minicpm` used to be on this list and is NOT a residual-topology
     /// row -- it runs Granite's graph verbatim
@@ -4154,20 +4159,6 @@ mod tests {
     /// applies them now and `tests/minicpm_graphs.rs` is the evidence.
     #[test]
     fn architectures_with_a_different_residual_topology_are_refused() {
-        let arch = "cohere2moe";
-        match resolve_architecture(arch) {
-            Some(ArchPath::DedicatedOnly { reason }) => {
-                assert!(
-                    reason.contains("cohere2"),
-                    "{arch}: the served graph is named, so the reason is what is on top of it"
-                );
-                assert!(
-                    reason.contains("src/models/"),
-                    "{arch}: what else it needs, with the line"
-                );
-            }
-            other => panic!("{arch} must be refused, got {other:?}"),
-        }
         // The sequential-residual siblings stay on the generic path --
         // this is a named list, not a family-wide ban.
         //
@@ -4195,6 +4186,7 @@ mod tests {
             "falcon",
             "phi2",
             "cohere2",
+            "cohere2moe",
             "phimoe",
             "gpt2",
             "starcoder",

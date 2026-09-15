@@ -493,6 +493,9 @@ const MULTIPLIER_ARCHITECTURES: &[(&str, MultiplierSupport)] = &[
     ("talkie", MultiplierSupport::TALKIE),
     ("command-r", MultiplierSupport::COMMAND_R),
     ("cohere2", MultiplierSupport::COHERE2),
+    // `cohere2moe.cpp:14,287-289`: the same REQUIRED key, multiplied
+    // when nonzero.
+    ("cohere2moe", MultiplierSupport::COHERE2),
 ];
 
 /// Which multipliers ferrox applies for `arch`.

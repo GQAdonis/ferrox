@@ -202,6 +202,10 @@ pub struct ModelConfig {
     pub vocab_size: usize,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
+    /// The norm FUNCTION every weighted site applies
+    /// (`crate::norm::norm_function`): the architecture's, or, for
+    /// `crate::norm::NORM_BY_RMS_EPS_KEY`, the file's.
+    pub norm_function: crate::norm::NormFunction,
     pub moe: MoeLayerConfig,
     /// `Gqa` for every preset except Kimi K3. `Decoder`'s forward pass
     /// does not yet branch on this -- see `AttentionKind`'s doc
@@ -1027,6 +1031,7 @@ pub fn glm_5_2() -> ModelConfig {
         // applies here too.
         n_dense_leading_layers: 0,
         moe_interleave_step: None,
+        norm_function: crate::norm::NormFunction::Rms,
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
@@ -1128,6 +1133,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         // not confirmed against V4 Pro's own config.json.
         n_dense_leading_layers: 3,
         moe_interleave_step: None,
+        norm_function: crate::norm::NormFunction::Rms,
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
@@ -1221,6 +1227,7 @@ pub fn kimi_k3() -> ModelConfig {
         // "first_k_dense_replace": 1.
         n_dense_leading_layers: 1,
         moe_interleave_step: None,
+        norm_function: crate::norm::NormFunction::Rms,
         // Kimi K3's real, published attention topology (verified
         // against huggingface.co/moonshotai/Kimi-K3/config.json's
         // linear_attn_config block and the real KimiDeltaAttention /
@@ -1338,6 +1345,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         },
         n_dense_leading_layers: 0,
         moe_interleave_step: None,
+        norm_function: crate::norm::NormFunction::Rms,
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
@@ -1412,6 +1420,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         },
         n_dense_leading_layers: 0,
         moe_interleave_step: None,
+        norm_function: crate::norm::NormFunction::Rms,
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
@@ -1488,6 +1497,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         },
         n_dense_leading_layers: 1,
         moe_interleave_step: None,
+        norm_function: crate::norm::NormFunction::Rms,
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,

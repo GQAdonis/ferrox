@@ -243,7 +243,14 @@ mod tests {
                 generic,
                 matches!(
                     row.arch,
-                    "stablelm" | "gptneox" | "plamo" | "command-r" | "falcon" | "phi2" | "cohere2"
+                    "stablelm"
+                        | "gptneox"
+                        | "plamo"
+                        | "command-r"
+                        | "falcon"
+                        | "phi2"
+                        | "cohere2"
+                        | "cohere2moe"
                 ),
                 "`{}`: a generic-path row here must have a golden in \
                  tests/parallel_residual_graphs.rs or its own graph test",

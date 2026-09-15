@@ -8667,6 +8667,7 @@ pub(crate) mod tests {
             // `ModelConfig::layer_attention_kind`'s, not this test's.
             n_dense_leading_layers: 1,
             moe_interleave_step: None,
+            norm_function: ferrox_models::norm::NormFunction::Rms,
             attention: AttentionKind::KimiHybrid(KimiHybridAttention {
                 kda_layers: vec![1],
                 full_attn_layers: vec![],

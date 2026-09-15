@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **91** architectures run with
+Honest position, re-audited 2026-09-14. **92** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -807,8 +807,28 @@ REQUIRED `logit_scale`, and one refusal for the window key llama.cpp
 REQUIRES (`swa_geometry::window_required`; a fixture without it is
 refused by libllama with `key not found`, measured). KL 1.0e-14
 (`tests/cohere2_graphs.rs`), 8.9e-14 with the scalar pattern key at 2.
-`cohere2moe` stays refused with what it needs ON TOP of the residual
-written into the reason.
+`cohere2moe` (the 49-layer 30B-A3B) closed on 2026-09-14 on exactly
+what that reason had named, plus one thing it had not:
+`RopeLayers::SlidingOrLeadingDense` (`cohere2moe.cpp:192`, the dense
+prefix rotates although it does not slide), the `0.5` on `moe_out +
+shexp` (`:248-260`, `parallel_dense_ffn::SHARED_EXPERT_SUM_SCALE`,
+recorded on the SAME `parallel_sum_scale` field Grok-2's sum scale
+fills, so the FFN bodies apply one scale at one site whichever names
+the dense branch came from), and the norm FUNCTION decided by the
+FILE (`:4-11,166`: `LLM_NORM` unless `layer_norm_rms_epsilon` is
+present and nonzero; `norm::NORM_BY_RMS_EPS_KEY`, one graph of 140,
+`ModelConfig::norm_function` the one field every site reads). The
+thing the reason had not named: `:23` reads `nextn_predict_layers`
+BEFORE `:35` reads the window array, so `n_layer()` there is the
+TRUNK and the array is one entry per trunk layer, where `mimo2.cpp:12`
+/ `step35.cpp:26` read it before the MTP count and take
+`block_count` entries -- `swa_layers::ARRAY_AT_TRUNK_LENGTH`, found
+by the MTP fixture refusing to load. KL 1.7e-14 (LayerNorm), 1.3e-14
+(RMS), the MTP file byte-identical to the trunk's golden in libllama
+and here, 6.4e-15 (softmax, `norm_w = true`); dropping the `0.5`,
+rotating the prefix as `cohere2`'s rule would not, rotating the full
+layer, or renormalising each turns the test red. No
+parallel-residual row is refused any more.
 
 `phimoe` (Phi-3.5-MoE) closed the same day, and it is the bias group's
 last row but `starcoder`, with a correction to its own refusal: the

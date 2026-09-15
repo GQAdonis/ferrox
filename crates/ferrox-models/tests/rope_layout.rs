@@ -302,7 +302,7 @@ fn a_ferrox_only_name_on_the_generic_path_is_declared() {
         // nothing (`gpt2`, `ferrox_models::position_embd`); the layout
         // it carries is a filler, and `no_rope_architectures_never_
         // reach_a_rotating_path` below is the test that pins that.
-        if ferrox_models::rope_layers::rope_layers(p.gguf_name, 12, false)
+        if ferrox_models::rope_layers::rope_layers(p.gguf_name, 12, false, 0)
             == ferrox_models::rope_layers::RopeLayers::Never
         {
             continue;
@@ -341,7 +341,7 @@ fn no_rope_architectures_never_reach_a_rotating_path() {
         // `ferrox_models::position_embd`); its layout is then a filler
         // no rotation site reads.
         if let ArchPath::GenericGqa { rope } | ArchPath::TestFixture { rope } = p.path {
-            if ferrox_models::rope_layers::rope_layers(name, 12, false)
+            if ferrox_models::rope_layers::rope_layers(name, 12, false, 0)
                 != ferrox_models::rope_layers::RopeLayers::Never
             {
                 rotated.push(format!("{name}: ferrox rotates it as {rope:?}"));

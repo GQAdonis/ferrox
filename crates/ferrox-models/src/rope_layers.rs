@@ -103,6 +103,11 @@ pub enum RopeLayers {
     /// while `swa_type` is still `STANDARD` -- and it is why this is not
     /// written as "sliding layers, or everything if nothing slides".
     SlidingOnly,
+    /// The sliding layers AND the leading dense layers rotate:
+    /// `cohere2moe.cpp:177-179,192`, `is_swa(il) || il <
+    /// n_layer_dense_lead`. The dense prefix is full attention with
+    /// RoPE, the full-attention layers past it get none.
+    SlidingOrLeadingDense { n_dense_lead: usize },
     /// One layer in every `step` does not rotate,
     /// `hparams.n_no_rope_layer_step`.
     NoRopeEvery {
@@ -129,6 +134,9 @@ impl RopeLayers {
             Self::All => true,
             Self::Never => false,
             Self::SlidingOnly => layer_slides,
+            Self::SlidingOrLeadingDense { n_dense_lead } => {
+                layer_slides || layer_idx < n_dense_lead
+            }
             Self::NoRopeEvery { step, phase } => {
                 let step = step.get();
                 match phase {
@@ -179,7 +187,12 @@ const fn step(n: usize) -> NonZeroUsize {
 ///
 /// `n_layers` is here for exactly one row: `smallthinker.cpp:108`
 /// rotates everything when its step equals the layer count.
-pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> RopeLayers {
+pub fn rope_layers(
+    arch: &str,
+    n_layers: usize,
+    has_sliding_window: bool,
+    n_dense_lead: usize,
+) -> RopeLayers {
     let no_rope_every = |phase| RopeLayers::NoRopeEvery {
         step: step(LLAMA_CPP_DEFAULT_NO_ROPE_STEP),
         phase,
@@ -205,10 +218,12 @@ pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> Rop
         // it, `crate::swa_geometry::window_required`), so this is
         // `exaone-moe`'s rule spelled `if (is_swa)` at `:91`: Command-R7B
         // rotates its three sliding layers in four and not the fourth.
-        // `cohere2moe.cpp:192` adds `|| il < n_layer_dense_lead`, a
-        // variant this enum does not have; that row is on no engine and
-        // its arm comes with it.
         "cohere2" => RopeLayers::SlidingOnly,
+        // `cohere2moe.cpp:192` adds `|| il < n_layer_dense_lead`
+        // (`:177-179`: "dense-prefix full-attention layers use RoPE");
+        // `:13` reads the window REQUIRED as `cohere2` does, so
+        // `has_sliding_window` is always true here.
+        "cohere2moe" => RopeLayers::SlidingOrLeadingDense { n_dense_lead },
         // `gpt2.cpp` and `starcoder.cpp` call no `ggml_rope`: a learned
         // position table is added to the embeddings instead
         // (`crate::position_embd`).
@@ -270,6 +285,7 @@ pub const PER_LAYER_ROPE_GATES: &[(&str, &str)] = &[
     ("exaone4", "src/models/exaone4.cpp:116"),
     ("exaone-moe", "src/models/exaone-moe.cpp:136,155"),
     ("cohere2", "src/models/cohere2.cpp:72,91"),
+    ("cohere2moe", "src/models/cohere2moe.cpp:177-179,192"),
     ("smollm3", "src/models/smollm3.cpp:5,69"),
     ("smallthinker", "src/models/smallthinker.cpp:18,108-109"),
     ("afmoe", "src/models/afmoe.cpp:137-138"),
@@ -290,15 +306,15 @@ mod tests {
         for slides in [true, false] {
             for il in 0..8 {
                 assert_eq!(
-                    rope_layers("exaone4", 64, true).rotates(il, slides),
-                    rope_layers("exaone-moe", 48, true).rotates(il, slides),
+                    rope_layers("exaone4", 64, true, 0).rotates(il, slides),
+                    rope_layers("exaone-moe", 48, true, 0).rotates(il, slides),
                     "layer {il}, slides={slides}"
                 );
             }
         }
         // And the disjunct that separates them: with no window at all
         // EXAONE-4 rotates everything, which is the 1.2B.
-        assert_eq!(rope_layers("exaone4", 30, false), RopeLayers::All);
+        assert_eq!(rope_layers("exaone4", 30, false, 0), RopeLayers::All);
     }
 
     /// EXAONE-4 32B, layer by layer: `set_swa_pattern(4)` last-dense
@@ -306,7 +322,7 @@ mod tests {
     /// ones rotate.
     #[test]
     fn exaone4_32b_rotates_three_layers_in_four() {
-        let rule = rope_layers("exaone4", 64, true);
+        let rule = rope_layers("exaone4", 64, true, 0);
         let slides = |il: usize| il % 4 < 3;
         for il in 0..64 {
             assert_eq!(
@@ -323,8 +339,8 @@ mod tests {
     /// SmolLM3-3B's layers at the wrong positions.
     #[test]
     fn the_two_no_rope_phases_disagree_about_every_layer_they_name() {
-        let smollm3 = rope_layers("smollm3", 36, false);
-        let smallthinker = rope_layers("smallthinker", 32, true);
+        let smollm3 = rope_layers("smollm3", 36, false, 0);
+        let smallthinker = rope_layers("smallthinker", 32, true, 0);
         for il in 0..36 {
             assert_eq!(smollm3.rotates(il, false), (il + 1) % 4 != 0);
         }
@@ -343,7 +359,7 @@ mod tests {
     /// rope". A SmallThinker with no window must not lose a layer.
     #[test]
     fn smallthinker_without_a_window_rotates_everything() {
-        assert_eq!(rope_layers("smallthinker", 32, false), RopeLayers::All);
+        assert_eq!(rope_layers("smallthinker", 32, false, 0), RopeLayers::All);
     }
 
     /// The census and the table are checked against each other, so a
@@ -355,7 +371,7 @@ mod tests {
             // of the seven gates fire; the two conditional rows
             // (`smallthinker`, `llama4`) need the window and the other
             // four ignore it.
-            let rule = rope_layers(arch, 32, true);
+            let rule = rope_layers(arch, 32, true, 0);
             assert_ne!(
                 rule,
                 RopeLayers::All,
@@ -370,11 +386,23 @@ mod tests {
 
     /// The other direction: an architecture llama.cpp does NOT gate must
     /// not pick up a gate here. `llama` is the whole generic path.
+    /// `cohere2moe.cpp:192`: the dense prefix rotates although it does
+    /// not slide, the full-attention layers past it do not.
+    #[test]
+    fn cohere2moe_rotates_its_dense_prefix_and_its_sliding_layers() {
+        let rule = rope_layers("cohere2moe", 4, true, 1);
+        assert_eq!(rule, RopeLayers::SlidingOrLeadingDense { n_dense_lead: 1 });
+        assert!(rule.rotates(0, false), "dense lead, full attention");
+        assert!(rule.rotates(1, true));
+        assert!(!rule.rotates(3, false), "full attention past the prefix");
+        assert!(!rope_layers("cohere2", 4, true, 1).rotates(0, false));
+    }
+
     #[test]
     fn an_ungated_architecture_rotates_every_layer() {
         for arch in ["llama", "qwen3", "gemma3", "olmo2", "exaone", "granite"] {
             assert_eq!(
-                rope_layers(arch, 32, true),
+                rope_layers(arch, 32, true, 0),
                 RopeLayers::All,
                 "{arch} has no `use_rope` in src/models/"
             );

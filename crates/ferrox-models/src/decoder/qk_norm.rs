@@ -118,10 +118,13 @@ impl Decoder {
         }
     }
 
-    /// The QK norms that run AFTER RoPE (`maincoder`, `hunyuan-moe`).
+    /// The QK norms that run AFTER RoPE: the weighted ones for
+    /// `maincoder` / `hunyuan-moe`, and Llama 4's weightless per-head
+    /// pair on its rotating layers (`crate::weightless_qk_norm`).
     pub(crate) fn apply_qk_norms_post_rope(
         &self,
         layer: &LayerWeights,
+        layer_idx: usize,
         q_batch: &mut [f32],
         k_batch: &mut [f32],
         q_width: usize,
@@ -130,6 +133,22 @@ impl Decoder {
         if self.qk_norm_after_rope {
             self.apply_qk_norms_batch(layer, q_batch, k_batch, q_width, kv_width);
         }
+        if self.config.weightless_qk_norm && self.config.layer_rotates(layer_idx) {
+            // `llama4.cpp:182-185`: no tensor, both projections, each
+            // head on its own.
+            for row in q_batch
+                .chunks_mut(q_width)
+                .chain(k_batch.chunks_mut(kv_width))
+            {
+                let normed = Self::rms_norm_per_head_scalar_gain(
+                    row,
+                    None,
+                    self.config.head_dim,
+                    self.config.rms_norm_eps,
+                );
+                row.copy_from_slice(&normed);
+            }
+        }
     }
 }
 
@@ -137,6 +156,48 @@ impl Decoder {
 mod tests {
     use crate::config::glm_5_2;
     use crate::Decoder;
+
+    /// The weightless pair (`llama4.cpp:182-185`) norms every head of
+    /// Q AND K on a rotating layer and touches nothing on an unrotated
+    /// one, with no tensor on the layer.
+    #[test]
+    fn the_weightless_norm_runs_per_head_on_rotating_layers_only() {
+        let mut cfg = glm_5_2();
+        cfg.hidden_dim = 16;
+        cfg.n_heads = 4;
+        cfg.n_kv_heads = 2;
+        cfg.head_dim = 4;
+        cfg.moe.hidden_dim = 16;
+        cfg.moe.expert_ffn_dim = 8;
+        cfg.n_layers = 4;
+        cfg.weightless_qk_norm = true;
+        // Layer 3 does not rotate (`crate::rope_layers`, llama4's rule).
+        cfg.sliding_window = Some(8);
+        cfg.rope_layers = crate::rope_layers::rope_layers("llama4", 4, true, 0);
+        let decoder = Decoder::new_random_small(cfg, 4, 8);
+        assert!(decoder.config.layer_rotates(0) && !decoder.config.layer_rotates(3));
+        let (q_width, kv_width) = (16, 8);
+        let q0: Vec<f32> = (0..q_width).map(|i| 0.5 + i as f32 * 0.25).collect();
+        let k0: Vec<f32> = (0..kv_width).map(|i| 1.0 - i as f32 * 0.1).collect();
+        let layer = &decoder.layers[0];
+        assert!(layer.attn.q_norm.is_none() && layer.attn.k_norm.is_none());
+
+        let (mut q, mut k) = (q0.clone(), k0.clone());
+        decoder.apply_qk_norms_post_rope(layer, 0, &mut q, &mut k, q_width, kv_width);
+        for (got, head) in q.chunks(4).zip(q0.chunks(4)) {
+            let want = crate::norm::rms_norm_no_params(head, decoder.config.rms_norm_eps);
+            assert_eq!(got, &want[..]);
+        }
+        for (got, head) in k.chunks(4).zip(k0.chunks(4)) {
+            let want = crate::norm::rms_norm_no_params(head, decoder.config.rms_norm_eps);
+            assert_eq!(got, &want[..]);
+        }
+
+        let (mut q, mut k) = (q0.clone(), k0.clone());
+        decoder.apply_qk_norms_post_rope(layer, 3, &mut q, &mut k, q_width, kv_width);
+        assert_eq!(q, q0);
+        assert_eq!(k, k0);
+    }
 
     /// Exactly one of the two hooks fires, whichever way the flag is
     /// set.
@@ -172,7 +233,7 @@ mod tests {
             let mut k = k0.clone();
             let layer = &decoder.layers[0];
             decoder.apply_qk_norms_pre_rope(layer, &mut q, &mut k, q_width, kv_width);
-            decoder.apply_qk_norms_post_rope(layer, &mut q, &mut k, q_width, kv_width);
+            decoder.apply_qk_norms_post_rope(layer, 0, &mut q, &mut k, q_width, kv_width);
 
             // The reference: the norm applied exactly once, directly.
             let want_q = decoder.apply_qk_norm(&q0, &vec![2.0; q_width]);

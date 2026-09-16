@@ -18,6 +18,8 @@ pub use encode::q5_k::{encode_block_q5_k, encode_row_q5_k};
 pub use encode::q6_k::{encode_block_q6_k, encode_row_q6_k, probe_q6_k_group};
 pub use encode::{encode_block_q8_0, encode_row_q8_0};
 
+pub mod iq4_xs_q8;
+pub use iq4_xs_q8::{dot_iq4_xs_q8_k, dot_iq4_xs_q8_k_scalar};
 pub mod iq_tables;
 /// ggml-produced golden vectors for the IQ2_XS/IQ2_S/IQ3_S/IQ1_M
 /// kernels. Test-only: a ~60 KB data blob has no business in a release
@@ -27,22 +29,22 @@ mod iq_tier_goldens;
 pub mod repack;
 
 pub use repack::{
-    gemm_q4_0x4_group, gemm_q4_0x4_group_x4, gemm_q4_0x4_group_x4_on, gemm_q4_kx8_group,
-    gemm_q4_kx8_group_x4, gemm_q4_kx8_group_x4_on, gemm_q5_kx8_group, gemm_q5_kx8_group_x4,
-    gemm_q5_kx8_group_x4_on, gemm_q6_kx8_group, gemm_q6_kx8_group_x4, gemm_q6_kx8_group_x4_on,
-    gemm_q8_0x4_group, gemm_q8_0x4_group_x4, gemm_q8_0x4_group_x4_on, gemv_q4_0x4_group,
-    gemv_q4_kx8_group, gemv_q4_kx8_q8_k, gemv_q5_kx8_group, gemv_q5_kx8_q8_k, gemv_q6_kx8_group,
-    gemv_q6_kx8_q8_k, gemv_q8_0x4_group, gemv_q8_0x4_q8_0, interleaved_gemm_is_accelerated,
-    make_block_q4_0x4, make_block_q4_kx8, make_block_q5_kx8, make_block_q6_kx8, make_block_q8_0x4,
-    pack_q4_0_matrix_x4, pack_q4_k_matrix_x8, pack_q5_k_matrix_x8, pack_q6_k_matrix_x8,
-    pack_q8_0_matrix_x4, preferred_interleave, prepare_q8_acts_x4, prepare_q8_k_acts_x4,
-    q4_0x4_gemm_uses_acts_x4, q4_0x4_interleave, q4_kx8_gemm_uses_acts_x4, q4_kx8_interleave,
-    q5_kx8_gemm_uses_acts_x4, q5_kx8_interleave, q6_kx8_gemm_uses_acts_x4, q6_kx8_interleave,
-    q8_0x4_gemm_uses_acts_x4, q8_0x4_interleave, AccelX4, Q8ActsX4, Q8KActsX4, Q4_0X4_BLOCK_BYTES,
-    Q4_0X4_GEMM_NC, Q4_0X4_INTERLEAVE, Q4_0X4_NROWS, Q4_KX8_BLOCK_BYTES, Q4_KX8_GEMM_NC,
-    Q4_KX8_NROWS, Q5_KX8_BLOCK_BYTES, Q5_KX8_GEMM_NC, Q5_KX8_NROWS, Q6_KX8_BLOCK_BYTES,
-    Q6_KX8_GEMM_NC, Q6_KX8_NROWS, Q8K_ACTS_X4_NC, Q8_0X4_BLOCK_BYTES, Q8_0X4_GEMM_NC,
-    Q8_0X4_INTERLEAVE, Q8_0X4_NROWS,
+    batch_gemm_is_accelerated, gemm_q4_0x4_group, gemm_q4_0x4_group_x4, gemm_q4_0x4_group_x4_on,
+    gemm_q4_kx8_group, gemm_q4_kx8_group_x4, gemm_q4_kx8_group_x4_on, gemm_q5_kx8_group,
+    gemm_q5_kx8_group_x4, gemm_q5_kx8_group_x4_on, gemm_q6_kx8_group, gemm_q6_kx8_group_x4,
+    gemm_q6_kx8_group_x4_on, gemm_q8_0x4_group, gemm_q8_0x4_group_x4, gemm_q8_0x4_group_x4_on,
+    gemv_q4_0x4_group, gemv_q4_kx8_group, gemv_q4_kx8_q8_k, gemv_q5_kx8_group, gemv_q5_kx8_q8_k,
+    gemv_q6_kx8_group, gemv_q6_kx8_q8_k, gemv_q8_0x4_group, gemv_q8_0x4_q8_0,
+    interleaved_gemm_is_accelerated, make_block_q4_0x4, make_block_q4_kx8, make_block_q5_kx8,
+    make_block_q6_kx8, make_block_q8_0x4, pack_q4_0_matrix_x4, pack_q4_k_matrix_x8,
+    pack_q5_k_matrix_x8, pack_q6_k_matrix_x8, pack_q8_0_matrix_x4, preferred_interleave,
+    prepare_q8_acts_x4, prepare_q8_k_acts_x4, q4_0x4_gemm_uses_acts_x4, q4_0x4_interleave,
+    q4_kx8_gemm_uses_acts_x4, q4_kx8_interleave, q5_kx8_gemm_uses_acts_x4, q5_kx8_interleave,
+    q6_kx8_gemm_uses_acts_x4, q6_kx8_interleave, q8_0x4_gemm_uses_acts_x4, q8_0x4_interleave,
+    AccelX4, Q8ActsX4, Q8KActsX4, Q4_0X4_BLOCK_BYTES, Q4_0X4_GEMM_NC, Q4_0X4_INTERLEAVE,
+    Q4_0X4_NROWS, Q4_KX8_BLOCK_BYTES, Q4_KX8_GEMM_NC, Q4_KX8_NROWS, Q5_KX8_BLOCK_BYTES,
+    Q5_KX8_GEMM_NC, Q5_KX8_NROWS, Q6_KX8_BLOCK_BYTES, Q6_KX8_GEMM_NC, Q6_KX8_NROWS, Q8K_ACTS_X4_NC,
+    Q8_0X4_BLOCK_BYTES, Q8_0X4_GEMM_NC, Q8_0X4_INTERLEAVE, Q8_0X4_NROWS,
 };
 
 use half::f16;
@@ -4880,7 +4882,7 @@ pub const IQ4_XS_BLOCK_ELEMS: usize = 256;
 /// index maps to one of these signed `i8` values instead of a linear
 /// `nibble*scale` transform. Verified against real ggml-quants.c
 /// (`kvalues_iq4nl`) rather than derived.
-const KVALUES_IQ4NL: [i8; 16] = [
+pub(crate) const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 

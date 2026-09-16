@@ -69,7 +69,14 @@ use ferrox_gguf::{GgufError, TensorSource};
 /// tensors (sinks, biases, the SwiGLU clamp), and widening it would have
 /// handed `seed_oss` attention sinks it does not have. Two facts, two
 /// predicates.
-pub const PRE_FFN_NORM_IS_POST_ATTENTION_NORM: &[&str] = &["gpt-oss", "seed_oss", "glm4moe"];
+pub const PRE_FFN_NORM_IS_POST_ATTENTION_NORM: &[&str] = &[
+    "gpt-oss",
+    "seed_oss",
+    "glm4moe",
+    "qwen35",
+    "qwen35moe",
+    "qwen3next",
+];
 
 /// Architectures that store their **pre-FFN** norm under
 /// `blk.N.attn_output_norm.weight` (`LLM_TENSOR_ATTN_OUT_NORM`) and carry
@@ -98,6 +105,59 @@ pub const PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM: &[&str] = &["dbrx"];
 /// from `FFN_POST_NORM` otherwise (Grok-2's `post_moe_norm`), required
 /// either way, and `:185-188` apply it before the FFN residual add.
 pub const POST_NORMS_UNDER_GROK_NAMES: &[&str] = &["grok"];
+
+/// Architectures whose OPTIONAL second pre-norm `blk.N.attn_norm_2`
+/// feeds ATTENTION when present, with `attn_norm` moving to the FFN.
+///
+/// `falcon`: `falcon.cpp:35-36` create `attn_norm_2` / its bias
+/// `TENSOR_NOT_REQUIRED` (Falcon-40B and 180B have them, Falcon-7B does
+/// not), `:79-85` norm the layer input with it for attention when it is
+/// there and take `attn_norm`'s output otherwise, and `:124` hands the
+/// FFN `attn_norm(x)` either way. So a 40B layer is the two-norm
+/// parallel residual (`crate::parallel_residual`, `TwoNorms`) with the
+/// tensor NAMES crossed relative to `gptneox`: the attention slot is
+/// `attn_norm_2` and the pre-FFN slot is `attn_norm`. Decided PER LAYER
+/// by tensor presence, which is why it is [`NormSites::for_layer`] and
+/// not a row of [`NormSites::for_arch`]. Measured: `grep -l attn_norm_2
+/// src/models/*.cpp` over all 140 is `falcon`, `bert`, `jina-bert-v2`
+/// (encoders, a post-norm there), `rwkv6` / `rwkv7` / `eagle3` (other
+/// engines); one generic-path graph.
+pub const ATTN_NORM_2_FEEDS_ATTENTION: &[&str] = &["falcon"];
+
+/// Architectures that norm the TOKEN EMBEDDINGS before layer 0, with
+/// the model-level `token_embd_norm` pair (`LLM_TENSOR_TOKEN_EMBD_NORM`,
+/// spelled without a `blk.` prefix).
+///
+/// `bloom`: `bloom.cpp:25-26` create `tok_norm` / `tok_norm_b`
+/// REQUIRED and `:77-80` norm `inpL` with them, `LLM_NORM`, right after
+/// `build_inp_embd`. Measured over all 140 graphs: `bloom` is the one
+/// decoder on the generic path; `bert` / `nomic-bert` / `nomic-bert-moe`
+/// / `jina-bert-v2` / `jina-bert-v3` / `modern-bert` are the encoder
+/// engine, `rwkv6` / `rwkv7` / `wavtokenizer-dec` their own. The site
+/// takes the architecture's norm FUNCTION like every other
+/// ([`NormSites::function`]), so `bloom`'s is the biased LayerNorm.
+pub const EMBEDDING_NORM_ARCHITECTURES: &[&str] = &["bloom"];
+
+/// Architectures whose OUTPUT norm is stored under the embedding-norm
+/// NAME: `token_embd_norm.weight` is `LLM_TENSOR_OUTPUT_NORM_LFM2`
+/// (`llama-arch.cpp:384`, "fix for wrong tensor name"), created at
+/// `lfm2.cpp:36` as `output_norm` and applied at `:212` after the last
+/// layer; nothing norms the embeddings (`:191`). The same name is
+/// `bloom`'s embedding norm ([`EMBEDDING_NORM_ARCHITECTURES`]), one
+/// tensor name feeding two different sites, decided by architecture --
+/// the `attn_output_norm` case again. `lfm2moe` shares the loader line
+/// (`lfm2moe.cpp:31`).
+pub const OUTPUT_NORM_UNDER_EMBEDDING_NAME: &[&str] = &["lfm2", "lfm2moe"];
+
+/// Architectures with ONE norm per layer, `attn_norm`, whatever the
+/// layer's block is: `nemotron-h.cpp:52` ("all blocks use the attn
+/// norm"), `:145`. Every Nemotron-H layer is a single block with a
+/// single residual add (`layer_shapes::BLOCK_WITHOUT_FFN_KEEPS_ITS_
+/// OUTPUT`), so a layer reads EITHER the attention slot (a Mamba-2 or
+/// attention layer, `ffn_dim 0`) OR the FFN slot (an FFN-only layer,
+/// `AttnShape::Absent`), never both, and pointing the FFN slot at
+/// `attn_norm` is exact.
+pub const ONE_NORM_PER_LAYER: &[&str] = &["nemotron_h", "nemotron_h_moe"];
 
 /// A norm site whose weight the file stores.
 ///
@@ -233,19 +293,35 @@ pub struct NormSites {
     pub post_attn: Option<StoredNorm>,
     pub post_ffn: Option<StoredNorm>,
     pub output: StoredNorm,
+    /// The norm on the token embeddings before layer 0, or `None` for
+    /// every architecture but [`EMBEDDING_NORM_ARCHITECTURES`].
+    pub embedding: Option<StoredNorm>,
 }
 
 impl NormSites {
-    /// The table row for `arch`.
+    /// The table row for `arch`, with the architecture's own norm
+    /// function.
     pub fn for_arch(arch: &str) -> Self {
-        let function = norm_function(arch);
+        Self::with_function(arch, norm_function(arch))
+    }
+
+    /// The table row for `arch` under `function`: the loader's entry,
+    /// which has read the file (`crate::norm::norm_function_for_file`).
+    pub fn with_function(arch: &str, function: NormFunction) -> Self {
         let mut sites = Self {
             function,
             attn: Some(StoredNorm::required(&["attn_norm"])),
             ffn: Some(StoredNorm::required(&["ffn_norm"])),
             post_attn: Some(StoredNorm::optional(&["post_attention_norm"])),
             post_ffn: Some(StoredNorm::optional(&["post_ffw_norm"])),
-            output: StoredNorm::required(&["output_norm"]),
+            output: if OUTPUT_NORM_UNDER_EMBEDDING_NAME.contains(&arch) {
+                StoredNorm::required(&["token_embd_norm"])
+            } else {
+                StoredNorm::required(&["output_norm"])
+            },
+            embedding: EMBEDDING_NORM_ARCHITECTURES
+                .contains(&arch)
+                .then_some(StoredNorm::required(&["token_embd_norm"])),
         };
         if crate::capability::is_post_norm_only(arch) {
             sites.attn = None;
@@ -258,6 +334,9 @@ impl NormSites {
         if PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM.contains(&arch) {
             sites.ffn = Some(StoredNorm::required(&["attn_output_norm"]));
         }
+        if ONE_NORM_PER_LAYER.contains(&arch) {
+            sites.ffn = Some(StoredNorm::required(&["attn_norm"]));
+        }
         if POST_NORMS_UNDER_GROK_NAMES.contains(&arch) {
             sites.post_attn = Some(StoredNorm::required(&["attn_output_norm"]));
             sites.post_ffn = Some(StoredNorm::required(&[
@@ -266,6 +345,25 @@ impl NormSites {
             ]));
         }
         sites
+    }
+
+    /// This layer's row: the per-architecture row, with the two
+    /// pre-norm slots crossed for a layer that carries `attn_norm_2` on
+    /// an architecture in [`ATTN_NORM_2_FEEDS_ATTENTION`]. Every other
+    /// layer of every other architecture gets the row unchanged.
+    pub fn for_layer(&self, arch: &str, file: &impl TensorSource, layer: usize) -> Self {
+        if !ATTN_NORM_2_FEEDS_ATTENTION.contains(&arch)
+            || file
+                .find_tensor(&format!("blk.{layer}.attn_norm_2.weight"))
+                .is_none()
+        {
+            return *self;
+        }
+        Self {
+            attn: Some(StoredNorm::required(&["attn_norm_2"])),
+            ffn: Some(StoredNorm::required(&["attn_norm"])),
+            ..*self
+        }
     }
 
     /// A pre-norm site (attention, FFN, or with `layer == None` the
@@ -302,6 +400,31 @@ impl NormSites {
 mod tests {
     use super::*;
 
+    /// Falcon's second pre-norm crosses the two slots on exactly the
+    /// layers that carry it; a 7B layer, and every layer of every other
+    /// architecture, keeps the row.
+    #[test]
+    fn attn_norm_2_crosses_the_two_pre_norm_slots_per_layer() {
+        use crate::test_source::StubSource;
+        let row = NormSites::for_arch("falcon");
+        assert_eq!(row.function, NormFunction::LayerNormBias);
+        let seven_b = StubSource::with_tensors(&["blk.0.attn_norm.weight"]);
+        assert_eq!(row.for_layer("falcon", &seven_b, 0), row);
+        let forty_b = StubSource::with_tensors(&["blk.1.attn_norm_2.weight"]);
+        assert_eq!(
+            row.for_layer("falcon", &forty_b, 0),
+            row,
+            "layer 0 has none"
+        );
+        let crossed = row.for_layer("falcon", &forty_b, 1);
+        assert_eq!(crossed.attn, Some(StoredNorm::required(&["attn_norm_2"])));
+        assert_eq!(crossed.ffn, Some(StoredNorm::required(&["attn_norm"])));
+        assert_eq!(crossed.output, row.output);
+        // The name alone does nothing on another architecture.
+        let llama = NormSites::for_arch("llama");
+        assert_eq!(llama.for_layer("llama", &forty_b, 1), llama);
+    }
+
     /// The default row is the plain pre-norm layer with both post-norms
     /// optional, which is what every architecture not named in a list
     /// gets.
@@ -317,6 +440,38 @@ mod tests {
         );
         assert_eq!(s.post_ffn, Some(StoredNorm::optional(&["post_ffw_norm"])));
         assert_eq!(s.output, StoredNorm::required(&["output_norm"]));
+        assert_eq!(s.embedding, None);
+        assert_eq!(
+            NormSites::for_arch("bloom").embedding,
+            Some(StoredNorm::required(&["token_embd_norm"]))
+        );
+    }
+
+    /// Nemotron-H's FFN-only layer norms with `attn_norm`
+    /// (nemotron-h.cpp:52,145).
+    #[test]
+    fn nemotron_h_has_one_norm_per_layer() {
+        let s = NormSites::for_arch("nemotron_h");
+        assert_eq!(s.attn, Some(StoredNorm::required(&["attn_norm"])));
+        assert_eq!(s.ffn, Some(StoredNorm::required(&["attn_norm"])));
+    }
+
+    /// `token_embd_norm` is bloom's EMBEDDING norm and LFM2's OUTPUT
+    /// norm (llama-arch.cpp:384); each row reads it at its own site and
+    /// not the other's.
+    #[test]
+    fn token_embd_norm_is_the_output_norm_on_lfm2_alone() {
+        let s = NormSites::for_arch("lfm2");
+        assert_eq!(s.output, StoredNorm::required(&["token_embd_norm"]));
+        assert_eq!(s.embedding, None);
+        let b = NormSites::for_arch("bloom");
+        assert_eq!(b.output, StoredNorm::required(&["output_norm"]));
+        for arch in OUTPUT_NORM_UNDER_EMBEDDING_NAME {
+            assert!(
+                !EMBEDDING_NORM_ARCHITECTURES.contains(arch),
+                "{arch}: one tensor cannot feed both sites"
+            );
+        }
     }
 
     /// `attn_output_norm` feeds a DIFFERENT site on the two rows that

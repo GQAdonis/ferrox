@@ -146,6 +146,59 @@ pub const ATTN_GATE_ARCHS: &[(&str, AttnGateSpec)] = &[
     ),
 ];
 
+/// The three graphs whose FULL-attention layers gate the softmax output
+/// through a double-width `wq` (`qwen35.cpp:59,191-199,229-231`,
+/// `qwen35moe.cpp`, `qwen3next.cpp`): `attn_q` is `2 * n_head *
+/// head_dim` rows, each head's `[q, gate]` interleaved, and
+/// `sigmoid(gate) * attn` runs before `wo`. Loaded as the fused matrix
+/// (`AttnWeights::q_gate_interleaved`) and split AFTER the projection
+/// ([`split_interleaved_q_gate`]), so a quantized `wq` stays one matrix
+/// on its quantized path.
+pub const Q_INTERLEAVED_GATE_ARCHS: &[(&str, &str)] = &[
+    ("qwen35", "src/models/qwen35.cpp:59,191-199,229-231"),
+    ("qwen35moe", "src/models/qwen35moe.cpp"),
+    ("qwen3next", "src/models/qwen3next.cpp"),
+];
+
+/// True when `arch`'s full-attention layers project their gate inside
+/// `attn_q`.
+pub fn q_gate_interleaved(arch: &str) -> bool {
+    Q_INTERLEAVED_GATE_ARCHS.iter().any(|(a, _)| *a == arch)
+}
+
+/// Splits `rows` rows of a `2 * n_heads * head_dim`-wide `wq` output
+/// into the query rows (`n_heads * head_dim`) and the gate rows, per
+/// head: `qwen35.cpp:191-199` view the query at offset 0 and the gate at
+/// offset `head_dim` of each `2 * head_dim` stride.
+pub fn split_interleaved_q_gate(
+    fused: &[f32],
+    rows: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let width = n_heads * head_dim;
+    assert_eq!(fused.len(), rows * 2 * width);
+    let mut q = Vec::with_capacity(rows * width);
+    let mut gate = Vec::with_capacity(rows * width);
+    for r in 0..rows {
+        let row = &fused[r * 2 * width..(r + 1) * 2 * width];
+        for h in 0..n_heads {
+            q.extend_from_slice(&row[h * 2 * head_dim..h * 2 * head_dim + head_dim]);
+            gate.extend_from_slice(&row[h * 2 * head_dim + head_dim..(h + 1) * 2 * head_dim]);
+        }
+    }
+    (q, gate)
+}
+
+/// `qwen35.cpp:229-230`: `attn_out *= sigmoid(gate)`, element for
+/// element, on `rows` rows.
+pub fn apply_interleaved_gate(attn_out: &mut [f32], gate: &[f32]) {
+    assert_eq!(attn_out.len(), gate.len());
+    for (a, g) in attn_out.iter_mut().zip(gate) {
+        *a *= 1.0 / (1.0 + (-g).exp());
+    }
+}
+
 /// The three graphs that create `LLM_TENSOR_ATTN_GATE` for the gated
 /// delta-net's `z` projection instead. Recorded so the measurement
 /// behind [`ATTN_GATE_ARCHS`] is checkable, and so nobody adds them to

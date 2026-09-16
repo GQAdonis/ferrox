@@ -295,13 +295,21 @@ mod tests {
         );
     }
 
+    /// `mamba2` reaches the generic decoder since 2026-09-14
+    /// (`layer_shapes::PURE_RECURRENT`); RWKV is what the recurrent
+    /// stub still refuses.
     #[test]
-    fn mamba_is_recurrent_fail_closed_for_generic() {
+    fn mamba_is_generic_and_rwkv_is_recurrent_fail_closed() {
         assert!(matches!(
             select_engine_kind("mamba2").unwrap(),
+            SelectedEngineKind::GenericDecoder
+        ));
+        assert!(ensure_generic_decoder("mamba2").is_ok());
+        assert!(matches!(
+            select_engine_kind("rwkv7").unwrap(),
             SelectedEngineKind::RecurrentHybrid
         ));
-        assert!(ensure_generic_decoder("mamba2").is_err());
+        assert!(ensure_generic_decoder("rwkv7").is_err());
     }
 
     #[test]

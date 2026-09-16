@@ -53,13 +53,15 @@
 /// Architectures whose graph clamps Q, K and V by
 /// `{arch}.attention.clamp_kqv`.
 ///
-/// `mpt` is deliberately absent even though it reads the key: it
-/// resolves to `ArchPath::DedicatedOnly` and never reaches the generic
-/// decoder, so listing it would be a claim about a row this list does
-/// not serve -- the rule
+/// `mpt` was deliberately absent while it was `DedicatedOnly`; it is
+/// audited since 2026-09-14 (`crate::alibi`, tests/alibi_graphs.rs, a
+/// fixture with `clamp_kqv = 4` that the unclamped body misses by 4.8)
+/// and `mpt.cpp:5` reads the key optional (`conversion/mpt.py:36`
+/// writes it from `clip_qkv`). The rule
 /// [`crate::rope_finetuned::ROPE_GATED_ON_FINETUNED`] follows for
-/// `granitehybrid`.
-pub const CLAMPED_QKV_ARCHITECTURES: &[&str] = &["olmo", "dbrx"];
+/// `granitehybrid` still applies: a row this list does not serve is
+/// not listed.
+pub const CLAMPED_QKV_ARCHITECTURES: &[&str] = &["olmo", "dbrx", "mpt"];
 
 /// The subset of [`CLAMPED_QKV_ARCHITECTURES`] whose loader reads the
 /// key as REQUIRED.
@@ -175,7 +177,9 @@ mod tests {
     /// for it never reads the key, so `f_clamp_kqv` stays 0 there.
     #[test]
     fn an_architecture_whose_graph_does_not_clamp_ignores_the_key() {
-        for arch in ["llama", "qwen3", "olmo2", "mpt", "grok"] {
+        // `mpt` was here while it was refused; it clamps (`mpt.cpp:5`).
+        assert_eq!(resolve_clamp("mpt", Some(8.0)), Ok(Some(8.0)));
+        for arch in ["llama", "qwen3", "olmo2", "grok"] {
             assert_eq!(
                 resolve_clamp(arch, Some(8.0)),
                 Ok(None),

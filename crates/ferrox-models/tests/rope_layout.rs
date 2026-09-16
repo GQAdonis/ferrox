@@ -273,13 +273,38 @@ fn a_ferrox_only_name_on_the_generic_path_is_declared() {
     //    (`ferrox_models::mrope`), because for this one the converter
     //    permuted the weights and the two rotations differ (measured,
     //    `tests/glm4_graphs.rs`).
-    const DECLARED: &[&str] = &["phi4", "granite-moe", "glm4moe", "glm4"];
+    //  * `granite-hybrid` -- the same ferrox-only alias as `granite-moe`,
+    //    of `granitehybrid` (`llama-arch.cpp:102`); NORM like its row.
+    //  * `qwen35`, `qwen35moe` -- `llama_model_rope_type` answers
+    //    `IMROPE` (`llama-model.cpp:2694-2696`) unconditionally, a
+    //    layout this table has no column for. On text positions it is
+    //    NEOX band for band (`ferrox_models::mrope`), which
+    //    `tests/qwen35_graphs.rs` pins against libllama with the
+    //    sections in the file.
+    const DECLARED: &[&str] = &[
+        "phi4",
+        "granite-moe",
+        "granite-hybrid",
+        "glm4moe",
+        "glm4",
+        "qwen35",
+        "qwen35moe",
+    ];
     let mut undeclared = Vec::new();
     for p in architecture_catalog() {
         let ArchPath::GenericGqa { rope } = p.path else {
             continue;
         };
         if known.contains_key(p.gguf_name) || DECLARED.contains(&p.gguf_name) {
+            continue;
+        }
+        // A `LLAMA_ROPE_TYPE_NONE` row on the generic path rotates
+        // nothing (`gpt2`, `ferrox_models::position_embd`); the layout
+        // it carries is a filler, and `no_rope_architectures_never_
+        // reach_a_rotating_path` below is the test that pins that.
+        if ferrox_models::rope_layers::rope_layers(p.gguf_name, 12, false, 0)
+            == ferrox_models::rope_layers::RopeLayers::Never
+        {
             continue;
         }
         undeclared.push(format!("{}: ferrox rotates it as {rope:?}", p.gguf_name));
@@ -311,8 +336,16 @@ fn no_rope_architectures_never_reach_a_rotating_path() {
             continue;
         };
         // `TestFixture` is not in this group and would be a mistake here.
+        // A generic-path row is admissible ONLY under the rule that
+        // rotates nothing (`gpt2`: a learned position table,
+        // `ferrox_models::position_embd`); its layout is then a filler
+        // no rotation site reads.
         if let ArchPath::GenericGqa { rope } | ArchPath::TestFixture { rope } = p.path {
-            rotated.push(format!("{name}: ferrox rotates it as {rope:?}"));
+            if ferrox_models::rope_layers::rope_layers(name, 12, false, 0)
+                != ferrox_models::rope_layers::RopeLayers::Never
+            {
+                rotated.push(format!("{name}: ferrox rotates it as {rope:?}"));
+            }
         }
     }
     assert!(

@@ -111,8 +111,15 @@ pub enum LoadError {
 /// one, where the GGUF carries no key to correct it. Nothing is live
 /// today -- all three are `NewCode` for other reasons and refuse before
 /// reaching here -- but the list is what a later admission would trust.
-const SIGMOID_GATING_ARCHITECTURES: &[&str] =
-    &["afmoe", "deepseek2", "glm4moe", "laguna", "step35"];
+const SIGMOID_GATING_ARCHITECTURES: &[&str] = &[
+    "afmoe",
+    // cohere2moe.cpp:27-29: the key read optional, SIGMOID when absent.
+    "cohere2moe",
+    "deepseek2",
+    "glm4moe",
+    "laguna",
+    "step35",
+];
 
 /// Architectures whose graph passes a gating LITERAL into
 /// `build_moe_ffn`, so the file's `expert_gating_func` is never read:
@@ -130,11 +137,19 @@ const SIGMOID_GATING_ARCHITECTURES: &[&str] =
 /// it guards against. `conversion/mimo.py` writes SIGMOID from
 /// `scoring_func`, so on a real MiMo file the two agree too; the row
 /// exists because the literal is what llama.cpp runs.
-const GATING_LITERAL_ARCHITECTURES: &[(&str, GatingFunction)] =
-    &[("mimo2", GatingFunction::Sigmoid)];
+const GATING_LITERAL_ARCHITECTURES: &[(&str, GatingFunction)] = &[
+    ("mimo2", GatingFunction::Sigmoid),
+    // `nemotron-h.cpp:218`: the SIGMOID literal; the converter writes no
+    // `expert_gating_func` (`conversion/nemotron.py:238-250`).
+    ("nemotron_h_moe", GatingFunction::Sigmoid),
+    // `llama4.cpp:230`: the SIGMOID literal, with `norm_w = false` at
+    // `:228` (`NO_TOPK_RENORMALIZE_ARCHITECTURES`); the converter
+    // writes no key (`conversion/llama.py:374-394`).
+    ("llama4", GatingFunction::Sigmoid),
+];
 /// The names alone, for the cross-table test.
 #[cfg(test)]
-const GATING_LITERAL_NAMES: &[&str] = &["mimo2"];
+const GATING_LITERAL_NAMES: &[&str] = &["mimo2", "nemotron_h_moe", "llama4"];
 
 /// Architectures whose `load_arch_hparams` reads
 /// `{arch}.expert_weights_scale` (`LLM_KV_EXPERT_WEIGHTS_SCALE`) -- and
@@ -147,20 +162,24 @@ const GATING_LITERAL_NAMES: &[&str] = &["mimo2"];
 /// src/models/*.cpp` is twenty graphs; these are the eight on this
 /// loader (`deepseek2` / `deepseek32` / `deepseek2ocr` / `deepseek4` /
 /// `glm-dsa` / `glm4-moe` / `kimi-linear` / `minimax-m3` / `dflash` /
-/// `nemotron-h` / `hy-v3` / `cohere2moe` are on other engines, refused,
-/// or unknown here). Found by `mimo2`'s fixture: `mimo2.cpp` reads the
+/// `nemotron-h` / `hy-v3` are on other engines, refused, or unknown
+/// here; `cohere2moe.cpp:20` joined on 2026-09-14). Found by `mimo2`'s fixture: `mimo2.cpp` reads the
 /// key nowhere, libllama ran the fixture unscaled, and ferrox -- which
 /// honoured the key for any architecture -- scaled it by 2.5.
 const EXPERT_WEIGHTS_SCALE_READERS: &[&str] = &[
     "afmoe",
     "bailingmoe",
     "bailingmoe2",
+    // `cohere2moe.cpp:19-20` read both the norm and the scale.
+    "cohere2moe",
     "deepseek",
     "dots1",
     "exaone-moe",
     // `glm4-moe.cpp:13-14` read both the scale and the norm.
     "glm4moe",
     "laguna",
+    // `nemotron-h.cpp:19` (`routed_scaling_factor`, 2.5 on Nemotron-3 Nano).
+    "nemotron_h_moe",
     "step35",
 ];
 
@@ -174,10 +193,13 @@ const EXPERT_WEIGHTS_NORM_READERS: &[&str] = &[
     "afmoe",
     "bailingmoe",
     "bailingmoe2",
+    "cohere2moe",
     "dots1",
     "exaone-moe",
     "glm4moe",
     "laguna",
+    // `nemotron-h.cpp:18` (`norm_topk_prob`).
+    "nemotron_h_moe",
     "step35",
 ];
 
@@ -239,7 +261,13 @@ const DEDICATED_OWNS_ITS_BEHAVIOUR: &[(&str, &str)] = &[
 // Ferrox therefore renormalised where llama.cpp does not. Same class of
 // bug as the OLMoE one above, and latent only because `deepseek` is
 // unaudited and refuses first.
-const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] = &["deepseek", "olmoe", "qwen2moe"];
+// `jamba.cpp:164` passes `norm_w = false` and its converter writes no
+// `expert_weights_norm` (`conversion/jamba.py:24-54`).
+// `llama4.cpp:228` passes `false` beside its SIGMOID literal
+// (`GATING_LITERAL_ARCHITECTURES`): the top-k sigmoid scores weight
+// the experts unrenormalised.
+const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] =
+    &["deepseek", "jamba", "llama4", "olmoe", "qwen2moe"];
 
 /// Architectures whose `{arch}.feed_forward_length` counts the gate and
 /// the up projection TOGETHER, so each FFN matrix is half as wide as the
@@ -432,25 +460,11 @@ impl ModelConfig {
         let n_layers = layer_loops
             .map(|l| l.logical_layers())
             .unwrap_or(trunk.n_layers);
-        // Baichuan is one architecture string covering two positional
-        // schemes: 7B rotates, 13B uses ALiBi and no RoPE at all
-        // (`src/models/baichuan.cpp:11-14`, `:57-58`, where `inp_pos` is
-        // `nullptr` for 13B, so `ggml_rope_ext` is never reached).
-        // llama.cpp decides that on the layer count and says so in a
-        // comment: "TODO: become GGUF KV parameter". There is therefore
-        // no key for `capability::unsupported_feature_keys` to test and
-        // no tensor for `assert_every_tensor_consumed` to miss. A
-        // Baichuan-13B checkpoint loads clean and is rotated anyway.
-        // Refuse it here, where the layer count is known.
-        if arch == "baichuan" && n_layers == 40 {
-            return Err(LoadError::UnsupportedFeature(
-                arch.clone(),
-                "Baichuan-13B (block_count=40) uses ALiBi and no RoPE, decided by layer \
-                 count with no GGUF key to declare it; the generic decoder would rotate \
-                 every Q/K head instead. Baichuan-7B (block_count=32) is unaffected"
-                    .to_string(),
-            ));
-        }
+        // Baichuan-13B (block_count 40) used to be refused HERE: one
+        // architecture string, two positional schemes, decided by layer
+        // count with no key (`baichuan.cpp:11-14`). It is served now
+        // through `crate::alibi` (the bias) and `crate::rope_layers`
+        // (no rotation), both keyed on the same layer count.
         // EXAONE-4 32B used to be refused HERE, on the same shape:
         // `exaone4.cpp:4-14` switches the whole SWA machinery on inside
         // `if (hparams.n_layer() == 64)` and :116 then ropes only the
@@ -497,17 +511,24 @@ impl ModelConfig {
                 // a file whose layer 0 has none is a division by zero
                 // there and a refusal here.
                 let h0 = heads_per_layer.first().copied().unwrap_or(0) as usize;
-                if h0 == 0 {
-                    return Err(LoadError::MissingHparam(format!(
-                        "{} (layer 0 declares head_count 0, so it cannot be derived as \
-                         hidden_dim / n_heads)",
-                        key("attention.key_length")
-                    )));
+                // A pure recurrent model has no heads and no head width
+                // (`layer_shapes::PURE_RECURRENT`); nothing reads one.
+                match hidden_dim.checked_div(h0) {
+                    _ if h0 == 0 && crate::layer_shapes::pure_recurrent_block(&arch).is_some() => 0,
+                    None => {
+                        return Err(LoadError::MissingHparam(format!(
+                            "{} (layer 0 declares head_count 0, so it cannot be derived as \
+                             hidden_dim / n_heads)",
+                            key("attention.key_length")
+                        )));
+                    }
+                    Some(derived) => {
+                        best_effort_fields.push(
+                            "head_dim (no attention.key_length key; derived as hidden_dim / n_heads)",
+                        );
+                        derived
+                    }
                 }
-                best_effort_fields.push(
-                    "head_dim (no attention.key_length key; derived as hidden_dim / n_heads)",
-                );
-                hidden_dim / h0
             }
         };
         let v_head_dim = crate::kv_head_dims::resolve_v_head_dim(
@@ -552,18 +573,26 @@ impl ModelConfig {
             head_dim,
             metadata_f32_any(file, &[key("rope.scaling.alpha")]),
         );
-        let rms_norm_eps = metadata_f32_any(
-            file,
-            &[
-                key("attention.layer_norm_rms_epsilon"),
-                key("attention.layer_norm_epsilon"),
-            ],
-        )
-        .unwrap_or_else(|| {
-            best_effort_fields
-                .push("rms_norm_eps (no layer_norm_rms_epsilon key; defaulted to 1e-5)");
-            1e-5
-        });
+        // The norm FUNCTION is the architecture's, except where the file
+        // decides it (`crate::norm::NORM_BY_RMS_EPS_KEY`): a present and
+        // nonzero RMS epsilon means RMSNorm there, and a zero one is
+        // llama.cpp's "absent", so it is dropped before the epsilon
+        // itself is read below.
+        let declared_rms_eps = metadata_f32_any(file, &[key("attention.layer_norm_rms_epsilon")])
+            .filter(|eps| {
+                *eps != 0.0
+                    || !crate::norm::NORM_BY_RMS_EPS_KEY
+                        .iter()
+                        .any(|(a, _)| *a == arch)
+            });
+        let norm_function = crate::norm::norm_function_for_file(&arch, declared_rms_eps);
+        let rms_norm_eps = declared_rms_eps
+            .or_else(|| metadata_f32_any(file, &[key("attention.layer_norm_epsilon")]))
+            .unwrap_or_else(|| {
+                best_effort_fields
+                    .push("rms_norm_eps (no layer_norm_rms_epsilon key; defaulted to 1e-5)");
+                1e-5
+            });
 
         let n_experts = metadata_u64_any(file, &[key("expert_count")]).unwrap_or(0) as usize;
         let is_moe = n_experts > 1;
@@ -599,7 +628,18 @@ impl ModelConfig {
         // the key, and its layer 0 is dense (:105), so a real Laguna
         // export loaded with its three REQUIRED `_shexp` tensors
         // (:138-140) unread on every MoE layer.
-        let first_moe_layer = n_dense_leading_layers.min(n_layers.saturating_sub(1));
+        // The interleave step the loader honours (`crate::moe_interleave`,
+        // `llama4.cpp:64`), read here because the shared-expert probe
+        // below needs the first layer it makes MoE.
+        let moe_interleave_step = crate::moe_interleave::interleave_step(
+            &arch,
+            metadata_u64_any(file, &[key("interleave_moe_layer_step")]),
+            n_experts,
+        )
+        .map_err(|reason| LoadError::UnsupportedFeature(arch.clone(), reason))?;
+        let first_moe_layer = (n_dense_leading_layers..n_layers)
+            .find(|&il| !moe_interleave_step.is_some_and(|step| !(il + 1).is_multiple_of(step)))
+            .unwrap_or(n_layers.saturating_sub(1));
         let shexp_probe = format!("blk.{first_moe_layer}.ffn_gate_shexp.weight");
         let n_shared_experts = match metadata_u64_any(file, &[key("expert_shared_count")]) {
             Some(n) => n as usize,
@@ -645,12 +685,17 @@ impl ModelConfig {
                 );
                 (hidden_dim * 4) as u64
             }) as usize;
+        // Qwen3.5's recurrent layers come from two keys, not from the
+        // head counts (`crate::gdn::recurrent_layers`).
+        let recurrent_layers =
+            crate::gdn::recurrent_layers(file, &arch, trunk.block_count, n_layers)?;
         let layer_shapes = crate::layer_shapes::LayerShapes::resolve(
             &arch,
             &heads_per_layer,
             &kv_heads_per_layer,
             ffn_per_layer.as_deref(),
             expert_ffn_dim,
+            recurrent_layers.as_deref(),
         )?
         .replicated(layer_loops.map_or(1, |l| l.n_loops));
         // The OTHER half of llama.cpp's dense-vs-MoE rule.
@@ -749,7 +794,8 @@ impl ModelConfig {
         // (`use_sliding_window: false`) -- llama.cpp's own convention
         // is that a window of 0 means "unused," so only a real nonzero
         // value here is treated as active.
-        let sliding_window = metadata_u64_any(file, &[key("attention.sliding_window")])
+        let declared_window = metadata_u64_any(file, &[key("attention.sliding_window")]);
+        let sliding_window = declared_window
             .map(|v| v as usize)
             .filter(|&w| w > 0)
             // `phi3` declares a window that llama.cpp deliberately does
@@ -775,6 +821,49 @@ impl ModelConfig {
                     crate::capability::SwaWindowOverride::Pin(pinned) => Some(pinned),
                 },
             );
+
+        // A CHUNKED window (`crate::chunked_swa`): the literal chunk on
+        // the branch the file takes, whatever nonzero value it declares
+        // and whether it declares one at all; a declared ZERO is the
+        // branch libllama aborts on, refused there by name.
+        let swa_chunked = crate::chunked_swa::chunked_window(&arch, declared_window)?;
+        let sliding_window = swa_chunked.or(sliding_window);
+        let swa_chunked = swa_chunked.is_some();
+
+        // A window llama.cpp REQUIRES (`crate::swa_geometry::
+        // window_required`): without it the file does not load upstream,
+        // and here it would run with no layer rotated.
+        if let (None, Some(line)) = (sliding_window, crate::swa_geometry::window_required(&arch)) {
+            return Err(LoadError::UnsupportedFeature(
+                arch.clone(),
+                format!(
+                    "`{arch}.attention.sliding_window` is absent or zero, and llama.cpp reads it \
+                     as a REQUIRED key for this architecture (src/models/{line}); every real \
+                     export writes it, and a file without it does not load upstream"
+                ),
+            ));
+        }
+
+        // A window on a short-conv architecture: `lfm2.cpp:24-29`
+        // honours it on the ATTENTION layers alone (`is_swa_impl[il] =
+        // !is_recr_impl[il]`), a per-layer answer `crate::swa_layers`
+        // has no variant for, and one that would also arm eviction
+        // against the history the conv indexes by row
+        // (`crate::shortconv`). No published export writes the key.
+        if let (Some(w), true) = (
+            sliding_window,
+            crate::shortconv::is_shortconv_architecture(&arch),
+        ) {
+            return Err(LoadError::UnsupportedFeature(
+                arch.clone(),
+                format!(
+                    "`{arch}.attention.sliding_window` {w}: lfm2.cpp:24-29 windows the attention \
+                     layers and not the conv layers, which `swa_layers` cannot yet spell, and a \
+                     window on a conv layer would evict the history its convolution reads \
+                     (`crate::shortconv`); no published LFM2 export writes the key"
+                ),
+            ));
+        }
 
         // Three graphs rope their SLIDING layers with the scaling
         // switched off -- freq_scale = 1, ext_factor = 0, attn_factor =
@@ -944,16 +1033,15 @@ impl ModelConfig {
         .or(multipliers.attention_scale);
 
         // Granite reads `{arch}.rope.scaling.finetuned` as a switch for
-        // RoPE itself, not as a note about the scaling. A file declaring
-        // it false runs UNROTATED in llama.cpp and there is no ferrox
-        // expression for that, so it stops here.
-        if let Some(reason) = crate::rope_finetuned::unrotated_refusal(
+        // RoPE itself, not as a note about the scaling: a file declaring
+        // it false runs UNROTATED in llama.cpp (every Granite-4.0 hybrid
+        // export), which is `RopeLayers::Never` below
+        // (`crate::rope_finetuned`).
+        let rope_switched_off = crate::rope_finetuned::unrotated(
             &arch,
             file.metadata(&key("rope.scaling.finetuned"))
                 .and_then(GgufValue::as_bool),
-        ) {
-            return Err(LoadError::UnsupportedFeature(arch.clone(), reason));
-        }
+        );
 
         // OLMo-1 and DBRX clamp Q, K and V by `{arch}.attention.clamp_kqv`
         // inside the shared `build_qkv`. Resolved here for the
@@ -1361,6 +1449,9 @@ impl ModelConfig {
             n_mtp_blocks: trunk.n_mtp_blocks,
             layer_loops,
             skip_stream: crate::skip_stream::has_skip_stream(&arch),
+            parallel_ssm: crate::mamba2::parallel_with_attention(&arch),
+            swa_chunked,
+            weightless_qk_norm: crate::weightless_qk_norm::weightless_qk_norm(&arch, n_experts),
             hidden_dim,
             n_heads,
             n_kv_heads,
@@ -1379,15 +1470,30 @@ impl ModelConfig {
             // answer (`sliding_window`, not the raw key), because
             // `exaone4` decides both off the same layer count and the
             // two must not be able to disagree.
-            rope_layers: crate::rope_layers::rope_layers(&arch, n_layers, sliding_window.is_some()),
+            rope_layers: if rope_switched_off {
+                crate::rope_layers::RopeLayers::Never
+            } else {
+                crate::rope_layers::rope_layers(
+                    &arch,
+                    n_layers,
+                    sliding_window.is_some(),
+                    n_dense_leading_layers,
+                )
+            },
             router_input: crate::router_input::router_input(&arch),
             block_sub_norms: crate::sub_norms::block_sub_norms(&arch),
             parallel_residual: crate::parallel_residual::model_has_parallel_layer(
                 file, &arch, n_layers,
             ),
+            learned_positions: crate::position_embd::learned_positions(&arch),
             attn_value_scale: crate::attn_value_scale::resolve_attn_value_scale(
                 &arch,
                 file.metadata_f32(&key("attention.value_scale")),
+            ),
+            alibi_max_bias: crate::alibi::max_alibi_bias(
+                &arch,
+                n_layers,
+                file.metadata_f32(&key("attention.max_alibi_bias")),
             ),
             layer_shapes,
             moe: MoeLayerConfig {
@@ -1405,8 +1511,11 @@ impl ModelConfig {
                     .map(|v| v as usize)
                     .filter(|&c| c > 0),
                 expert_weights_scale,
+                routed_weight_before_ffn: crate::routed_weight_site::weight_before_ffn(&arch),
             },
             n_dense_leading_layers,
+            moe_interleave_step,
+            norm_function,
             rope_freqs,
             rope_layout,
             qk_norm_style,
@@ -2469,7 +2578,7 @@ impl Decoder {
         // uses for a different site (`gpt-oss` / `seed_oss`, `dbrx`,
         // `grok`). `crate::norm_sites` is the one table for all of it;
         // this loader used to restate the decision at every site.
-        let norm_sites = crate::norm_sites::NormSites::for_arch(&arch);
+        let norm_sites = crate::norm_sites::NormSites::with_function(&arch, config.norm_function);
         let mut gpt_oss_layers: Vec<crate::decoder::GptOssLayer> = Vec::new();
 
         // One store for the whole model (keys are (layer, expert)),
@@ -2484,6 +2593,14 @@ impl Decoder {
         // dequantizes one row via `WeightMatrix::dequant_row`, instead
         // of the whole vocabulary tensor being widened to f32 up front.
         let embedding = load_weight_matrix(&file, "token_embd.weight")?;
+        // The learned position table (`crate::position_embd`), one row
+        // per trained position, for the graphs that add one.
+        let position_embd = crate::position_embd::load_position_embd(
+            &file,
+            &arch,
+            config.hidden_dim,
+            metadata_u64_any(&file, &[format!("{arch}.context_length")]).map(|v| v as usize),
+        )?;
 
         // PHYSICAL layers: the blocks the file holds tensors for. A
         // looped model (`crate::layer_loops`) has more logical layers
@@ -2503,6 +2620,10 @@ impl Decoder {
             // than the post-attention residual, and under which norm
             // (`crate::parallel_residual`).
             let parallel = crate::parallel_residual::layer_parallel_norm(&file, &arch, l);
+            // THIS layer's norm slots: the architecture's row, with
+            // Falcon-40B's `attn_norm_2` crossing the two pre-norm names
+            // on the layers that carry it (`crate::norm_sites`).
+            let layer_sites = norm_sites.for_layer(&arch, &file, l);
             // BitNet's two inner norms, REQUIRED when the architecture
             // has them and untouched otherwise (`crate::sub_norms`).
             let sub_norms = crate::sub_norms::load_sub_norms(
@@ -2587,7 +2708,7 @@ impl Decoder {
                         o_proj: load_weight_matrix(&file, &format!("blk.{l}.attn_output.weight"))?,
                         // Which tensor, which function, and whether there is a
                         // norm here at all: all three answered by the table.
-                        norm_weight: norm_sites.load_pre_norm(norm_sites.attn, &file, Some(l))?,
+                        norm_weight: layer_sites.load_pre_norm(layer_sites.attn, &file, Some(l))?,
                         q_norm,
                         k_norm,
                         // Qwen2/Qwen2-MoE-family real QKV bias (`attn_{q,k,v}.bias`,
@@ -2639,6 +2760,18 @@ impl Decoder {
                             l,
                             config.hidden_dim,
                         )?,
+                        shortconv: None,
+                        // falcon-h1.cpp:55-71: the Mamba-2 block beside
+                        // attention on every layer (`crate::mamba2::
+                        // PARALLEL_WITH_ATTENTION`).
+                        ssm: if config.parallel_ssm {
+                            Some(crate::ssm_block::SsmBlock::Mamba2(
+                                crate::mamba2::Mamba2::load(&file, &arch, l, config.hidden_dim)?,
+                            ))
+                        } else {
+                            None
+                        },
+                        q_gate_interleaved: crate::attn_gate::q_gate_interleaved(&arch),
                     };
                     crate::layer_shapes::check_gqa_projection_widths(
                         l,
@@ -2653,6 +2786,7 @@ impl Decoder {
                 other => crate::layer_shapes::load_non_gqa_attention(
                     other,
                     &file,
+                    &arch,
                     l,
                     &norm_sites,
                     config.hidden_dim,
@@ -2666,7 +2800,38 @@ impl Decoder {
             // ik_llama.cpp's source. A model with n_experts<=1
             // globally (the dense test fixture) is dense on every
             // layer either way.
-            let is_dense_layer = config.layer_is_dense(l) || config.moe.n_experts <= 1;
+            // A layer with NO FFN at all (`ffn_dim 0`: deci's, Nemotron-H's
+            // block-only layers) takes the dense arm, whose loader answers
+            // `absent_ffn` for that width, whatever the model's MoE says.
+            let is_dense_layer = config.layer_is_dense(l)
+                || config.moe.n_experts <= 1
+                || shape.ffn_dim == 0
+                || crate::moe_interleave::dense_by_router_absence(&arch, &file, l);
+            // The ungated experts (`nemotron-h.cpp:82-86,209-215`: a null
+            // gate into `build_moe_ffn`, `LLM_FFN_RELU_SQR`) are spelled
+            // the way the dense ungated FFN is (`load_dense_expert`): the
+            // gate ALIASED to `up`, so `relu(up)^2` runs through the gated
+            // body with no branch. A file that carries a gate anyway is
+            // refused, as the dense loader refuses one.
+            let routed_gate_name = if config.ffn_is_ungated() && !is_dense_layer {
+                if file
+                    .find_tensor(&format!("blk.{l}.ffn_gate_exps.weight"))
+                    .is_some()
+                {
+                    return Err(LoadError::UnsupportedFeature(
+                        arch.clone(),
+                        format!(
+                            "blk.{l}.ffn_gate_exps.weight is present but this architecture's \
+                             experts are ungated ({:?}: a null gate into build_moe_ffn, \
+                             nemotron-h.cpp:212)",
+                            config.ffn_activation
+                        ),
+                    ));
+                }
+                format!("blk.{l}.ffn_up_exps.weight")
+            } else {
+                format!("blk.{l}.ffn_gate_exps.weight")
+            };
             // The inner FFN norm has a site in the dense body only
             // (`build_ffn` with a NULL down, `bitnet.cpp:127-141`);
             // `build_moe_ffn` has none, so a routed layer that carried
@@ -2693,11 +2858,7 @@ impl Decoder {
                 // enabled; fall back to resident when any of the three
                 // tensors isn't a supported quantized dtype.
                 let stored = if expert_cache_bytes.is_some() {
-                    let g = stored_expert_specs(
-                        &file,
-                        &format!("blk.{l}.ffn_gate_exps.weight"),
-                        n_experts,
-                    )?;
+                    let g = stored_expert_specs(&file, &routed_gate_name, n_experts)?;
                     let u = stored_expert_specs(
                         &file,
                         &format!("blk.{l}.ffn_up_exps.weight"),
@@ -2748,11 +2909,7 @@ impl Decoder {
                         ExpertBacking::Resident(Vec::new())
                     }
                     None => {
-                        let gates = split_expert_tensor(
-                            &file,
-                            &format!("blk.{l}.ffn_gate_exps.weight"),
-                            n_experts,
-                        )?;
+                        let gates = split_expert_tensor(&file, &routed_gate_name, n_experts)?;
                         let ups = split_expert_tensor(
                             &file,
                             &format!("blk.{l}.ffn_up_exps.weight"),
@@ -2780,8 +2937,28 @@ impl Decoder {
 
             let mut shared_experts: Vec<ExpertWeights> =
                 if config.moe.n_shared_experts > 0 && !is_dense_layer {
+                    // The shared expert takes the architecture's dense
+                    // activation, so an ungated one aliases its gate as
+                    // `load_dense_expert` does (`nemotron-h.cpp:222-227`).
+                    let shexp_gate = if config.ffn_is_ungated() {
+                        if file
+                            .find_tensor(&format!("blk.{l}.ffn_gate_shexp.weight"))
+                            .is_some()
+                        {
+                            return Err(LoadError::UnsupportedFeature(
+                                arch.clone(),
+                                format!(
+                                    "blk.{l}.ffn_gate_shexp.weight is present but this \
+                                     architecture's shared expert is ungated"
+                                ),
+                            ));
+                        }
+                        format!("blk.{l}.ffn_up_shexp.weight")
+                    } else {
+                        format!("blk.{l}.ffn_gate_shexp.weight")
+                    };
                     vec![ExpertWeights {
-                        gate: load_weight_matrix(&file, &format!("blk.{l}.ffn_gate_shexp.weight"))?,
+                        gate: load_weight_matrix(&file, &shexp_gate)?,
                         up: load_weight_matrix(&file, &format!("blk.{l}.ffn_up_shexp.weight"))?,
                         down: load_weight_matrix(&file, &format!("blk.{l}.ffn_down_shexp.weight"))?,
                     }]
@@ -2792,6 +2969,9 @@ impl Decoder {
             // shared-expert slot under the dense names, plus the row's
             // scale on the sum (`crate::parallel_dense_ffn`). Decided per
             // layer: Grok-1's layers have no triple and take neither.
+            // ...and the same scale under the `_shexp` names
+            // (`SHARED_EXPERT_SUM_SCALE`, cohere2moe's `* 0.5`), on a
+            // layer that loaded a shared expert above.
             let parallel_sum_scale = if is_dense_layer {
                 None
             } else {
@@ -2804,7 +2984,10 @@ impl Decoder {
                         });
                         row.sum_scale
                     }
-                    None => None,
+                    None => crate::parallel_dense_ffn::shared_expert_sum_scale(
+                        &arch,
+                        !shared_experts.is_empty(),
+                    ),
                 }
             };
             // Arctic's second per-layer norm, the routed branch's operand
@@ -2956,7 +3139,7 @@ impl Decoder {
                 {
                     NormOp::None
                 } else {
-                    norm_sites.load_pre_norm(norm_sites.ffn, &file, Some(l))?
+                    layer_sites.load_pre_norm(layer_sites.ffn, &file, Some(l))?
                 },
                 parallel,
                 activation_counts,
@@ -2984,6 +3167,9 @@ impl Decoder {
         // asking for the tensor would refuse every real OLMo-1 file;
         // the table's function decides whether the read happens.
         let final_norm = norm_sites.load_pre_norm(Some(norm_sites.output), &file, None)?;
+        // The embedding norm (`norm_sites::EMBEDDING_NORM_ARCHITECTURES`),
+        // `NormOp::None` where the site is absent.
+        let embedding_norm = norm_sites.load_pre_norm(norm_sites.embedding, &file, None)?;
         // Many small Llama/Gemma-family GGUFs tie the lm-head to
         // `token_embd.weight` and omit `output.weight` (llama.cpp
         // `llama_model_loader` falls back the same way). Prefer the
@@ -2992,6 +3178,8 @@ impl Decoder {
             Ok(w) => w,
             Err(_) => load_weight_matrix(&file, "token_embd.weight")?,
         };
+        // `output.bias` for the graphs that create it (`crate::proj_bias`).
+        let output_bias = crate::proj_bias::load_output_bias(&file, &arch, output_head.rows())?;
 
         // Second pass: attach the one shared store to every
         // store-backed layer. Opening the shard files fresh (plain
@@ -3042,12 +3230,17 @@ impl Decoder {
             crate::execution_plan::ExecutionPlan::probe_metal_caps(),
         );
 
+        let alibi_slopes = crate::decoder::config_alibi_slopes(&config);
         let decoder = Decoder {
             config,
             embedding,
+            position_embd,
+            embedding_norm,
+            alibi_slopes,
             layers,
             final_norm,
             output_head,
+            output_bias,
             gpu_vram_budget_bytes: None,
             gpt_oss: if is_gpt_oss {
                 Some(crate::decoder::GptOssWeights {
@@ -3568,7 +3761,7 @@ mod tests {
                 .ffn_activation,
             FfnActivation::ReluSqr
         );
-        for shared in ["plm", "nemotron", "jais2", "nemotron-h"] {
+        for shared in ["plm", "nemotron", "jais2", "nemotron_h"] {
             assert!(crate::capability::uses_relu_sqr(shared), "{shared}");
         }
         assert!(!crate::capability::uses_relu_sqr("llama"));
@@ -3749,6 +3942,10 @@ mod tests {
                 "POST_NORMS_UNDER_GROK_NAMES",
                 crate::norm_sites::POST_NORMS_UNDER_GROK_NAMES,
             ),
+            (
+                "ATTN_NORM_2_FEEDS_ATTENTION",
+                crate::norm_sites::ATTN_NORM_2_FEEDS_ATTENTION,
+            ),
             ("LEADING_DENSE_KEY_IS_INERT", LEADING_DENSE_KEY_IS_INERT),
             (
                 "QK_NORM_AFTER_ROPE_ARCHITECTURES",
@@ -3809,6 +4006,10 @@ mod tests {
             (
                 "POST_NORMS_UNDER_GROK_NAMES",
                 crate::norm_sites::POST_NORMS_UNDER_GROK_NAMES,
+            ),
+            (
+                "ATTN_NORM_2_FEEDS_ATTENTION",
+                crate::norm_sites::ATTN_NORM_2_FEEDS_ATTENTION,
             ),
             ("LEADING_DENSE_KEY_IS_INERT", LEADING_DENSE_KEY_IS_INERT),
             (
@@ -3895,17 +4096,34 @@ mod tests {
 
     /// A NAMED problem must outrank "unaudited".
     ///
-    /// `gpt2` uses learned absolute position embeddings, and that is
-    /// what its refusal should say. Reporting "unaudited" instead would
-    /// be true and far less useful, and it is the ordering the loader's
-    /// own comment claims. Nothing checked that claim.
+    /// `grovemoe` is unaudited AND names its second expert bank; a
+    /// `llama4` file declaring a window of zero names the branch
+    /// libllama aborts on (`crate::chunked_swa`), and that is what its
+    /// refusal should say. Reporting "unaudited" instead would be true
+    /// and far less useful, and it is the ordering the loader's own
+    /// comment claims. Nothing checked that claim. (`gpt2`, `bloom` and
+    /// then a plain `llama4` were the example until each was served.)
     #[test]
     fn a_named_refusal_outranks_the_unaudited_one() {
-        let err = config_for_arch("gpt2").expect_err("gpt2 must refuse");
+        let kvs: Vec<(&str, Kv)> = vec![
+            ("general.architecture", Kv::Str("llama4")),
+            ("llama4.block_count", Kv::U32(1)),
+            ("llama4.embedding_length", Kv::U32(64)),
+            ("llama4.attention.head_count", Kv::U32(1)),
+            ("llama4.attention.head_count_kv", Kv::U32(1)),
+            ("llama4.attention.key_length", Kv::U32(64)),
+            ("llama4.rope.freq_base", Kv::F32(10_000.0)),
+            ("llama4.expert_count", Kv::U32(16)),
+            ("llama4.interleave_moe_layer_step", Kv::U32(1)),
+            ("llama4.attention.sliding_window", Kv::U32(0)),
+        ];
+        let err = ModelConfig::from_gguf(&open_metadata_gguf("llama4", &kvs))
+            .expect_err("a zero window must refuse");
         assert!(
             !matches!(err, LoadError::UnauditedArchitecture(..)),
-            "gpt2 should report its own reason, not that nobody audited it: {err:?}"
+            "llama4 should report its own reason, not that nobody audited it: {err:?}"
         );
+        assert!(err.to_string().contains("llama-graph.cpp:159"), "{err}");
     }
 
     /// A checkpoint that declares YaRN gets the per-band divisors the
@@ -4959,33 +5177,27 @@ mod tests {
         );
     }
 
-    /// An architecture that uses no RoPE must not reach the generic
-    /// decoder, which rotates unconditionally.
-    ///
-    /// All five of these were admitted as `GenericGqa { rope: Neox }`.
-    /// Nothing downstream could have caught it: `bloom` and `refact`
-    /// hardcode their ALiBi slope in `load_arch_hparams` with no GGUF
-    /// key, so the metadata gates above see nothing, and `mpt` carries
-    /// no tensor the generic loader fails to consume, so
-    /// `assert_every_tensor_consumed` sees nothing either. It would have
-    /// loaded, run at full speed, and answered from rotated positions.
+    /// The `LLAMA_ROPE_TYPE_NONE` group used to be refused by name here;
+    /// every row is served now, positioned the way its graph positions
+    /// (`crate::position_embd`, `crate::alibi`), and what this pins is
+    /// that not one of them reaches a rotation: the rule is
+    /// `RopeLayers::Never` for each, at any depth it takes.
     #[test]
-    fn an_architecture_with_no_rope_is_refused_by_name() {
-        for arch in ["gpt2", "mpt", "refact", "bloom", "jais"] {
-            let file = open_metadata_gguf(
-                &format!("norope_{arch}"),
-                &[("general.architecture", Kv::Str(arch))],
+    fn an_architecture_with_no_rope_rotates_nothing() {
+        for (arch, n_layers) in [
+            ("gpt2", 12),
+            ("mpt", 32),
+            ("refact", 32),
+            ("bloom", 30),
+            ("jais", 40),
+            ("baichuan", 40),
+        ] {
+            assert_eq!(
+                crate::rope_layers::rope_layers(arch, n_layers, false, 0),
+                crate::rope_layers::RopeLayers::Never,
+                "{arch} positions without RoPE and must rotate nothing"
             );
-            match ModelConfig::from_gguf(&file) {
-                Err(LoadError::DedicatedArchitectureRequired(got, reason)) => {
-                    assert_eq!(got, arch);
-                    assert!(
-                        reason.contains("ALiBi") || reason.contains("position embeddings"),
-                        "{arch}: the refusal must name what is missing, got {reason:?}"
-                    );
-                }
-                other => panic!("{arch} must be refused, got {other:?}"),
-            }
+            assert!(crate::capability::is_audited_generic(arch), "{arch}");
         }
     }
 
@@ -5055,129 +5267,40 @@ mod tests {
     /// Baichuan is one `general.architecture` string covering two
     /// positional schemes, and llama.cpp picks between them on the layer
     /// count alone (`src/models/baichuan.cpp:11-14`, with its own "TODO:
-    /// become GGUF KV parameter"). So the 13B is the MiniCPM case: no
-    /// key to gate on and no tensor to miss.
+    /// become GGUF KV parameter"). The 13B used to be refused HERE; it is
+    /// served now, and what this pins is that the two schemes are still
+    /// told apart by the count, on both tables that must agree about it
+    /// (`crate::alibi`, `crate::rope_layers`).
     #[test]
-    fn baichuan_13b_is_refused_because_it_uses_alibi_and_the_7b_is_not() {
-        let thirteen_b = open_metadata_gguf(
-            "baichuan13b",
-            &[
-                ("general.architecture", Kv::Str("baichuan")),
-                ("baichuan.block_count", Kv::U32(40)),
-            ],
+    fn baichuan_13b_positions_by_alibi_and_the_7b_rotates() {
+        assert_eq!(
+            crate::alibi::max_alibi_bias("baichuan", 40, None),
+            Some(8.0)
         );
-        match ModelConfig::from_gguf(&thirteen_b) {
-            Err(LoadError::UnsupportedFeature(arch, msg)) => {
-                assert_eq!(arch, "baichuan");
-                assert!(msg.contains("ALiBi"), "{msg}");
-                assert!(
-                    msg.contains("40"),
-                    "the refusal must name the layer count: {msg}"
-                );
-            }
-            other => panic!("Baichuan-13B must be refused, got {other:?}"),
-        }
-
-        // The 7B rotates exactly as the generic decoder does, so it must
-        // pass this gate. It still fails later, on the next missing
-        // hparam, which is what proves the gate let it through.
-        let seven_b = open_metadata_gguf(
-            "baichuan7b",
-            &[
-                ("general.architecture", Kv::Str("baichuan")),
-                ("baichuan.block_count", Kv::U32(32)),
-            ],
+        assert_eq!(
+            crate::rope_layers::rope_layers("baichuan", 40, false, 0),
+            crate::rope_layers::RopeLayers::Never
         );
-        match ModelConfig::from_gguf(&seven_b) {
-            Err(LoadError::MissingHparam(key)) => assert_eq!(key, "baichuan.embedding_length"),
-            other => panic!("Baichuan-7B must pass the ALiBi gate, got {other:?}"),
-        }
-    }
-
-    /// The norm-slot and norm-function lists cannot contradict each
-    /// other.
-    ///
-    /// Two kinds of list feed `crate::norm_sites::NormSites::for_arch`.
-    /// The SLOT lists say which tensor a site reads:
-    /// `PRE_FFN_NORM_IS_POST_ATTENTION_NORM`,
-    /// `PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM`, `POST_NORMS_UNDER_GROK_NAMES`
-    /// and `capability::POST_NORM_ONLY_ARCHITECTURES` (no pre-norm
-    /// tensor at all). A name on two of them would have one tensor read
-    /// for two sites, or a site both present and absent, and whichever
-    /// list `for_arch` consults last would win silently. The FUNCTION
-    /// lists say how a site norms: `capability::NON_PARAMETRIC_LAYER_NORM`
-    /// and `capability::WEIGHTED_LAYER_NORM`, which are two answers to
-    /// one question and so must also be disjoint. And the parameterless
-    /// function reads no tensor, so `olmo` cannot also be on a list
-    /// that names one.
-    ///
-    /// `dbrx` is deliberately on a slot list AND a function list, which
-    /// is why this is not "every list is pairwise disjoint": where a
-    /// tensor lives and how it is applied are orthogonal facts.
-    ///
-    /// Written as loops over the lists rather than hand-written pairs,
-    /// because the previous version checked two of three and the third
-    /// would have slipped past it in either direction.
-    #[test]
-    fn the_norm_slot_and_function_lists_cannot_contradict() {
-        use crate::norm_sites::{
-            POST_NORMS_UNDER_GROK_NAMES, PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM,
-            PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
-        };
-        let slot_lists: [(&str, &[&str]); 4] = [
-            (
-                "PRE_FFN_NORM_IS_POST_ATTENTION_NORM",
-                PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
-            ),
-            (
-                "PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM",
-                PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM,
-            ),
-            ("POST_NORMS_UNDER_GROK_NAMES", POST_NORMS_UNDER_GROK_NAMES),
-            (
-                "POST_NORM_ONLY_ARCHITECTURES",
-                crate::capability::POST_NORM_ONLY_ARCHITECTURES,
-            ),
-        ];
-        let function_lists: [(&str, &[&str]); 2] = [
-            (
-                "NON_PARAMETRIC_LAYER_NORM",
-                crate::capability::NON_PARAMETRIC_LAYER_NORM,
-            ),
-            (
-                "WEIGHTED_LAYER_NORM",
-                crate::capability::WEIGHTED_LAYER_NORM,
-            ),
-        ];
-        let disjoint = |lists: &[(&str, &[&str])]| {
-            for (i, (a_name, a)) in lists.iter().enumerate() {
-                for (b_name, b) in lists.iter().skip(i + 1) {
-                    for name in a.iter() {
-                        assert!(
-                            !b.contains(name),
-                            "`{name}` is on both `{a_name}` and `{b_name}`; \
-                             `NormSites::for_arch` would read it two ways and the list it \
-                             consults last would win silently"
-                        );
-                    }
-                }
-            }
-        };
-        disjoint(&slot_lists);
-        disjoint(&function_lists);
-        for name in crate::capability::NON_PARAMETRIC_LAYER_NORM {
-            for (slot_name, slot) in &slot_lists {
-                assert!(
-                    !slot.contains(name),
-                    "`{name}` reads no norm tensor and is on `{slot_name}`, which names one"
-                );
+        assert_eq!(crate::alibi::max_alibi_bias("baichuan", 32, None), None);
+        assert_eq!(
+            crate::rope_layers::rope_layers("baichuan", 32, false, 0),
+            crate::rope_layers::RopeLayers::All
+        );
+        // Both sizes pass the header stage and fail on the next missing
+        // hparam, which is what proves neither is gated here any more.
+        for (name, n) in [("baichuan13b", 40u32), ("baichuan7b", 32)] {
+            let file = open_metadata_gguf(
+                name,
+                &[
+                    ("general.architecture", Kv::Str("baichuan")),
+                    ("baichuan.block_count", Kv::U32(n)),
+                ],
+            );
+            match ModelConfig::from_gguf(&file) {
+                Err(LoadError::MissingHparam(key)) => assert_eq!(key, "baichuan.embedding_length"),
+                other => panic!("{name} must pass the header stage, got {other:?}"),
             }
         }
-        // Non-empty, so the loops above cannot pass by having nothing
-        // to compare.
-        assert!(!crate::capability::NON_PARAMETRIC_LAYER_NORM.is_empty());
-        assert!(!crate::capability::WEIGHTED_LAYER_NORM.is_empty());
-        assert!(!PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM.is_empty());
     }
 
     /// EXAONE-4 is ONE architecture string over TWO graphs, and

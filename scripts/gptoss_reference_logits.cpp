@@ -20,6 +20,11 @@
 // `llama-cli --lora-scaled` does. It is the reference half of ferrox's
 // LoRA coverage test.
 //
+// `REF_N_CTX=N` in the environment sizes the context and the batch at
+// N instead of 128, for a prompt that has to cross a boundary the
+// model only reaches far out (Llama 4's 8192-position chunk,
+// `tests/llama4_graphs.rs`). The whole prompt is still one batch.
+//
 // Prints one float per line, full precision, for the LAST position.
 
 #include "llama.h"
@@ -80,9 +85,11 @@ int main(int argc, char ** argv) {
     }
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx     = 128;
-    cparams.n_batch   = 128;
-    cparams.n_ubatch  = 128;
+    const char * n_ctx_env = getenv("REF_N_CTX");
+    const uint32_t n_ctx = n_ctx_env ? (uint32_t) atoi(n_ctx_env) : 128;
+    cparams.n_ctx     = n_ctx;
+    cparams.n_batch   = n_ctx;
+    cparams.n_ubatch  = n_ctx;
     cparams.no_perf   = true;
     // F32 KV. llama.cpp defaults to an F16 cache, which alone puts a
     // ~1e-4 floor under any comparison and would hide a real error of

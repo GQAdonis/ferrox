@@ -249,6 +249,7 @@ const LAYER_NORM_BIASES: &[&str] = &["output_norm.bias", "attn_norm.bias", "ffn_
 /// The projection biases, applied for exactly the architectures whose
 /// graph creates them (`ferrox_models::proj_bias`'s two tables).
 const PROJECTION_BIASES: &[&str] = &[
+    "output.bias",
     "attn_output.bias",
     "ffn_up.bias",
     "ffn_down.bias",
@@ -256,8 +257,11 @@ const PROJECTION_BIASES: &[&str] = &[
 ];
 
 fn creates_projection_bias(arch: &str, bias: &str) -> bool {
-    use ferrox_models::proj_bias::{ATTN_OUT_BIAS_CREATORS, FFN_BIAS_CREATORS};
+    use ferrox_models::proj_bias::{
+        ATTN_OUT_BIAS_CREATORS, FFN_BIAS_CREATORS, OUTPUT_BIAS_CREATORS,
+    };
     match bias {
+        "output.bias" => OUTPUT_BIAS_CREATORS.iter().any(|(n, _)| *n == arch),
         "attn_output.bias" => ATTN_OUT_BIAS_CREATORS.iter().any(|(n, _)| *n == arch),
         "ffn_up.bias" | "ffn_down.bias" => FFN_BIAS_CREATORS.iter().any(|(n, _, _)| *n == arch),
         "ffn_gate.bias" => FFN_BIAS_CREATORS.iter().any(|(n, _, g)| *n == arch && *g),
@@ -269,7 +273,8 @@ fn creates_projection_bias(arch: &str, bias: &str) -> bool {
 fn applied(arch: &str, bias: &str) -> bool {
     GENERIC_DECODER_APPLIES.contains(&bias)
         || (LAYER_NORM_BIASES.contains(&bias)
-            && ferrox_models::capability::uses_biased_layer_norm(arch))
+            && (ferrox_models::capability::uses_biased_layer_norm(arch)
+                || ferrox_models::capability::uses_biased_rms_norm(arch)))
         || (PROJECTION_BIASES.contains(&bias) && creates_projection_bias(arch, bias))
 }
 
@@ -332,15 +337,23 @@ fn the_layer_norm_bias_entry_is_backed_by_real_code() {
         let config = ferrox_models::ModelConfig::from_gguf(&file).expect("config parses");
         let d = ferrox_models::Decoder::from_gguf(&path, config).expect("fixture loads");
         for (i, layer) in d.layers.iter().enumerate() {
+            use ferrox_models::norm::NormOp;
+            use ferrox_models::parallel_residual::ParallelNorm;
             assert!(
-                matches!(
-                    layer.attn.norm_weight,
-                    ferrox_models::norm::NormOp::LayerNormBias { .. }
-                ) && matches!(
-                    layer.moe.norm_weight,
-                    ferrox_models::norm::NormOp::LayerNormBias { .. }
-                ),
+                matches!(layer.attn.norm_weight, NormOp::LayerNormBias { .. }),
                 "{arch} layer {i}: the LayerNorm biases were not read into the biased variant"
+            );
+            // A shared-norm parallel layer (`falcon`-7B, `phi2`) has no
+            // pre-FFN tensor and no pre-FFN norm: the FFN reads the
+            // attention norm's output (`ferrox_models::parallel_residual`).
+            let pre_ffn_ok = match layer.moe.parallel {
+                Some(ParallelNorm::SharedNorm) => matches!(layer.moe.norm_weight, NormOp::None),
+                _ => matches!(layer.moe.norm_weight, NormOp::LayerNormBias { .. }),
+            };
+            assert!(
+                pre_ffn_ok,
+                "{arch} layer {i}: the pre-FFN slot is not the biased variant (or the \
+                 shared-norm parallel layer's None)"
             );
         }
         assert!(matches!(
@@ -413,25 +426,12 @@ fn an_architecture_whose_required_bias_ferrox_drops_is_not_on_the_generic_path()
     );
 }
 
-/// The refusals added for this reason must keep saying so.
-///
-/// A refusal whose reason drifts to something else is a refusal nobody
-/// can act on, and it would let the arch back onto the generic path the
-/// moment that other reason is fixed.
-#[test]
-fn the_bias_refusals_name_the_bias() {
-    // `nemotron`, `orion`, `codeshell`, `jais2`, `starcoder2` and
-    // `stablelm` were here; their biases are applied now.
-    for arch in ["starcoder", "phimoe"] {
-        match resolve_profile(arch).map(|p| p.path) {
-            Some(ArchPath::DedicatedOnly { reason }) => assert!(
-                reason.contains("bias"),
-                "{arch} is refused, but not for its biases: {reason}"
-            ),
-            other => panic!("{arch} must be refused for its required biases, got {other:?}"),
-        }
-    }
-}
+// The test that pinned "the refusals added for this reason keep saying
+// so" has no rows left: `nemotron`, `orion`, `codeshell`, `jais2`,
+// `starcoder2`, `stablelm`, `phimoe` and `starcoder` each left by having
+// the dropped bias implemented, which is what
+// `an_architecture_whose_required_bias_ferrox_drops_is_not_on_the_generic_path`
+// checks for every row above.
 
 /// The transcription itself must not silently shrink, and every name in
 /// it has to resolve or the test above compares nothing.

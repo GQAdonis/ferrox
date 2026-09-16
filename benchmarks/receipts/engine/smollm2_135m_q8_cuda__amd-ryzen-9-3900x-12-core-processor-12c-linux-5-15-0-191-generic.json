@@ -1,0 +1,75 @@
+{
+  "accelerator": "NVIDIA GeForce RTX 3090",
+  "approx_params": 176062464,
+  "arch": "llama",
+  "backend": "cuda",
+  "backend_active": "CUDA",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.21.0",
+  "host_load_1min_end": 1.61,
+  "host_load_1min_start": 1.66,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 12,
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+    "label": "AMD Ryzen 9 3900X 12-Core Processor (12c) Linux 5.15.0-191-generic",
+    "os": "Linux 5.15.0-191-generic",
+    "perf_cores": null,
+    "ram_gb": 78.5
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "smollm2_135m_q8",
+  "kind": "engine",
+  "load_s": 0.011731465,
+  "model_path": "models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 144811360,
+  "tests": [
+    {
+      "ferrox_samples": [
+        1610.0317151720062,
+        1643.387626227777,
+        1617.2266374966152
+      ],
+      "ferrox_stddev": 14.332484629949393,
+      "ferrox_tps": 1617.2266374966152,
+      "gap": 27.044038841520464,
+      "llama_tps": 43736.34,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        176.26116550795376,
+        176.35259627277327,
+        176.500041274121
+      ],
+      "ferrox_stddev": 0.09841027771523043,
+      "ferrox_tps": 176.35259627277327,
+      "gap": 4.6680911843603905,
+      "llama_tps": 823.23,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 12,
+  "warmup_reps": 1
+}

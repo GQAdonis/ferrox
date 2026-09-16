@@ -26,6 +26,110 @@ higher one is a regression, not progress.
 Claim 2 is where CUDA fails today, and it is invisible in a gap column
 because a fallback still produces numbers.
 
+## Measured state, 2026-09-15
+
+Re-measured on a rented, dedicated AMD Ryzen 9 3900X (12 cores, Zen 2:
+AVX2 and no AVX-512) with an RTX 3090 (Ampere, CUDA 12.4, llama.cpp
+`1269cb1` built twice, CPU-only for the CPU rows and with CUDA for the
+CUDA rows). Every row below has a receipt in `benchmarks/receipts/
+engine/` and is rendered in `RESULTS.md`; the 7945HX section there is
+the same code BEFORE #159 and is kept as the before.
+
+### CPU, x86 (the first x86 rows since #159)
+
+| model | pp512 gap | tg128 gap |
+|---|---|---|
+| Llama-3.2-1B Q5_K_M | **1.04x** | 1.16x |
+| Llama-3.2-1B Q4_K_M | 1.29x | 1.11x |
+| Llama-3.2-1B Q6_K | 1.36x | 1.16x |
+| Llama-3.2-3B Q4_K_M | 1.25x | 1.13x |
+| Llama-3.1-8B Q4_K_M | 1.20x | 1.10x |
+| Mistral-7B Q4_K_M | 1.20x | 1.09x |
+| Phi-4-mini Q4_K_M | 1.18x | 1.12x |
+| Gemma-2-2B Q4_K_M | 1.36x | 1.09x |
+| Gemma-3-1B Q8_0 | 1.63x | 1.04x |
+| Qwen3-0.6B Q8_0 | 1.50x | 1.15x |
+| Qwen2.5-0.5B Q8_0 | 1.64x | 1.16x |
+| TinyLlama-1.1B Q8_0 | 1.52x | 1.08x |
+| SmolLM2-135M Q8_0 | 2.08x | 1.34x |
+| Llama-3.2-1B IQ4_XS | **4.45x** | 1.17x |
+
+**x86 prefill went from 6x-10x to 1.0x-1.6x** on the K-quants, which is
+#159's AVX2 GEMMs finally measured. The first run of this suite had ONE
+row still at **8.56x**: Llama-3.2-1B Q5_K_M prefilled at 44 tok/s
+against llama.cpp's 379 while Q4_K and Q6_K sat at 1.2x on the same
+host. The Q5_K batch arm in `weight_matrix.rs` gated its Kx8 path on
+`cfg!(target_arch = "aarch64")` where the Q4_K arm takes the path
+unconditionally and the Q6_K arm asks `q6_kx8_gemm_uses_acts_x4`, so
+every x86 Q5_K prefill fell through to the per-row GEMM -- class 2, a
+written-down claim about an architecture beside kernels that had an
+AVX2 body since #159, the exact shape #239 fixed in `int_dot_tier_here`.
+One predicate (`q5k_batch_takes_kx8`) later it reads 0.91x on a 5950X
+and 1.04x here, and Phi-4-mini, whose `attn_qkv` is Q5_K, went 3.24x
+to 1.18x with it. (The 5950X box went offline mid-run; its numbers are
+in the session log, not the ledger.)
+
+What is left on x86, by class:
+
+1. **No kernel: IQ4_XS prefill, 4.45x.** The batched arm for every
+   kind without a Kx8 tier is the generic fallback: per row, per
+   activation, `dot_iq4_xs_f32`, which re-decodes the row's nibbles
+   `batch` times per prefill and multiplies in f32. llama.cpp's
+   `ggml_vec_dot_iq4_xs_q8_K` is an int8 dot over Q8_K-quantized
+   activations (the codebook lookup into `maddubs` / `sdot`).
+   **Closed on the same day**, `ferrox_quant::iq4_xs_q8` (scalar twin,
+   SDOT, AVX2; the activations quantized once per matmul on both the
+   single-vector and the batched path): on the M2 Pro, interleaved
+   twice against the previous binary, Llama-3.2-1B IQ4_XS prefill went
+   53 to 170 tok/s and decode 40 to 85, and `ferrox parity` against
+   libllama is MATCH at KL 3.8e-5. The x86 number needs a rented box;
+   the local ratio is the evidence that the missing kernel was the
+   gap. The same fallback still serves IQ4_NL, Q2_K, Q3_K, Q5_0, Q4_1
+   and MXFP4, none of which is in the suite.
+3. **Fixed per-op cost: the Q8_0 rows at 1.5x-2.1x that shrink with
+   size** (SmolLM2 2.08x, Qwen 1.5x-1.6x, TinyLlama 1.5x, 8B 1.2x), and
+   SmolLM2's decode at 1.34x where every other decode row is 1.04x to
+   1.17x. #128's constant, seen from the prefill side.
+
+### CUDA (RTX 3090, Ampere)
+
+Step 1's exit criterion is half met. **The K-quant GEMM is correct on
+hardware**: `cargo test -p ferrox-cuda --features cuda -- --ignored`
+passes all 13 tests, and `ferrox verify --backend cuda` is
+token-identical to the CPU on Q4_K_M, Q5_K_M, Q6_K, Q8_0 and IQ4_XS
+Llama / TinyLlama checkpoints over a 64-token prompt and 24 generated
+tokens. One tolerance was wrong, not one kernel:
+`launch_mul_mm_matches_the_scalar_twin` bounded the GPU-vs-twin error
+relative to the RESULT, and with random fixture weights a 256-column
+sum cancels down to 0.6 while its terms' L1 is in the thousands, so a
+4.8e-4 absolute drift from FMA contraction read as a 1e-4 relative
+failure on one Q5_K element. The bound is result-relative plus an
+absolute floor per column now, and the measured worst case is written
+into it.
+
+**It is not within an order of magnitude**, and the gap is WIDER on
+Ampere than on the Xeon+3060 row: prefill 25.5x to 43.3x, decode 2.75x
+to 9.25x (IQ4_XS decode is the 9.25x; the K-quants are 2.75x to
+3.36x). Sampled with `nvidia-smi -lms 500` DURING the runs, twenty-six
+and thirty-one busy samples on Llama-3.2-3B Q4_K_M:
+
+| workload | GPU util | mem util | power |
+|---|---|---|---|
+| pp512 (323 tok/s) | **30% to 39%** | 1% | 175 W |
+| tg256 (66 tok/s) | 45% to 75% | 19% to 30% | 250 W to 308 W |
+
+So prefill leaves the 3090 idle two thirds of the time at half the
+power decode draws, which is the signature of a launch-bound or
+host-synchronised graph, NOT of slow arithmetic: a slow kernel would
+pin utilization. This is the lead the 2026-09-04 section called "50%,
+needing repeated sampling"; it is repeated now and it holds. Decode's
+19% to 30% memory utilization against llama.cpp's ~60% is #133's
+memory-bound half, unchanged. The order of work for CUDA is therefore:
+count the launches and host round trips in one prefill step (the
+per-op `cudaStreamSynchronize` shape) before touching any kernel
+body, because at 35% utilization the arithmetic cannot be more than a
+third of the problem.
+
 ## Measured state, 2026-09-04
 
 ### CUDA (GTX 1080, CUDA 12.4, llama.cpp built with CUDA on the same box)

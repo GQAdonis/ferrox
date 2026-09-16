@@ -19,6 +19,7 @@
 //! docs/THIRD_PARTY_NOTICES.md.
 
 pub mod activation_tap;
+pub mod alibi;
 pub mod attention;
 pub mod bench_profile;
 pub mod block_sparse;
@@ -38,6 +39,7 @@ pub mod expert_cache;
 pub mod expert_pool;
 pub mod expert_slots;
 pub mod expert_store;
+pub mod gdn;
 pub mod host_memory;
 pub mod instance;
 pub mod kernel_registry;
@@ -45,11 +47,13 @@ pub mod kv_block;
 pub mod kv_disk;
 pub mod kv_signature;
 pub mod kv_swa;
+pub mod mamba2;
 pub mod matmul;
 pub mod mla_absorbed;
 pub mod par;
 pub mod placement;
 pub mod qstar;
+pub mod recurrent_state;
 pub mod residency;
 pub mod summary_stats;
 pub mod tensor;

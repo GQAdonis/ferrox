@@ -121,10 +121,9 @@
 //!   since its other blocker, the shared-norm parallel residual over a
 //!   weighted LayerNorm, landed (`crate::parallel_residual`,
 //!   `capability::WEIGHTED_LAYER_NORM`). **Cohere2** reads the same key
-//!   the same way (`cohere2.cpp:14,153-154`, REQUIRED there) and is not
-//!   a row yet: its window rotates the sliding layers only, which no
-//!   seam here serves, and a row for an architecture that cannot load
-//!   is a gate that cannot fire.
+//!   REQUIRED (`cohere2.cpp:14`, `get_key` with no `false`) and applies
+//!   it the same way (`:153-154`), so it is the `talkie` shape,
+//!   [`LogitScaleUse::AsIs`], under its own row.
 //!
 //! **Neither attention key lives in this module's output.** Both
 //! `{arch}.attention.scale` and `{arch}.attention.output_scale` resolve
@@ -458,6 +457,18 @@ impl MultiplierSupport {
         attention: AttentionScaleKey::NotRead,
         defaults: MultiplierDefaults::FromFileOnly,
     };
+
+    /// `cohere2`. `{arch}.logit_scale` REQUIRED (`cohere2.cpp:14`) and
+    /// MULTIPLIED onto the logits (`:153-154`); every export writes it
+    /// (`conversion/command_r.py:27`, `0.25` for Command-R7B). None of
+    /// the other three keys is read.
+    pub const COHERE2: Self = Self {
+        embedding: false,
+        residual: false,
+        logit: LogitScaleUse::AsIs,
+        attention: AttentionScaleKey::NotRead,
+        defaults: MultiplierDefaults::FromFileOnly,
+    };
 }
 
 /// The GGUF architectures whose graph applies one or more of the four
@@ -473,10 +484,18 @@ const MULTIPLIER_ARCHITECTURES: &[(&str, MultiplierSupport)] = &[
     ("granite", MultiplierSupport::GRANITE),
     ("granitemoe", MultiplierSupport::GRANITE),
     ("granite-moe", MultiplierSupport::GRANITE),
+    // `granite-hybrid.cpp:4-7` reads the same four, all optional, and
+    // `:113,145-147,175` apply them at the same four sites.
+    ("granitehybrid", MultiplierSupport::GRANITE),
+    ("granite-hybrid", MultiplierSupport::GRANITE),
     ("minicpm", MultiplierSupport::MINICPM),
     ("grok", MultiplierSupport::GROK),
     ("talkie", MultiplierSupport::TALKIE),
     ("command-r", MultiplierSupport::COMMAND_R),
+    ("cohere2", MultiplierSupport::COHERE2),
+    // `cohere2moe.cpp:14,287-289`: the same REQUIRED key, multiplied
+    // when nonzero.
+    ("cohere2moe", MultiplierSupport::COHERE2),
 ];
 
 /// Which multipliers ferrox applies for `arch`.

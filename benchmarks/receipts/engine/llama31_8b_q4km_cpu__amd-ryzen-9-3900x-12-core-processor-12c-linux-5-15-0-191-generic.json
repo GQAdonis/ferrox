@@ -1,0 +1,75 @@
+{
+  "accelerator": null,
+  "approx_params": 8835301376,
+  "arch": "llama",
+  "backend": "cpu",
+  "backend_active": "CPU",
+  "engine_env": {
+    "FERROX_CPU_INT_DOT": "1"
+  },
+  "ferrox_version": "0.21.0",
+  "host_load_1min_end": 16.13,
+  "host_load_1min_start": 1.89,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 12,
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+    "label": "AMD Ryzen 9 3900X 12-Core Processor (12c) Linux 5.15.0-191-generic",
+    "os": "Linux 5.15.0-191-generic",
+    "perf_cores": null,
+    "ram_gb": 78.5
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "llama31_8b_q4km",
+  "kind": "engine",
+  "load_s": 0.044410056,
+  "model_path": "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 4920739232,
+  "tests": [
+    {
+      "ferrox_samples": [
+        58.783743002251775,
+        58.853343255087424,
+        58.14595404809109
+      ],
+      "ferrox_stddev": 0.3183321876801486,
+      "ferrox_tps": 58.783743002251775,
+      "gap": 1.2010123274609374,
+      "llama_tps": 70.6,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        5.40346428023153,
+        5.375715312707198,
+        5.431246009456437
+      ],
+      "ferrox_stddev": 0.0226703133312866,
+      "ferrox_tps": 5.40346428023153,
+      "gap": 1.1029960948950002,
+      "llama_tps": 5.96,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 12,
+  "warmup_reps": 1
+}

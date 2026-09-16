@@ -524,9 +524,11 @@ Every route that needs a decode still refuses.
 Only `bert` loads. The other encoder rows upstream builds from
 `bert.cpp`: `nomic-bert`, `jina-bert-v2/v3`, `neo-bert`,
 `modern-bert`, `eurobert`, `t5encoder`, and the decoder-style
-`llama-embed` / `gemma-embedding` / `pangu-embedded` all refuse **by
-name**, saying what each one needs (RoPE, a gated FFN, per-projection QK
-norm, its own graph). `ferrox_models::embedding_model::NOT_YET` is that
+`llama-embed` / `gemma-embedding` all refuse **by name**, saying what
+each one needs (RoPE, a gated FFN, per-projection QK norm, its own
+graph). `pangu-embedded` was in that list from its name alone and is a
+decoder LLM (openPangu-Embedded); it runs on the decode routes since
+2026-09-14. `ferrox_models::embedding_model::NOT_YET` is that
 list, and a test pins it against the capability registry so a new row
 cannot fall through to a generic refusal.
 

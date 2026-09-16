@@ -2,17 +2,25 @@
 //! one rule with a table, rather than one branch per architecture.
 //!
 //! Every architecture ferrox had audited rotates Q and K on every
-//! layer, and that is llama.cpp's default too. Six architectures
+//! layer, and that is llama.cpp's default too. Eight architectures
 //! upstream do not, and until 2026-09-10 ferrox had no way to say so:
 //! three of them were REFUSED for it, one ran WRONG, and two were
-//! latent behind other refusals.
+//! latent behind other refusals. The first census counted SIX, because
+//! it grepped for the word `use_rope`; `cohere2.cpp:91` and
+//! `cohere2moe.cpp:192` spell the same gate as `if (is_swa)` around
+//! `ggml_rope_ext` and were found on 2026-09-14 by grepping for that
+//! (`olmo2` and `mellum` also test `is_swa` there, but rotate BOTH
+//! branches -- the sliding one with the scaling off, `crate::
+//! swa_geometry` -- so they are not gates).
 //!
-//! # The six, transcribed
+//! # The eight, transcribed
 //!
 //! | arch | llama.cpp | line |
 //! |---|---|---|
 //! | `exaone4` | `is_swa(il) \|\| swa_type == NONE` | `exaone4.cpp:116` |
 //! | `exaone-moe` | `is_swa(il)` | `exaone-moe.cpp:136,155` |
+//! | `cohere2` | `is_swa(il)` | `cohere2.cpp:72,91` |
+//! | `cohere2moe` | `is_swa(il) \|\| il < n_layer_dense_lead` | `cohere2moe.cpp:177-179,192` |
 //! | `smollm3` | `(il + 1) % 4 != 0` | `smollm3.cpp:5,69` |
 //! | `smallthinker` | `step == n_layer \|\| il % step != 0` | `smallthinker.cpp:18,108-109` |
 //! | `afmoe` | `step > 0 && (il + 1) % step != 0` | `afmoe.cpp:137-138` |
@@ -78,6 +86,14 @@ pub enum RopeLayers {
     /// Every layer rotates: llama.cpp writes no gate at all.
     #[default]
     All,
+    /// NO layer rotates: the graph calls no `ggml_rope` at all and the
+    /// position enters some other way. `gpt2` and `starcoder` add a
+    /// learned table to the embeddings (`crate::position_embd`);
+    /// `llama_model_rope_type` answers `LLAMA_ROPE_TYPE_NONE` for the
+    /// first and NORM for the second, and neither graph reads the answer.
+    /// Not `SlidingOnly` with nothing sliding: that spelling would rotate
+    /// the day such a file declared a window.
+    Never,
     /// Only the SLIDING-WINDOW layers rotate; the full-attention layers
     /// get no rotation. `exaone4` (when its SWA is on) and `exaone-moe`.
     ///
@@ -87,6 +103,11 @@ pub enum RopeLayers {
     /// while `swa_type` is still `STANDARD` -- and it is why this is not
     /// written as "sliding layers, or everything if nothing slides".
     SlidingOnly,
+    /// The sliding layers AND the leading dense layers rotate:
+    /// `cohere2moe.cpp:177-179,192`, `is_swa(il) || il <
+    /// n_layer_dense_lead`. The dense prefix is full attention with
+    /// RoPE, the full-attention layers past it get none.
+    SlidingOrLeadingDense { n_dense_lead: usize },
     /// One layer in every `step` does not rotate,
     /// `hparams.n_no_rope_layer_step`.
     NoRopeEvery {
@@ -111,7 +132,11 @@ impl RopeLayers {
     pub fn rotates(self, layer_idx: usize, layer_slides: bool) -> bool {
         match self {
             Self::All => true,
+            Self::Never => false,
             Self::SlidingOnly => layer_slides,
+            Self::SlidingOrLeadingDense { n_dense_lead } => {
+                layer_slides || layer_idx < n_dense_lead
+            }
             Self::NoRopeEvery { step, phase } => {
                 let step = step.get();
                 match phase {
@@ -162,7 +187,12 @@ const fn step(n: usize) -> NonZeroUsize {
 ///
 /// `n_layers` is here for exactly one row: `smallthinker.cpp:108`
 /// rotates everything when its step equals the layer count.
-pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> RopeLayers {
+pub fn rope_layers(
+    arch: &str,
+    n_layers: usize,
+    has_sliding_window: bool,
+    n_dense_lead: usize,
+) -> RopeLayers {
     let no_rope_every = |phase| RopeLayers::NoRopeEvery {
         step: step(LLAMA_CPP_DEFAULT_NO_ROPE_STEP),
         phase,
@@ -183,6 +213,34 @@ pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> Rop
                 RopeLayers::All
             }
         }
+        // `cohere2.cpp:4` pins `swa_type` to STANDARD and `:13` reads the
+        // window as a REQUIRED key (the loader refuses a file without
+        // it, `crate::swa_geometry::window_required`), so this is
+        // `exaone-moe`'s rule spelled `if (is_swa)` at `:91`: Command-R7B
+        // rotates its three sliding layers in four and not the fourth.
+        "cohere2" => RopeLayers::SlidingOnly,
+        // `cohere2moe.cpp:192` adds `|| il < n_layer_dense_lead`
+        // (`:177-179`: "dense-prefix full-attention layers use RoPE");
+        // `:13` reads the window REQUIRED as `cohere2` does, so
+        // `has_sliding_window` is always true here.
+        "cohere2moe" => RopeLayers::SlidingOrLeadingDense { n_dense_lead },
+        // `gpt2.cpp` and `starcoder.cpp` call no `ggml_rope`: a learned
+        // position table is added to the embeddings instead
+        // (`crate::position_embd`).
+        "gpt2" | "starcoder" => RopeLayers::Never,
+        // `nemotron-h.cpp:181-193` builds its attention with no
+        // `ggml_rope_ext` at all: the Mamba-2 layers carry position.
+        "nemotron_h" | "nemotron_h_moe" => RopeLayers::Never,
+        // `jamba.cpp:98` ("No RoPE :)"); `mamba` / `mamba2` have no
+        // attention at all. All three are `LLAMA_ROPE_TYPE_NONE`
+        // (llama-model.cpp:2555-2557).
+        "jamba" | "mamba" | "mamba2" => RopeLayers::Never,
+        // The ALiBi graphs (`crate::alibi`): `bloom`, `refact`, `mpt`,
+        // `jais`, and `baichuan` at 40 layers ONLY (`baichuan.cpp:11-14`;
+        // the 7B rotates). One table decides both the bias and the
+        // absence of rotation, so the two cannot disagree about the
+        // layer count.
+        _ if crate::alibi::positions_by_alibi(arch, n_layers) => RopeLayers::Never,
         // `smollm3.cpp:5` assigns the step unconditionally, so this is
         // every SmolLM3 file: 9 of a 36-layer SmolLM3-3B's layers get no
         // rotation.
@@ -202,11 +260,13 @@ pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> Rop
         // (`tests/gated_attention_graphs.rs`).
         "afmoe" => no_rope_every(NoRopePhase::LastOfPeriod),
         // `llama4.cpp:11` sets the step to `n_layer` ("always use rope",
-        // its own comment) only when the file declares a window of ZERO;
-        // every other Llama-4 keeps the default 4 and :145-146 skips
-        // `(il + 1) % 4 == 0`. LATENT on the generic path (`llama4` has
-        // a dedicated engine), and `llama4`'s chunked attention is not
-        // ferrox's `sliding_window` either.
+        // its own comment) only when the file declares a window of ZERO,
+        // the branch `crate::chunked_swa` refuses because libllama
+        // aborts on it; every other Llama-4 keeps the default 4 and
+        // :145-146 skips `(il + 1) % 4 == 0`, which is exactly the
+        // full-attention layer of its 3-chunked-1-full period. LIVE
+        // since 2026-09-14 (`tests/llama4_graphs.rs`); the chunked
+        // window is ferrox's `sliding_window` with `swa_chunked` set.
         "llama4" if has_sliding_window => no_rope_every(NoRopePhase::LastOfPeriod),
         _ => RopeLayers::All,
     }
@@ -224,6 +284,8 @@ pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> Rop
 pub const PER_LAYER_ROPE_GATES: &[(&str, &str)] = &[
     ("exaone4", "src/models/exaone4.cpp:116"),
     ("exaone-moe", "src/models/exaone-moe.cpp:136,155"),
+    ("cohere2", "src/models/cohere2.cpp:72,91"),
+    ("cohere2moe", "src/models/cohere2moe.cpp:177-179,192"),
     ("smollm3", "src/models/smollm3.cpp:5,69"),
     ("smallthinker", "src/models/smallthinker.cpp:18,108-109"),
     ("afmoe", "src/models/afmoe.cpp:137-138"),
@@ -244,15 +306,15 @@ mod tests {
         for slides in [true, false] {
             for il in 0..8 {
                 assert_eq!(
-                    rope_layers("exaone4", 64, true).rotates(il, slides),
-                    rope_layers("exaone-moe", 48, true).rotates(il, slides),
+                    rope_layers("exaone4", 64, true, 0).rotates(il, slides),
+                    rope_layers("exaone-moe", 48, true, 0).rotates(il, slides),
                     "layer {il}, slides={slides}"
                 );
             }
         }
         // And the disjunct that separates them: with no window at all
         // EXAONE-4 rotates everything, which is the 1.2B.
-        assert_eq!(rope_layers("exaone4", 30, false), RopeLayers::All);
+        assert_eq!(rope_layers("exaone4", 30, false, 0), RopeLayers::All);
     }
 
     /// EXAONE-4 32B, layer by layer: `set_swa_pattern(4)` last-dense
@@ -260,7 +322,7 @@ mod tests {
     /// ones rotate.
     #[test]
     fn exaone4_32b_rotates_three_layers_in_four() {
-        let rule = rope_layers("exaone4", 64, true);
+        let rule = rope_layers("exaone4", 64, true, 0);
         let slides = |il: usize| il % 4 < 3;
         for il in 0..64 {
             assert_eq!(
@@ -277,8 +339,8 @@ mod tests {
     /// SmolLM3-3B's layers at the wrong positions.
     #[test]
     fn the_two_no_rope_phases_disagree_about_every_layer_they_name() {
-        let smollm3 = rope_layers("smollm3", 36, false);
-        let smallthinker = rope_layers("smallthinker", 32, true);
+        let smollm3 = rope_layers("smollm3", 36, false, 0);
+        let smallthinker = rope_layers("smallthinker", 32, true, 0);
         for il in 0..36 {
             assert_eq!(smollm3.rotates(il, false), (il + 1) % 4 != 0);
         }
@@ -297,7 +359,7 @@ mod tests {
     /// rope". A SmallThinker with no window must not lose a layer.
     #[test]
     fn smallthinker_without_a_window_rotates_everything() {
-        assert_eq!(rope_layers("smallthinker", 32, false), RopeLayers::All);
+        assert_eq!(rope_layers("smallthinker", 32, false, 0), RopeLayers::All);
     }
 
     /// The census and the table are checked against each other, so a
@@ -306,10 +368,10 @@ mod tests {
     fn every_gated_architecture_is_in_the_table() {
         for (arch, line) in PER_LAYER_ROPE_GATES {
             // 32 layers and a window is the shape that makes every one
-            // of the six gates fire; the two conditional rows
+            // of the seven gates fire; the two conditional rows
             // (`smallthinker`, `llama4`) need the window and the other
             // four ignore it.
-            let rule = rope_layers(arch, 32, true);
+            let rule = rope_layers(arch, 32, true, 0);
             assert_ne!(
                 rule,
                 RopeLayers::All,
@@ -324,11 +386,23 @@ mod tests {
 
     /// The other direction: an architecture llama.cpp does NOT gate must
     /// not pick up a gate here. `llama` is the whole generic path.
+    /// `cohere2moe.cpp:192`: the dense prefix rotates although it does
+    /// not slide, the full-attention layers past it do not.
+    #[test]
+    fn cohere2moe_rotates_its_dense_prefix_and_its_sliding_layers() {
+        let rule = rope_layers("cohere2moe", 4, true, 1);
+        assert_eq!(rule, RopeLayers::SlidingOrLeadingDense { n_dense_lead: 1 });
+        assert!(rule.rotates(0, false), "dense lead, full attention");
+        assert!(rule.rotates(1, true));
+        assert!(!rule.rotates(3, false), "full attention past the prefix");
+        assert!(!rope_layers("cohere2", 4, true, 1).rotates(0, false));
+    }
+
     #[test]
     fn an_ungated_architecture_rotates_every_layer() {
         for arch in ["llama", "qwen3", "gemma3", "olmo2", "exaone", "granite"] {
             assert_eq!(
-                rope_layers(arch, 32, true),
+                rope_layers(arch, 32, true, 0),
                 RopeLayers::All,
                 "{arch} has no `use_rope` in src/models/"
             );

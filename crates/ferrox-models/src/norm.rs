@@ -165,6 +165,20 @@ pub enum NormOp {
     /// old "LayerNorm-with-bias group" shares; it arrived when two rows
     /// needed nothing else, and the six that need more say what.
     LayerNormBias { weight: Vec<f32>, bias: Vec<f32> },
+    /// RMSNorm with a learned weight AND bias: `x / sqrt(mean(x^2) +
+    /// eps) * w + b` -- `build_norm(x, w, b, LLM_NORM_RMS, il)`, the
+    /// same multiply-then-add as [`Self::LayerNormBias`] over the RMS
+    /// rather than the centred vector.
+    ///
+    /// `phimoe` (Phi-3.5-MoE): `phimoe.cpp:20-21,28-29,35-36` create
+    /// the six per-layer and two output tensors REQUIRED, and its graph
+    /// is `phi3`'s (`models.h:632`), whose `phi3.cpp:99-102,137-139,
+    /// 174-177` pass each pair to `LLM_NORM_RMS`; `phi3` itself never
+    /// creates the biases, so its files take [`Self::Rms`]. One graph of
+    /// 140 on the generic path (`capability::BIASED_RMS_NORM`;
+    /// `deepseek32` and `glm-dsa` pass a bias to `LLM_NORM_RMS` on other
+    /// engines, `chameleon` passes NULL).
+    RmsBias { weight: Vec<f32>, bias: Vec<f32> },
     /// No norm at all: the branch reads the raw residual.
     ///
     /// `olmo2` and `exaone4`. NOT "an RMSNorm whose weights are all
@@ -213,6 +227,15 @@ impl NormOp {
                 }
                 out
             }
+            Self::RmsBias { weight, bias } => {
+                // `rms_norm` is the multiply; then the same `ggml_add`.
+                let mut out = rms_norm(x, weight, eps);
+                debug_assert_eq!(out.len(), bias.len());
+                for (o, b) in out.iter_mut().zip(bias.iter()) {
+                    *o += b;
+                }
+                out
+            }
             Self::None => x.to_vec(),
         }
     }
@@ -226,10 +249,13 @@ impl NormOp {
     pub fn rms_weights(&self) -> Option<&[f32]> {
         match self {
             Self::Rms(w) => Some(w),
+            // A biased RMSNorm has RMS weights, and no fused kernel adds
+            // the bias after them: the host body, not the launch.
             Self::RmsNoParams
             | Self::LayerNormNoParams
             | Self::LayerNorm(_)
             | Self::LayerNormBias { .. }
+            | Self::RmsBias { .. }
             | Self::None => None,
         }
     }
@@ -278,6 +304,9 @@ pub enum NormFunction {
     /// `LLM_NORM_RMS` with a null weight: `talkie`
     /// (`capability::NON_PARAMETRIC_RMS_NORM`), [`NormOp::RmsNoParams`].
     RmsNoParams,
+    /// `LLM_NORM_RMS` with a weight AND a bias: `phimoe`
+    /// (`capability::BIASED_RMS_NORM`), [`NormOp::RmsBias`].
+    RmsBias,
 }
 
 impl NormFunction {
@@ -306,6 +335,10 @@ impl NormFunction {
             },
             Self::LayerNormNoParams => NormOp::LayerNormNoParams,
             Self::RmsNoParams => NormOp::RmsNoParams,
+            Self::RmsBias => NormOp::RmsBias {
+                weight: load(NormParam::Weight)?,
+                bias: load(NormParam::Bias)?,
+            },
         })
     }
 }
@@ -319,6 +352,31 @@ impl NormFunction {
 /// `the_norm_slot_and_function_lists_cannot_contradict` pins that the
 /// situation never arises.
 pub fn norm_function(arch: &str) -> NormFunction {
+    norm_function_for_file(arch, None)
+}
+
+/// The ONE graph of 140 whose norm function is decided by the FILE:
+/// `cohere2moe.cpp:4-11` read both epsilon keys as optional, zero the
+/// RMS one when it is absent, and `:166,314` pick `LLM_NORM` when
+/// `f_norm_rms_eps == 0.0f` and `LLM_NORM_RMS` otherwise. Every real
+/// export writes `attention.layer_norm_epsilon` alone
+/// (`conversion/base.py:1354-1355` from `layer_norm_eps`), so the
+/// architecture's default is the weighted LayerNorm
+/// (`capability::WEIGHTED_LAYER_NORM`) and a file carrying a nonzero
+/// `attention.layer_norm_rms_epsilon` switches to RMS; measured
+/// (`grep -n 'f_norm_rms_eps == 0' src/models/*.cpp`).
+pub const NORM_BY_RMS_EPS_KEY: &[(&str, &str)] =
+    &[("cohere2moe", "src/models/cohere2moe.cpp:4-11,166")];
+
+/// [`norm_function`] with what the file declares for
+/// `attention.layer_norm_rms_epsilon`, for [`NORM_BY_RMS_EPS_KEY`];
+/// every other architecture ignores the argument.
+pub fn norm_function_for_file(arch: &str, declared_rms_eps: Option<f32>) -> NormFunction {
+    if NORM_BY_RMS_EPS_KEY.iter().any(|(a, _)| *a == arch)
+        && declared_rms_eps.is_some_and(|eps| eps != 0.0)
+    {
+        return NormFunction::Rms;
+    }
     if crate::capability::uses_non_parametric_layer_norm(arch) {
         NormFunction::LayerNormNoParams
     } else if crate::capability::uses_non_parametric_rms_norm(arch) {
@@ -327,6 +385,8 @@ pub fn norm_function(arch: &str) -> NormFunction {
         NormFunction::LayerNorm
     } else if crate::capability::uses_biased_layer_norm(arch) {
         NormFunction::LayerNormBias
+    } else if crate::capability::uses_biased_rms_norm(arch) {
+        NormFunction::RmsBias
     } else {
         NormFunction::Rms
     }

@@ -525,21 +525,35 @@ impl IntDotTier {
 
 /// The per-host, per-workload rule, in one place.
 ///
-/// - **aarch64**: both halves. The interleave-8 NEON GEMV and the i8mm
-///   SMMLA GEMMs are the kernels this tier was written for, worth ~28%
-///   of decode and 15x of prefill (`FERROX_CPU_INT_DOT=0` takes
-///   Llama-3.2-1B Q4_K_M pp512 from 420.34 to 27.81 tok/s, #152).
+/// - **aarch64**: the matvec half always — the interleave-8 NEON GEMV
+///   and the i8mm SMMLA GEMMs are the kernels this tier was written for,
+///   worth ~28% of decode and 15x of prefill (`FERROX_CPU_INT_DOT=0`
+///   takes Llama-3.2-1B Q4_K_M pp512 from 420.34 to 27.81 tok/s, #152).
+///   The batch half asks the kernels, which on a host with `i8mm` is the
+///   quad GEMM and on one with only `dotprod` is the width-4 `sdot` GEMM.
 /// - **x86_64**: the batch half only, and only when the AVX2 `×4` GEMMs
 ///   are actually present. The matvec half stays off because it was
 ///   MEASURED to lose — see the table above — and nothing in this change
 ///   touches the kernel it loses to.
 /// - anywhere else: neither, because neither has a kernel.
 ///
-/// `batch_gemm` is not a written-down claim about x86; it asks
-/// `ferrox_quant` whether the `×4` GEMMs have a SIMD kernel at the width
-/// this host packs with. A kind cannot be told the tier is a win while
+/// `batch_gemm` is not a written-down claim about any architecture; it
+/// asks `ferrox_quant` whether a SIMD batch GEMM exists at the width
+/// this host packs with. A host cannot be told the tier is a win while
 /// its kernel is missing, and an x86 host without AVX2 gets the same
 /// answer a RISC-V one does.
+///
+/// It asks [`ferrox_quant::batch_gemm_is_accelerated`] and NOT
+/// `interleaved_gemm_is_accelerated`: the latter is about the
+/// interleave-8 quad kernels, which is the right question for whether to
+/// PREPARE a quad and the wrong one for whether the tier buys anything.
+/// A pre-i8mm aarch64 host — every M1 Mac, every A14-and-earlier iPhone,
+/// and the Cortex-A55-class cores that are still most of the Android
+/// fleet — runs a width-4 `dotprod` GEMM for Q4_K, Q5_K, Q8_0 and Q4_0,
+/// so the narrower predicate reports "no SIMD GEMM" on a host that is
+/// running one. Q6_K has no width-4 GEMM on purpose (its scalar Kx8 GEMM
+/// measured slower than the per-row NEON dot), and the per-kind
+/// `q*_gemm_uses_acts_x4` entry points are what keep that distinction.
 ///
 /// # On the `cfg!` in here
 ///
@@ -551,19 +565,39 @@ impl IntDotTier {
 /// runtime probe rather than a guess. The two predicates also answer
 /// different questions and must not be merged: `policy::backend` picks
 /// the SCHEDULER by work size; this picks the KERNEL by workload shape.
+/// Whether the Q5_K batched matmul takes the Kx8 path: every aarch64
+/// host (the i8mm quad GEMM, the width-4 `sdot` GEMM, or the scalar Kx8
+/// body, as the Q4_K arm takes it unconditionally), and any other host
+/// whose `x4` GEMM has a SIMD kernel at this width (AVX2 since #159).
+///
+/// Asked of the kernels rather than written beside them, the shape
+/// `int_dot_tier_here` has: this read `cfg!(target_arch = "aarch64")`
+/// alone until 2026-09-15, which sent every x86 Q5_K prefill through
+/// the per-row GEMM -- 44.2 against llama.cpp's 378.7 tok/s on
+/// Llama-3.2-1B Q5_K_M (8.56x) on a Ryzen 5950X, beside Q4_K and Q6_K
+/// at 1.19x on the same host, because those two arms asked the kernels
+/// and this one asked the architecture. With the predicate: 417.1
+/// tok/s, 0.91x. Phi-4-mini's `attn_qkv` is Q5_K too.
+#[inline]
+fn q5k_batch_takes_kx8(interleave: usize) -> bool {
+    cfg!(target_arch = "aarch64") || ferrox_quant::q5_kx8_gemm_uses_acts_x4(interleave)
+}
+
 fn int_dot_tier_here() -> IntDotTier {
     #[cfg(target_arch = "aarch64")]
     {
         IntDotTier {
             matvec: true,
-            batch_gemm: true,
+            batch_gemm: ferrox_quant::batch_gemm_is_accelerated(
+                ferrox_quant::preferred_interleave(),
+            ),
         }
     }
     #[cfg(target_arch = "x86_64")]
     {
         IntDotTier {
             matvec: false,
-            batch_gemm: ferrox_quant::interleaved_gemm_is_accelerated(
+            batch_gemm: ferrox_quant::batch_gemm_is_accelerated(
                 ferrox_quant::preferred_interleave(),
             ),
         }
@@ -1552,6 +1586,23 @@ impl WeightMatrix {
                             );
                             return out;
                         }
+                        // IQ4_XS over Q8_K activations, llama.cpp's
+                        // `ggml_vec_dot_iq4_xs_q8_K` (`ferrox_quant::
+                        // iq4_xs_q8`): the same int8 lane the K-quants
+                        // take, so decode and prefill agree on the
+                        // activation quantization.
+                        QuantKind::IQ4XS if x.len().is_multiple_of(256) => {
+                            let act = ferrox_quant::quantize_activations_q8_k(x);
+                            crate::par::items_mut(
+                                &mut out,
+                                Self::min_rows_per_task(*rows),
+                                |r, o| {
+                                    let row = &data.as_slice()[r * row_bytes..(r + 1) * row_bytes];
+                                    *o = ferrox_quant::dot_iq4_xs_q8_k(row, &act);
+                                },
+                            );
+                            return out;
+                        }
                         QuantKind::Q6K if x.len().is_multiple_of(256) => {
                             let act = ferrox_quant::quantize_activations_q8_k(x);
                             let n_groups = *rows / ferrox_quant::Q6_KX8_NROWS;
@@ -2532,15 +2583,26 @@ impl WeightMatrix {
                             let mut acts_owned = Vec::new();
                             let (acts, shared_tiles) =
                                 Self::q8k_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
-                            // Q5_Kx8 multi-act NEON GEMM amortizes weight unpack.
-                            let use_kx8 = cfg!(target_arch = "aarch64");
+                            // The Kx8 batch path: every aarch64 host (i8mm,
+                            // dotprod, or the scalar Kx8 body, as the Q4_K arm
+                            // takes it), and any other host whose `x4` GEMM
+                            // has a SIMD kernel at this width (AVX2 since
+                            // #159). This read `cfg!(target_arch = "aarch64")`
+                            // alone until 2026-09-15, which sent every x86
+                            // Q5_K prefill through the per-row GEMM below:
+                            // 44.2 against llama.cpp's 378.7 tok/s on
+                            // Llama-3.2-1B Q5_K_M (8.56x) on a Ryzen 5950X,
+                            // beside Q4_K at 1.19x and Q6_K at 1.19x on the
+                            // same host, because those two arms asked the
+                            // kernels and this one asked the architecture.
+                            let interleave = ferrox_quant::q5_kx8_interleave();
+                            let use_kx8 = q5k_batch_takes_kx8(interleave);
                             let n_groups = if use_kx8 {
                                 *rows / ferrox_quant::Q5_KX8_NROWS
                             } else {
                                 0
                             };
                             if n_groups > 0 {
-                                let interleave = ferrox_quant::q5_kx8_interleave();
                                 let packed = get_or_repack_q5k(data, *rows, cols);
                                 let nc = ferrox_quant::Q5_KX8_GEMM_NC;
                                 // On the i8mm path, interleave each quad of
@@ -2740,6 +2802,34 @@ impl WeightMatrix {
                                     }
                                 });
                             }
+                            return out;
+                        }
+                        // IQ4_XS: quantize the activations to Q8_K ONCE
+                        // per matmul and run the int8 dot per (row,
+                        // activation). No Kx8 tier, so the row's nibbles
+                        // are still decoded per activation, as llama.cpp's
+                        // own IQ4_XS prefill decodes them; what the f32
+                        // fallback below paid on top was an f32 FMA per
+                        // element and a per-activation f32 read of the
+                        // row, measured 4.45x behind llama.cpp on a Ryzen
+                        // 9 3900X (2026-09-15) where every K-quant on the
+                        // same host was 1.0x to 1.4x.
+                        QuantKind::IQ4XS if cols.is_multiple_of(256) => {
+                            let mut acts_owned = Vec::new();
+                            let (acts, _) =
+                                Self::q8k_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
+                            let data_slice = data.as_slice();
+                            crate::par::indices(*rows, Self::min_rows_per_task(*rows), |r| {
+                                let row = &data_slice[r * row_bytes..(r + 1) * row_bytes];
+                                for (b, act) in acts.iter().enumerate() {
+                                    unsafe {
+                                        out_w.set(
+                                            b * rows + r,
+                                            ferrox_quant::dot_iq4_xs_q8_k(row, act),
+                                        );
+                                    }
+                                }
+                            });
                             return out;
                         }
                         QuantKind::Q5K | QuantKind::Q6K => {}
@@ -5056,20 +5146,75 @@ mod int_dot_default_tests {
 
     /// The BATCH half is not a `cfg!` claim: it asks the kernels.
     ///
-    /// A host may only be told the batch tier is a win if
-    /// `ferrox_quant` reports a SIMD `×4` GEMM at the width this host
-    /// packs with. That is what stops the two structures — the list of
-    /// architectures believed to have kernels, and the kernels — from
-    /// drifting apart, which is how the 4x-to-8.8x regression happened
-    /// in the first place.
+    /// A host may only be told the batch tier is a win if `ferrox_quant`
+    /// reports a SIMD batch GEMM at the width this host packs with. That
+    /// is what stops the two structures — the list of architectures
+    /// believed to have kernels, and the kernels — from drifting apart,
+    /// which is how the 4x-to-8.8x regression happened in the first
+    /// place.
+    ///
+    /// The probe is [`ferrox_quant::batch_gemm_is_accelerated`] and not
+    /// `interleaved_gemm_is_accelerated`, because those are different
+    /// questions and this one asked the narrower of the two. The
+    /// interleave-8 predicate is about the quad kernels; a pre-i8mm
+    /// aarch64 host runs a width-4 `dotprod` GEMM for four of the five
+    /// kinds, so it has a SIMD batch GEMM while the interleave-8
+    /// predicate says it does not.
     #[test]
     fn the_batch_half_is_taken_only_where_a_simd_gemm_answers_for_it() {
         assert_eq!(
             super::int_dot_tier_here().batch_gemm,
-            ferrox_quant::interleaved_gemm_is_accelerated(ferrox_quant::preferred_interleave())
+            ferrox_quant::batch_gemm_is_accelerated(ferrox_quant::preferred_interleave())
                 && cfg!(any(target_arch = "aarch64", target_arch = "x86_64")),
             "the batch half must agree with the kernel probe, not with a written-down list"
         );
+    }
+
+    /// The Q5_K batch gate asks the kernels: wherever the Q5_K `x4`
+    /// GEMM has a SIMD kernel the Kx8 path is taken, whatever the
+    /// architecture. A `cfg!` alone here is the defect this test exists
+    /// for (8.56x on x86 prefill, 2026-09-15).
+    #[test]
+    fn the_q5k_batch_path_is_taken_wherever_its_simd_gemm_exists() {
+        let interleave = ferrox_quant::q5_kx8_interleave();
+        if ferrox_quant::q5_kx8_gemm_uses_acts_x4(interleave) {
+            assert!(super::q5k_batch_takes_kx8(interleave));
+        }
+        // And on a host with no such kernel, the gate agrees with the
+        // Q4_K arm's rule, which is "aarch64 always".
+        assert!(super::q5k_batch_takes_kx8(interleave) || !cfg!(target_arch = "aarch64"));
+    }
+
+    /// The two probes are not interchangeable, and this pins the
+    /// difference so neither can quietly be swapped for the other.
+    ///
+    /// On a host with a width-4 SIMD batch GEMM and no interleave-8 one
+    /// — every pre-i8mm aarch64 host, which is every M1 Mac, every
+    /// A14-and-earlier iPhone, and the Cortex-A55-class cores that are
+    /// still most of the Android fleet — the wider predicate says yes
+    /// and the narrower says no. Reading the narrower as "is the batch
+    /// tier a win" is what made this test fail on an M1 while the code
+    /// was running a SIMD GEMM the whole time.
+    #[test]
+    fn the_batch_probe_is_wider_than_the_interleave_8_one() {
+        for width in [4usize, 8] {
+            assert!(
+                ferrox_quant::batch_gemm_is_accelerated(width)
+                    || !ferrox_quant::interleaved_gemm_is_accelerated(width),
+                "the batch probe must answer yes wherever the interleave-8 one does"
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            assert!(
+                ferrox_quant::batch_gemm_is_accelerated(4),
+                "a dotprod host runs the width-4 sdot GEMM for Q4_K/Q5_K/Q8_0/Q4_0"
+            );
+            assert!(
+                !ferrox_quant::interleaved_gemm_is_accelerated(4),
+                "the interleave-8 predicate is about the quad kernels only"
+            );
+        }
     }
 
     /// `int_dot_is_a_win_here` — the thing `default_cpu_int_dot_on`

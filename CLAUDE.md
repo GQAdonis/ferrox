@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **65** architectures run with
+Honest position, re-audited 2026-09-14. **92** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -767,9 +767,402 @@ and matches libllama's unscaled logits, ratio 0.0625 to the scaled
 file's). KL 1.0e-15 (`tests/command_r_graphs.rs`). Command-R+ (64
 layers) carries the per-head LayerNorm QK norm llama.cpp REQUIRES at
 that depth (`:28-31`) and is refused by name from a 64-layer fixture
-libllama runs. `cohere2`, `cohere2moe`, `falcon` and `phi2` stay
-refused with what each needs ON TOP of the residual written into the
-reason.
+libllama runs. `falcon` (Falcon-7B / 40B / 180B) followed on BOTH
+arms of the seam, and reading `falcon.cpp:79-85,124` beside
+`gptneox.cpp:149` is what the table's `second_norm` column records:
+every Falcon layer is parallel, and the OPTIONAL `attn_norm_2` that
+40B carries does not switch the residual on, it picks the ARM -- and
+it norms the layer input for ATTENTION while `attn_norm` keeps feeding
+the FFN, so the two tensor names are crossed relative to gptneox's.
+`norm_sites::ATTN_NORM_2_FEEDS_ATTENTION` crosses the two pre-norm
+slots on exactly the layers that carry it (`NormSites::for_layer`; one
+graph of 140 on the generic path, measured), and the 7B fixture proved
+the first table row wrong before any code ran: it had said "parallel
+WHEN `attn_norm_2` is present", and a 7B file refused to load its
+missing `ffn_norm`. KL 3.8e-8 and 1.9e-7 at the f16 GELU-table line
+(`tests/falcon_graphs.rs`); swapping the two slots back diverges by
+more than 1. `phi2` (Phi-2, Phi-1.5) followed on 2026-09-14 on the ONE
+slot its reason had named: `output.bias` on the LM head
+(`phi2.cpp:22,136`, REQUIRED; `proj_bias::OUTPUT_BIAS_CREATORS` is
+three graphs of 140, `phimoe` required and `qwen2` optional). It is
+`Decoder::output_bias`, added in `decoder::lm_head::Logits` -- the one
+place the head's post-projection transforms already ran, before the
+multiplier and the cap because it belongs to the matmul -- and
+`FoldedLmHead::permit` refuses a head that has one, because unlike the
+cap and the multiplier a bias is not monotone across the vocabulary
+and a folded argmax would be a different token. KL 2.9e-7 at the f16
+GELU-table line, the fused and split QKV spellings on one golden
+(`tests/phi2_graphs.rs`). `cohere2` (Command-R7B, Command-A) followed
+the same day on a CENSUS CORRECTION rather than new code: its refusal
+had named "a rotation on the sliding layers only, the inverse of the
+per-layer RoPE gate", and it is not the inverse, it is the gate --
+`cohere2.cpp:91` is `if (is_swa)` around `ggml_rope_ext`, the
+`exaone-moe` rule `rope_layers` had served since 2026-09-11. The
+module's census of SIX had been made by grepping for the word
+`use_rope`; grepping for `is_swa` beside `ggml_rope_ext` finds eight,
+`cohere2` and `cohere2moe` (whose `|| il < n_layer_dense_lead` is a
+variant the enum does not have yet, recorded). One arm, one
+`WEIGHTED_LAYER_NORM` row, one `MultiplierSupport` row for its
+REQUIRED `logit_scale`, and one refusal for the window key llama.cpp
+REQUIRES (`swa_geometry::window_required`; a fixture without it is
+refused by libllama with `key not found`, measured). KL 1.0e-14
+(`tests/cohere2_graphs.rs`), 8.9e-14 with the scalar pattern key at 2.
+`cohere2moe` (the 49-layer 30B-A3B) closed on 2026-09-14 on exactly
+what that reason had named, plus one thing it had not:
+`RopeLayers::SlidingOrLeadingDense` (`cohere2moe.cpp:192`, the dense
+prefix rotates although it does not slide), the `0.5` on `moe_out +
+shexp` (`:248-260`, `parallel_dense_ffn::SHARED_EXPERT_SUM_SCALE`,
+recorded on the SAME `parallel_sum_scale` field Grok-2's sum scale
+fills, so the FFN bodies apply one scale at one site whichever names
+the dense branch came from), and the norm FUNCTION decided by the
+FILE (`:4-11,166`: `LLM_NORM` unless `layer_norm_rms_epsilon` is
+present and nonzero; `norm::NORM_BY_RMS_EPS_KEY`, one graph of 140,
+`ModelConfig::norm_function` the one field every site reads). The
+thing the reason had not named: `:23` reads `nextn_predict_layers`
+BEFORE `:35` reads the window array, so `n_layer()` there is the
+TRUNK and the array is one entry per trunk layer, where `mimo2.cpp:12`
+/ `step35.cpp:26` read it before the MTP count and take
+`block_count` entries -- `swa_layers::ARRAY_AT_TRUNK_LENGTH`, found
+by the MTP fixture refusing to load. KL 1.7e-14 (LayerNorm), 1.3e-14
+(RMS), the MTP file byte-identical to the trunk's golden in libllama
+and here, 6.4e-15 (softmax, `norm_w = true`); dropping the `0.5`,
+rotating the prefix as `cohere2`'s rule would not, rotating the full
+layer, or renormalising each turns the test red. No
+parallel-residual row is refused any more.
+
+`phimoe` (Phi-3.5-MoE) closed the same day, and it is the bias group's
+last row but `starcoder`, with a correction to its own refusal: the
+"LayerNorm biases" the reason named are RMSNorm biases. `phimoe.cpp`
+has no graph of its own (`models.h:632`, `using graph =
+llama_model_phi3::graph`), and `phi3.cpp:99-102,137-139,174-177` pass
+each norm's bias to `LLM_NORM_RMS`; `phi3` never creates one, so its
+files take the plain RMS and `phimoe`'s take `NormOp::RmsBias`,
+`capability::BIASED_RMS_NORM`, one graph of 140 on the generic path
+(measured: `chameleon` passes NULL there, `deepseek32` / `glm-dsa` are
+other engines). Its two projection biases were slots already
+(`attn_output.bias`, `output.bias`), so the row is one `NormFunction`
+variant. A second correction came free: `phimoe.cpp:3-10` read no
+window key, so the `attention.sliding_window` every export writes is
+dead metadata as `phi3`'s (libllama `n_swa = 0` on a file declaring
+8, measured) -- and a test had asserted that `phimoe` HONOURS its
+window, which nothing had ever checked. KL 1.9e-11 (LongRoPE's long
+pair in use, attn factor 1.0955) and 1.9e-12 (plain), at the `orion`
+line for the same reason (`tests/phimoe_graphs.rs`). The loader's
+norm-function census listed two of five function lists; it lists all
+five now.
+
+`gpt2` and `starcoder` closed together on `ferrox-models/src/
+position_embd.rs`, and they are ONE graph read side by side (`diff
+gpt2.cpp starcoder.cpp` is a size table and `head_count_kv 1`): the
+`gptneox` sequential layer with a learned `position_embd.weight`
+`{n_embd, n_ctx_train}` gathered at `inp_pos` and ADDED to the token
+embedding before layer 0 (`gpt2.cpp:19,74-77`), and no `ggml_rope`
+anywhere. Reach measured over the 140: three generic-path graphs
+create the tensor (`mpt`'s OPTIONAL beside its ALiBi, recorded), four
+encoders. The seam is two facts: the table added at the ONE embedding
+site (`Decoder::embed_token` takes `pos` now, so no caller can embed
+without saying where), and `rope_layers::RopeLayers::Never`, a rule
+that rotates nothing -- deliberately NOT `SlidingOnly` with no window,
+which would start rotating the day such a file declared one. The
+`LLAMA_NO_ROPE` test that had pinned `gpt2` off the generic path pins
+it on it now under exactly that rule, and the four ALiBi rows stay
+where they were. Every fused Metal launch is fenced off a model with a
+table, because the GPU embedding gather has no add. KL 1.9e-7 each at
+the f16 GELU-table line (`tests/position_embd_graphs.rs`); dropping
+the table or rotating every layer -- what the generic path used to do
+to GPT-2 -- diverges by more than 1. The "LayerNorm-with-bias group"
+of `tests/attn_bias.rs` is EMPTY: nine rows, nine closures, each by the
+dropped bias being implemented rather than the row being edited.
+
+ALiBi closed the rest of the `LLAMA_ROPE_TYPE_NONE` group the same
+day, FIVE rows on one seam, and the count was measured before the
+seam was built: `grep -n f_max_alibi_bias src/models/*.cpp` over the
+140 is seven files, five on the generic path, in THREE spellings --
+the literal `8.0f` (`bloom.cpp:18`, `refact.cpp:12`), the literal at
+40 layers only (`baichuan.cpp:11-14`, the 13B; the 7B rotates and was
+audited already), and `attention.max_alibi_bias` read optional
+(`mpt.cpp:6`, `jais.cpp:5`). `ferrox-core/src/alibi.rs` is llama.cpp's
+slope formula (`ggml-cpu/ops.cpp:5489-5508`: `n_head_log2`, `m0`,
+`m1`, the odd powers for the tail of a non-power-of-two head count),
+and the three host attention kernels -- row, paged, batched prefill --
+take the slopes as ONE additive term, `slope_h * (p_key - p_query)`
+after the scale and the softcap, where `ggml_soft_max_ext` adds
+`slope * mask`; a ferrox-core test pins the three against a naive
+reference and each other. `ferrox-models/src/alibi.rs` is the table,
+and `rope_layers::RopeLayers::Never` is DERIVED from it for these rows,
+so the bias and the absence of rotation cannot disagree about
+Baichuan's layer count -- the thing the old refusal had said "no key
+could see". Every fused Metal launch and the CUDA resident attention
+refuse a model with a bias. Each row then had one more thing, and each
+was a table entry: `bloom` norms its EMBEDDINGS (`token_embd_norm`,
+`norm_sites::EMBEDDING_NORM_ARCHITECTURES`, the one decoder of 140
+that does), `jais` passes `kq_scale = 1/d` (`jais.cpp:83`, the one
+graph with a literal other than `1/sqrt(d)`;
+`capability::attention_scale_override`), `mpt` clamps
+(`CLAMPED_QKV_ARCHITECTURES`, where it had been "deliberately absent"
+as a refused row) and carries an optional `position_embd` the table
+from the PR before serves. KL 6.4e-13 (refact), 8.3e-8 / 3.6e-7 /
+1.6e-7 (bloom, mpt, mpt with a position table: GELU rows at the table
+line), 7.4e-13 (jais), 1.1e-12 (Baichuan-13B at 40 layers)
+(`tests/alibi_graphs.rs`). The first run of the six goldens found the
+two things the table had not: `mpt`'s clamp was not applied (4.8 off)
+and `jais` was scaled by `1/sqrt(d)` (1.36 off), which is what a
+golden is for.
+
+`minimax-m2` (MiniMax-M2, the 230B MoE) closed the same day with NO
+code, and it is the cheapest lesson in this file: its refusal had said
+"UNAUDITED, not unimplemented -- plain GQA, whole-vector QK norm,
+partial NEOX RoPE, a sigmoid MoE with `exp_probs_b`, all of which the
+generic path has; what is missing is a fixture" for a week, while
+`scripts/make_minimax_fixture.py` and `tests/fixtures/minimax_m2_tiny.
+gguf` sat in the tree evidencing that very claim. Running the fixture
+through libllama took a minute and matched at KL 3.4e-15 on the first
+try (`tests/minimax_m2_graphs.rs`). A verdict that names its own
+closing evidence and does not go and get it is a refusal that could
+have been a row.
+
+`lfm2` (LFM2-350M / 700M / 1.2B / 2.6B) and `lfm2moe` (LFM2-8B-A1B)
+closed the same day as the FIRST hybrid rows, and the lesson is where
+they closed: not on the hybrid
+engine that had refused it for a year but on the generic path.
+`lfm2.cpp:192-208` is the generic layer -- `attn_norm`, a block, the
+residual add, `ffn_norm`, the FFN -- with a short convolution where
+attention would be on the layers whose `head_count_kv` is 0 (`:9-11`),
+so it is a THIRD `AttnShape` beside deci's two (`layer_shapes::
+AttnShape::ShortConv`, `ferrox-models/src/shortconv.rs`) rather than
+a second engine. Reach measured first: `grep -l shortconv` over the
+140 graphs is `lfm2.cpp` and `lfm2moe.cpp`, ONE graph (`models.h:
+1899`); the Mamba-2 hybrids share only the rule "zero KV heads means
+recurrent", and `layer_shapes::ZeroKvLayer` is that rule as a table --
+the same two counts had been deci's `Linear` for every architecture,
+so a Jamba file would have loaded its Mamba layers as `wo`-only
+attention and failed on a missing tensor. The state is the layer's KV
+HISTORY: one `n_embd` row of `b * x` per token with no V
+(`AttnShape::cache_geometry`), read back as the last `l_cache` rows,
+where llama.cpp keeps the `l_cache - 1` it needs (`n_embd_r()`).
+Keeping the history is what lets the layer truncate, page, snapshot
+and share a prefix through the same code every attention layer uses;
+the paged arm reads the window through the block table and a test
+straddles a block boundary with it. `token_embd_norm.weight` is its
+OUTPUT norm (`llama-arch.cpp:384`, "fix for wrong tensor name") and
+`bloom`'s EMBEDDING norm -- the `attn_output_norm` case again, one row
+in `norm_sites`. KL 3.2e-12 on the split, fused-QKV and
+separate-`output` fixtures (`tests/lfm2_graphs.rs`); reversing the
+taps or dropping the state turns every golden red; `lfm2moe` is the
+same graph with `leading_dense_block_count` dense layers and a sigmoid
+MoE with `exp_probs_b` REQUIRED on the rest, KL 6.0e-13, its
+`expert_weights_scale` dead metadata as `mimo2`'s. A window stays
+refused by name: `lfm2.cpp:24-29` windows the attention layers ALONE,
+which `swa_layers` cannot spell, and no export writes the key.
+
+`pangu-embedded` (openPangu-Embedded-1B / 7B, Huawei) closed the same
+day from the DEFERRED column, which no row had left before, and the
+lesson is the cheapest kind: the row had been classified from its
+NAME. "Embedded" means edge devices; `PanguEmbeddedForCausalLM` is a
+decoder with an `lm_head`, `conversion/pangu.py` is a `TextModel`, and
+ferrox had it in the catalog as "embedding variant; deferred" AND in
+`embedding_model::NOT_YET` as "a decoder embedding path", two copies
+of one wrong reading. `pangu-embed.cpp` is `llama.cpp`'s graph with a
+REQUIRED `attn_output.bias` (`:37`) and NEOX RoPE: one `proj_bias`
+row, one profile line, KL 1.5e-13 on three fixtures
+(`tests/pangu_embedded_graphs.rs`). Reading the converter's base
+class takes a minute; the deferred column has thirty-one rows left and
+every one of them deserves that minute.
+
+`granitehybrid` (Granite 4.0: H-Micro, H-Tiny, H-Small) closed the
+same day as the FIRST MAMBA-2 row, and it is the second recurrent seam
+in one day, which is what shows where the two differ. `granite-hybrid.
+cpp:128-142` is Granite's layer with `build_mamba2_layer`
+(`mamba-base.cpp:149-288`) where attention would be on the zero-KV
+layers, so the block is a fourth `AttnShape` (`Mamba2`,
+`ferrox-models/src/mamba2.rs`, `ferrox-core/src/mamba2.rs` for ggml's
+conv and scan steps) on the same table row `lfm2` used. What is NOT
+the same is the state: LFM2's is a window of its inputs and rode as
+the layer's KV history, which every cache consumer already knew how
+to truncate, page and fork; a Mamba state is a REDUCTION over the
+whole prefix, and `ferrox_core::recurrent_state::RecurrentState`
+beside the cache says so in the one place it matters --
+`KvCache::truncate` REFUSES a middle position (`can_truncate_to`), the
+prefix cache does not store such a cache, `--model-draft` refuses
+such a model, and the block pushes EMPTY rows so `positions()` still
+counts, because `serving/batch/row.rs` reads layer 0's cache as "how
+far this row has got" and Granite-4.0's layer 0 is a Mamba layer.
+llama.cpp's `llama_memory_recurrent::seq_rm` refuses `p0 > 0` for the
+same reason. Two measurements: `ssm_conv1d.bias` is
+`TENSOR_NOT_REQUIRED` at `granite-hybrid.cpp:63` and `ggml_add`ed
+unconditionally at `mamba-base.cpp:222`, so libllama SEGFAULTS on a
+file without it and ferrox requires it; and the Granite
+`rope.scaling.finetuned` refusal, which had said "ferrox has no way to
+express unrotated" for four days while `RopeLayers::Never` had
+existed for one, is served (`rope_finetuned::unrotated`), because
+`conversion/granite.py:253-256` writes the key FALSE for every
+Granite-4.0 hybrid export and no row could match without it. KL
+1.9e-13 (NoPE dense), 7.9e-13 (rotated, Bamba's shape), 1.0e-13 (MoE
+with the shared expert), `tests/granite_hybrid_graphs.rs`; resetting
+the state every token or dropping the `exp` from the decay turns five
+tests red. `nemotron-h` (one block per layer), `falcon-h1` (attention
+and Mamba-2 in PARALLEL), `jamba` and `plamo2` (Mamba-1) each name
+what they still need in `layer_shapes::ZeroKvLayer`.
+
+`nemotron_h` (Nemotron-H 8B / 47B / 56B, Nemotron-3 Nano dense) closed
+the same day on that seam, and what it added is two table rows and no
+arithmetic: `nemotron-h.cpp:143-158` runs every layer as ONE block --
+Mamba-2 where both arrays are zero (`:9-11`), attention where only the
+FFN width is, the ungated ReLU-squared FFN otherwise -- under ONE
+`attn_norm` with ONE residual add. On the generic layer that is "a
+block with `ffn_dim 0`", which `LayerShapes::resolve` had REFUSED for
+every architecture because deci DISCARDS such a block's output
+(`deci.cpp:147-149`) and Nemotron-H adds it (`:157`): one reading per
+graph, `BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT`. And "an FFN with no
+block", whose pre-norm is `attn_norm` because the graph has one norm
+per layer (`norm_sites::ONE_NORM_PER_LAYER`; exact, because a layer
+reads one slot or the other and never both). `ZeroKvLayer::
+Mamba2UnlessFfn` is the rule that reads the second array. Its
+attention never calls `ggml_rope_ext` (`:181-193`), so the NEOX group
+entry is a filler and `rope_layers` answers `Never`. KL 2.0e-13 /
+1.4e-12 / 7.5e-14 (`tests/nemotron_h_graphs.rs`); pointing the FFN
+slot at `ffn_norm` turns every test red. `nemotron_h_moe`
+(Nemotron-3 Nano 30B-A3B) closed in the next PR on what the loader
+already had: `load_dense_expert` aliased an ungated FFN's gate to
+`up`, and the routed and shared experts (`:82-89,209-227`, a null
+gate into `build_moe_ffn`) take the same alias, which
+`GluAct::ReluSqr` never reads; the sigmoid literal (`:218`) and the
+two `expert_weights_*` keys (`:18-19`, which Nano's converter writes
+as `norm_topk_prob true` / `routed_scaling_factor 2.5`) are rows in
+the loader's reader tables; a layer with `ffn_dim 0` takes the dense
+arm whatever the model's MoE says, so the block-only layers load no
+experts. `moe_latent_size` (Nemotron-3 Super, `:206-208`) is refused
+by name in `unsupported_feature_keys`. KL 3.6e-13.
+
+`falcon-h1` (Falcon-H1 0.5B to 34B) closed next, and it is the
+Mamba-2 block in its THIRD position: `falcon-h1.cpp:137-161` runs
+attention AND the block on every layer, in parallel on the same
+`attn_norm` output, summed before the one residual add. So the layer
+is `AttnShape::Gqa` with `AttnWeights::mamba2` set
+(`mamba2::PARALLEL_WITH_ATTENTION`, `ModelConfig::parallel_ssm`), its
+cache holds the attention rows AND the block's `RecurrentState`,
+attention counts the positions, and `Decoder::parallel_ssm_rows` /
+`add_parallel_ssm` are ONE pair the row body and both batched bodies
+call -- the block runs before the KV push so the two can never
+disagree about which token the state saw. Two measurements:
+`attn_output.bias` is created at `:76` and `:154` passes NULL for it,
+so it is `unread_tensors`' second row; and `ffn_norm` is the
+two-argument `LLM_TN` spelling (`:80`, `blk.N.ffn_norm` with no
+`.weight`), which libllama REQUIRES -- the `.weight` spelling fails
+`check_tensor_dims` -- and which `norm_sites` had accepted since
+`plamo3`. KL 1.3e-13 / 6.2e-13 (no `ssm_norm`) / 3.2e-13
+(`tests/falcon_h1_graphs.rs`); running the block on a fresh state
+every token turns six tests red. Every `build_mamba2_layer` caller
+of the 140 graphs is served; `jamba`, `plamo2` and `mamba` are
+`build_mamba_layer` (Mamba-1) and said so.
+
+`jamba`, `mamba` and `mamba2` closed next on that block and on one
+rule. `ferrox-models/src/mamba1.rs` is `build_mamba_layer`
+(`mamba-base.cpp:4-148`) once: the same conv step and the same scan
+kernel as Mamba-2's with `n_head = d_inner`, `head_dim = 1` and a
+per-STATE decay (`ferrox_core::mamba2::Decay::PerState`, the kernel's
+`src3->ne[0] != 1` arm, one `exp` per state element), dt / B / C from
+one projection of the conv output, the RMS norms on them when the
+three weights exist (Jamba, REQUIRED) or `ssm.dt_b_c_rms` sets them
+weightless (FalconMamba), dt projected up with its bias.
+`ssm_block::SsmBlock` is the one value the decoder holds for either
+generation, so a third is one variant. The rule is `layer_shapes::
+PURE_RECURRENT`: a pure Mamba converter writes `head_count 0`,
+`head_count_kv` absent and `feed_forward_length 0`, uniform zeros
+that `LayerShapes::resolve` had read as a zero-head GQA model; on the
+two named architectures every layer is the block and nothing else,
+`head_dim` is 0 because nothing reads one, and the FFN-free block
+keeps its output (`mamba.cpp:88`). Jamba is the hybrid: Mamba-1 where
+the KV array is 0, attention with NO RoPE elsewhere (`jamba.cpp:98`),
+and the FFN dense or MoE PER LAYER by whether the file has a router
+(`:89-101,152`; `moe_interleave::DENSE_LAYER_BY_ROUTER_ABSENCE`, one
+loader of 140 that reads the file for it), softmax with `norm_w =
+false`. KL 7.3e-12 / 2.3e-12 / 1.8e-12 / 3.6e-13
+(`tests/mamba_graphs.rs`), the Mamba-1 rows at the `orion` tolerance
+class because `d_inner` one-element heads each take their own `exp`;
+swapping B and C turns five tests red. Every Mamba graph in llama.cpp
+is served but `plamo2`'s own spelling.
+
+`qwen35` (Qwen3.5 dense, 0.8B to 27B) closed next, and it is the row
+the "hybrid engine" had been a scaffold FOR since 2026-09-01: 852
+lines of `gdn.rs` ported from a Python reference, 915 of
+`hybrid_gguf_loader.rs`, a stub that refused everything, and not one
+libllama golden between them. The block went on the seam the Mamba
+rows had just built: `ferrox-core/src/gdn.rs` is the autoregressive
+delta rule as `delta-net-base.cpp:289-365` computes it (decay, the
+state's prediction, the beta-scaled error, the rank-one update, the
+read-out with the scaled query), `ferrox-models/src/gdn.rs` is
+`qwen35.cpp:236-317` around it, `AttnShape::Gdn` is the site, and the
+state rides on the cache as every other recurrent block's. Two things
+the port had wrong that only a golden shows: Qwen3.5's V heads read
+K heads TILED (`h % n_k`, `llama-model.cpp:524-526`; the converter
+reorders V heads for `ggml_repeat`), where the reference and the port
+grouped them (`h / ratio`, Qwen3-Next's order), and the l2 norms take
+the model's RMS epsilon, not a literal. The attention layers gate
+through a double-width `wq` with the gate interleaved per head
+(`:191-199`); it is split AFTER the projection
+(`attn_gate::split_interleaved_q_gate`) so a quantized `wq` stays one
+matrix on its quantized path, and the sigmoid multiplies in the one
+attention tail. Which layers are recurrent comes from two keys, not
+the head counts (`gdn::recurrent_layers`: the array over `n_layer_all`
+when present, else the interval); `LayerShapes::resolve` takes that
+mask. Partial IMROPE over `rope.dimension_sections` is NEOX band for
+band on text positions (`mrope::MROPE_READERS`), pinned by the golden
+with the sections in the file. KL 4.1e-13 on the first run
+(`tests/qwen35_graphs.rs`); grouping the heads or dropping the
+sigmoid each turns five tests red. The scaffold is deleted.
+`qwen35moe` (Qwen3.5-35B-A3B, 122B-A10B, 397B-A17B) followed in the
+next PR with NO code: `qwen35moe.cpp:496-538` is `qwen2moe`'s FFN --
+softmax, `norm_w = true`, the shared expert scaled by its own sigmoid
+gate -- under Qwen3.5's layers, KL 2.9e-11 at the `orion` tolerance.
+`qwen3next` (Qwen3-Next-80B-A3B) followed on the two tables its
+refusal had named: `gdn::GROUPED_HEAD_ARCHITECTURES` (its V heads
+read K heads `h / ratio`, `qwen3next.cpp:521-539`, the map the
+deleted port had assumed for everyone) and `gdn::BetaAlpha::Fused`
+(beta and alpha in one `ssm_ba` projection laid out per K group,
+`:422-436`), plain NEOX RoPE, KL 8.7e-12; swapping beta and alpha
+or tiling the heads each turns its test red. Every gated-delta-net
+graph in llama.cpp is served.
+
+`llama4` (Llama 4 Scout / Maverick) closed on 2026-09-14, and it is
+the row that says "read the graph AND the helper it calls":
+`llama4.cpp` has four things on top of Llama, and the one that cost
+the most was not in it. `ferrox-models/src/chunked_swa.rs` is the
+new seam: `llama4.cpp:13-14` set `LLAMA_SWA_TYPE_CHUNKED` at a
+literal 8192 (the file's value is never read, and a declared ZERO is
+the branch libllama ABORTS on, `llama-graph.cpp:159`, refused by
+name), `llama-hparams.h:419-425` mask every key before the query's
+own chunk, so a query at `p` sees `p % 8192 + 1` positions where a
+sliding layer sees a constant. `ModelConfig::layer_window_for_query`
+is that number for the row body, `BatchWindow` sends the batched
+prefill to a per-query arm when a batch straddles a boundary and to
+the blocked kernel when it sits inside the first chunk, eviction
+keeps the last 8192 rows, and `metal_can_serve_model` refuses the
+model. The other three each landed as a per-layer gate on a seam
+that existed: the temperature 0.1 / 8192 / 1.0 from literals
+(`attn_temperature::LITERAL_ATTN_TEMPERATURE`) on the layers that do
+NOT rotate (`AttnTemperature::unrotated_layers_only`); a weightless
+per-head RMS on Q and K AFTER RoPE on the layers that do, for every
+expert count but 128 (`llama4.cpp:43,182-188`; `weightless_qk_norm`,
+a `bool`, one reachable graph of 140); and the interleave step,
+honoured because `llama4.cpp:64` is the ONE tensor loader of 140
+that branches on it (`moe_interleave::
+INTERLEAVE_STEP_HONOURED_BY_LOADER`; ERNIE's does not, which is why
+that arm is a refusal). The fourth thing is `llama-graph.cpp:1947`:
+`weight_before_ffn = arch == LLM_ARCH_LLAMA4`, the sigmoid weight
+multiplied into the expert's INPUT before `mul_mat_id` where every
+other graph multiplies the output -- SwiGLU is not homogeneous, the
+fixture's logits move by 0.86 between the two, and
+`ferrox-models/src/routed_weight_site.rs` scales the row per slot at
+the two host sites that gather a routed input. Building it found
+`route_top_k_sigmoid` renormalising whatever `norm_topk_prob` said:
+every sigmoid row before this one declared the key true, so the
+ignored argument had never changed an answer; `llama4.cpp:228`
+passes `false`. KL 1.1e-12 on the 16- and 128-expert shapes and at
+the last of 8200 positions across the chunk boundary on both bodies
+(`REF_N_CTX` on the reference tool); each seam switched off turns
+the test red; a zero expert count is refused as `llama4.cpp:49-51`
+refuse it. The engine stub that had refused the row is deleted.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what

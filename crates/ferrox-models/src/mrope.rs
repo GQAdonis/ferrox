@@ -62,6 +62,21 @@ pub const MROPE_READERS: &[(&str, MropeOnText, &str)] = &[
         MropeOnText::RefusedNormBase,
         "src/models/glm4.cpp:5,112-119; llama-model.cpp:2699; conversion/glm.py:53-85",
     ),
+    // `qwen35.cpp:5` reads the sections as REQUIRED and `:213-222`
+    // rotates with `ggml_rope_multi` in IMROPE mode
+    // (llama-model.cpp:2694-2696) over `rope.dimension_count` bands;
+    // with one position per component that is NEOX band for band, the
+    // layout its converter writes (`conversion/qwen.py:378`, partial).
+    (
+        "qwen35",
+        MropeOnText::SameAsNeox,
+        "src/models/qwen35.cpp:5,213-222; llama-model.cpp:2694-2696",
+    ),
+    (
+        "qwen35moe",
+        MropeOnText::SameAsNeox,
+        "src/models/qwen35moe.cpp:9; llama-model.cpp:2694-2696",
+    ),
 ];
 
 /// `llama_hparams::use_mrope()` for a file.

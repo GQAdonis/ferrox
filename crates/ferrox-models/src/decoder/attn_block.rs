@@ -18,6 +18,7 @@
 use ferrox_core::attention::causal_gqa_attention_row;
 use ferrox_core::cache::{KvCache, PagedKvCache, SharedPagedKv};
 use ferrox_core::matmul::rms_norm;
+use ferrox_core::recurrent_state::RecurrentState;
 
 use super::{Decoder, LayerWeights};
 use crate::layer_shapes::AttnShape;
@@ -51,6 +52,17 @@ pub(crate) enum KvStep<'a> {
     },
 }
 
+impl KvStep<'_> {
+    /// The sequence's recurrent-state slot for this layer, whichever
+    /// backing holds it (`ferrox_core::recurrent_state`).
+    pub(crate) fn recurrent_slot(&mut self) -> &mut Option<RecurrentState> {
+        match self {
+            KvStep::Decode(cache) | KvStep::Batched(cache) => &mut cache.recurrent,
+            KvStep::Paged { cache, .. } => &mut cache.recurrent,
+        }
+    }
+}
+
 impl Decoder {
     /// One layer's attention block for ONE row: QKV projection, the
     /// three QKV biases, the two QK norms, RoPE's `mscale`, per-head
@@ -78,7 +90,7 @@ impl Decoder {
         layer: &LayerWeights,
         normed: &[f32],
         pos: usize,
-        kv: KvStep<'_>,
+        mut kv: KvStep<'_>,
     ) -> Option<Vec<f32>> {
         let head_dim = self.config.head_dim;
         let (n_heads, n_kv_heads) = match self.config.layer_shape(layer_idx).attention {
@@ -89,6 +101,11 @@ impl Decoder {
             // deci.cpp:115-118: `attn_norm` then `wo`, nothing else.
             AttnShape::Linear => return Some(layer.attn.o_proj.apply(normed)),
             AttnShape::Absent => return None,
+            // lfm2.cpp:197 / granite-hybrid.cpp:163: the recurrent block,
+            // on this row's cache.
+            AttnShape::ShortConv | AttnShape::Mamba2 | AttnShape::Mamba1 | AttnShape::Gdn => {
+                return Some(self.recurrent_block(layer_idx, layer, normed, 1, kv))
+            }
         };
 
         let (mut q, mut k, mut v) = {
@@ -122,6 +139,13 @@ impl Decoder {
             }
         };
 
+        // qwen35.cpp:191-199: the gate rides in `wq`; split it off
+        // before anything reads a Q width.
+        let q_gate = layer.attn.q_gate_interleaved.then(|| {
+            let (qq, gate) = crate::attn_gate::split_interleaved_q_gate(&q, 1, n_heads, head_dim);
+            q = qq;
+            gate
+        });
         // Whole rows here: one token's Q and K. See
         // `Decoder::qk_norm_after_rope` for why the norm has two homes.
         let (q_width, kv_width, v_width) = (q.len(), k.len(), v.len());
@@ -135,12 +159,18 @@ impl Decoder {
         for h in 0..n_kv_heads {
             self.apply_rope_head_layer(&mut k[h * head_dim..(h + 1) * head_dim], pos, layer_idx);
         }
-        self.apply_qk_norms_post_rope(layer, &mut q, &mut k, q_width, kv_width);
+        self.apply_qk_norms_post_rope(layer, layer_idx, &mut q, &mut k, q_width, kv_width);
         self.apply_attention_scale(&mut q);
-        self.apply_attn_temperature(&mut q, q_width, |_| pos);
+        self.apply_attn_temperature(layer_idx, &mut q, q_width, |_| pos);
 
+        // falcon-h1.cpp:156-160: the parallel Mamba-2 block on the same
+        // normed row, summed into the attention branch.
+        let ssm = self.parallel_ssm_rows(layer_idx, layer, normed, 1, kv.recurrent_slot());
         let mut attn_out = self.push_and_attend_row(kv, layer_idx, layer, &k, &v, &q);
-        Some(self.attn_out_to_residual_rows(layer, normed, &mut attn_out, 1))
+        let mut projected =
+            self.attn_out_to_residual_rows(layer, normed, &mut attn_out, 1, q_gate.as_deref());
+        Self::add_parallel_ssm(&mut projected, ssm);
+        Some(projected)
     }
 
     /// Everything between the softmax-weighted V sum and the residual
@@ -154,13 +184,22 @@ impl Decoder {
     /// places; it is added to one. `normed` is the SAME vector the
     /// Q/K/V projections read, which is what every gating graph
     /// projects the gate from (`crate::attn_gate`).
+    ///
+    /// `q_gate` is the gate the three bodies split off a double-width
+    /// `wq` (`AttnWeights::q_gate_interleaved`), `rows * n_heads *
+    /// head_dim` wide, or `None`; `qwen35.cpp:229-230` multiplies its
+    /// sigmoid in here, before `wo`.
     pub(crate) fn attn_out_to_residual_rows(
         &self,
         layer: &LayerWeights,
         normed: &[f32],
         attn_out: &mut [f32],
         rows: usize,
+        q_gate: Option<&[f32]>,
     ) -> Vec<f32> {
+        if let Some(gate) = q_gate {
+            crate::attn_gate::apply_interleaved_gate(attn_out, gate);
+        }
         if let Some(gate) = &layer.attn.output_gate {
             gate.apply_rows(normed, attn_out, rows, self.config.head_dim);
         }
@@ -253,7 +292,13 @@ impl Decoder {
         );
         let head_dim = self.config.head_dim;
         let v_head_dim = self.config.v_head_dim();
-        let window = self.config.layer_sliding_window(layer_idx);
+        // The query's own position, BEFORE the push: a chunked layer's
+        // window is a function of it (`crate::chunked_swa`).
+        let query_pos = match &kv {
+            KvStep::Decode(cache) | KvStep::Batched(cache) => cache.positions(),
+            KvStep::Paged { cache, .. } => cache.seq_len(),
+        };
+        let window = self.config.layer_window_for_query(layer_idx, query_pos);
         // The sink arm carries no softcap, matching llama.cpp's.
         let softcap = if sinks.is_some() {
             None
@@ -266,7 +311,12 @@ impl Decoder {
         // a layer with sinks, or a model whose V width differs
         // (`crate::kv_head_dims`) takes the host kernel.
         let cuda_resident_layer = match &kv {
-            KvStep::Decode(_) if window.is_none() && sinks.is_none() && v_head_dim == head_dim => {
+            KvStep::Decode(_)
+                if window.is_none()
+                    && sinks.is_none()
+                    && v_head_dim == head_dim
+                    && self.alibi_slopes.is_none() =>
+            {
                 Some(layer_idx)
             }
             KvStep::Decode(_) | KvStep::Batched(_) | KvStep::Paged { .. } => None,
@@ -301,6 +351,7 @@ impl Decoder {
                         window,
                         sinks,
                         softcap,
+                        self.alibi_slopes.as_deref(),
                     ),
                 };
                 // AFTER the read, never inside `push`: the rows this
@@ -337,6 +388,7 @@ impl Decoder {
                     window,
                     sinks,
                     softcap,
+                    self.alibi_slopes.as_deref(),
                 )
             }
         }

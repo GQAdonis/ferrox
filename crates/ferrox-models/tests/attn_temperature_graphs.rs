@@ -425,6 +425,7 @@ fn the_loader_resolves_the_temperature_and_its_floor_the_way_llama_cpp_does() {
         scale: 0.5,
         floor_scale: NonZeroU32::new(2).unwrap(),
         offset: 0.0,
+        unrotated_layers_only: false,
     };
     let temp = load_graph_fixture(TEMP);
     assert_eq!(
